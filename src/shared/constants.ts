@@ -1,7 +1,7 @@
 export const API_BODY_LIMIT_BYTES = 2048;
-export const IP_SUBMISSION_COOLDOWN_MS = 60_000;
+export const IP_SUBMISSION_COOLDOWN_MS = 1_000;
 export const MAX_RECENT_SUBMISSIONS = 50;
-export const SCORER_BUCKET_COUNT = 4;
+export const SCORER_BUCKET_COUNT = 10;
 export const MAX_EVIDENCE_FILES = 24;
 export const MAX_EVIDENCE_TOTAL_BYTES = 120_000;
 export const MAX_EVIDENCE_FILE_BYTES = 12_000;

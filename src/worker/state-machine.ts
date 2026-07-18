@@ -123,6 +123,23 @@ export function claimJob(
   return undefined;
 }
 
+export function recoverProcessingJobs(state: AppStateSnapshot, nowIso: string): number {
+  let recovered = 0;
+  for (const job of Object.values(state.jobs)) {
+    if (job.status !== "processing") {
+      continue;
+    }
+    job.status = "queued";
+    job.updatedAt = nowIso;
+    const queue = bucketQueue(state, job.bucket);
+    if (!queue.includes(job.id)) {
+      queue.unshift(job.id);
+    }
+    recovered += 1;
+  }
+  return recovered;
+}
+
 export function finalizeJob(state: AppStateSnapshot, payload: FinalizePayload): FinalizeResult {
   const job = state.jobs[payload.submissionId];
   if (!job) {
@@ -242,8 +259,8 @@ function leaseNextJob(
       callbackToken: job.callbackToken,
       callbackUrl: `${callbackBaseUrl.replace(/\/+$/, "")}/internal/scoring-callback`,
       attempt: job.attempts,
-      pinnedSha: job.resolution.pinnedSha!,
-      defaultBranch: job.resolution.defaultBranch!,
+      pinnedSha: job.resolution.pinnedSha,
+      defaultBranch: job.resolution.defaultBranch,
       summary: job.resolution.summary
     };
   }

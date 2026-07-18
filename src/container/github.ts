@@ -7,6 +7,26 @@ const RAW_BASE = "https://raw.githubusercontent.com";
 
 export class RetryableGithubError extends Error {}
 
+export async function resolveRepoEvidence(repo: NormalizedRepo, summary: string): Promise<RepoEvidenceSnapshot> {
+  const repository = await githubJson<{ default_branch: string | null }>(
+    `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.repo}`
+  );
+  if (repository.kind === "missing") {
+    return missingSnapshot(repo, summary, "missing_or_private");
+  }
+  const defaultBranch = repository.data.default_branch;
+  if (!defaultBranch) {
+    return missingSnapshot(repo, summary, "no_default_branch");
+  }
+  const commit = await githubJson<{ sha: string }>(
+    `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.repo}/commits/${encodeURIComponent(defaultBranch)}`
+  );
+  if (commit.kind === "missing") {
+    return missingSnapshot(repo, summary, "empty_repository");
+  }
+  return fetchRepoEvidence(repo, commit.data.sha, defaultBranch, summary);
+}
+
 export async function fetchRepoEvidence(repo: NormalizedRepo, pinnedSha: string, defaultBranch: string, summary: string): Promise<RepoEvidenceSnapshot> {
   const treeResponse = await githubJson<GitHubTreeResponse>(
     `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.repo}/git/trees/${pinnedSha}?recursive=1`
@@ -143,9 +163,26 @@ async function githubJson<T>(url: string): Promise<{ kind: "ok"; data: T } | { k
 }
 
 function githubHeaders(): Record<string, string> {
+  const token = process.env.GITHUB_TOKEN?.trim();
   return {
     accept: "application/vnd.github+json",
-    "user-agent": "hackathon-nukoevi-app"
+    "user-agent": "hackathon-nukoevi-app",
+    ...(token ? { authorization: `Bearer ${token}` } : {})
+  };
+}
+
+function missingSnapshot(
+  repo: NormalizedRepo,
+  summary: string,
+  assessment: "empty_repository" | "missing_or_private" | "no_default_branch"
+): RepoEvidenceSnapshot {
+  return {
+    repo,
+    pinnedSha: null,
+    defaultBranch: null,
+    summary,
+    assessment,
+    files: []
   };
 }
 

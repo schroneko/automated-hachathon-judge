@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildZeroScoreResult } from "../src/shared/scoring";
-import { claimJob, createInitialSnapshot, finalizeJob, getRanking, isRankingEligible, submitJob } from "../src/worker/state-machine";
+import { claimJob, createInitialSnapshot, finalizeJob, getRanking, isRankingEligible, recoverProcessingJobs, submitJob } from "../src/worker/state-machine";
 
 function now(offset = 0) {
   return new Date(Date.UTC(2026, 6, 17, 0, 0, offset)).toISOString();
@@ -14,6 +14,51 @@ const resolution = {
 };
 
 describe("state machine", () => {
+  it("allows another submission from the same IP after one second", () => {
+    const state = createInitialSnapshot();
+    const first = submitJob(state, {
+      repoUrl: "https://github.com/example/first",
+      ipHash: "shared",
+      callbackBaseUrl: "https://hackathon.nukoevi.app",
+      nowIso: now(0),
+      resolution
+    });
+    const blocked = submitJob(state, {
+      repoUrl: "https://github.com/example/blocked",
+      ipHash: "shared",
+      callbackBaseUrl: "https://hackathon.nukoevi.app",
+      nowIso: now(0),
+      resolution
+    });
+    const allowed = submitJob(state, {
+      repoUrl: "https://github.com/example/allowed",
+      ipHash: "shared",
+      callbackBaseUrl: "https://hackathon.nukoevi.app",
+      nowIso: now(1),
+      resolution
+    });
+
+    expect(first.ok).toBe(true);
+    expect(blocked.ok).toBe(false);
+    expect(allowed.ok).toBe(true);
+  });
+
+  it("requeues processing jobs after a runner restart", () => {
+    const state = createInitialSnapshot();
+    submitJob(state, {
+      repoUrl: "https://github.com/example/interrupted",
+      ipHash: "restart",
+      callbackBaseUrl: "https://hackathon.nukoevi.app",
+      nowIso: now(0),
+      resolution
+    });
+    const interrupted = claimJob(state, "https://hackathon.nukoevi.app", now(1));
+
+    expect(interrupted).toBeDefined();
+    expect(recoverProcessingJobs(state, now(2))).toBe(1);
+    expect(claimJob(state, "https://hackathon.nukoevi.app", now(3))?.submissionId).toBe(interrupted?.submissionId);
+  });
+
   it("excludes schroneko repositories from ranking", () => {
     expect(isRankingEligible("example/demo")).toBe(true);
     expect(isRankingEligible("schroneko/demo")).toBe(false);

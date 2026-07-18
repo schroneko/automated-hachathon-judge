@@ -5,8 +5,8 @@ GitHub リポジトリ URL だけを受け取り、Cloudflare Workers と Mac �
 ## Architecture
 
 - Worker が静的 frontend と `/api/*`、`/internal/*` を配信します。
-- `JudgeState` Durable Object が submission 履歴、最新 completed、in-flight 重複防止、IP cooldown、4 バケットの待ち行列を保持します。
-- Mac Runner は認証済みの internal endpoint から job を atomic claim し、最大 4 件を並列処理します。
+- `JudgeState` Durable Object が submission 履歴、最新 completed、in-flight 重複防止、IP cooldown、10 バケットの待ち行列を保持します。
+- Mac Runner は認証済みの internal endpoint から job を atomic claim し、最大 10 件を並列処理します。
 - Runner は GitHub REST API と raw content API だけで pinned SHA の証拠ファイルを bounded snapshot に落として `@openai/codex-sdk` に渡します。
 - ジャッジ callback は per-job random token を使います。グローバル callback secret は使いません。
 - ChatGPT 認証は Mac の Codex auth だけを使い、Cloudflare には保存しません。
@@ -69,7 +69,7 @@ build 後に foreground で起動できます。
 npm run runner:start
 ```
 
-既定値は production URL、4 並列、token file `~/Library/Application Support/Hackathon Judge/runner-token` です。完了結果は callback 成功まで `~/Library/Application Support/Hackathon Judge/spool` に保存されるため、callback 障害で再採点しません。
+既定値は production URL、10 並列、token file `~/Library/Application Support/Hackathon Judge/runner-token` です。完了結果は callback 成功まで `~/Library/Application Support/Hackathon Judge/spool` に保存されるため、callback 障害で再採点しません。
 
 本番 Mac では `~/Library/LaunchAgents/app.nukoevi.hackathon-runner.plist` が Runner を常駐させます。`caffeinate -i` で Runner 稼働中の system sleep を防ぎますが、画面の sleep は妨げません。heartbeat が 30 秒途切れると Worker は新規投稿を `503` で拒否します。
 

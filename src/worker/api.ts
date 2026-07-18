@@ -2,7 +2,6 @@ import { CALLBACK_PATH_PREFIX, STATE_OBJECT_NAME } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import { hashIp, normalizeGitHubRepoUrl, parseSubmissionBody } from "../shared/validation";
 import type { FinalizePayload, FinalizeResult, SubmitJobInput, SubmitJobResult } from "../shared/types";
-import { resolveRepoAtSubmission } from "./github";
 
 export async function handleApiRequest(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
@@ -31,6 +30,9 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
   }
   if (request.method === "POST" && url.pathname === "/internal/runner/heartbeat") {
     return runnerAuthorized(request, env) ? recordRunnerHeartbeat(env) : unauthorizedRunner(env);
+  }
+  if (request.method === "POST" && url.pathname === "/internal/runner/recover") {
+    return runnerAuthorized(request, env) ? recoverRunnerJobs(env) : unauthorizedRunner(env);
   }
   if (request.method === "POST" && url.pathname === CALLBACK_PATH_PREFIX) {
     return finalizeSubmission(request, env);
@@ -66,7 +68,12 @@ async function createSubmission(request: Request, env: Env): Promise<Response> {
     ipHash: hashIp(clientIp(request)),
     callbackBaseUrl: workerBaseUrl(request, env),
     nowIso: new Date().toISOString(),
-    resolution: await resolveRepoAtSubmission(repo)
+    resolution: {
+      assessment: "scored",
+      pinnedSha: null,
+      defaultBranch: null,
+      summary: `${repo.normalized} の提出時点スナップショット`
+    }
   };
 
   const response = await stateStub(env).fetch("https://state/submit", {
@@ -107,6 +114,15 @@ async function claimRunnerJob(request: Request, env: Env): Promise<Response> {
 
 async function recordRunnerHeartbeat(env: Env): Promise<Response> {
   const response = await stateStub(env).fetch("https://state/heartbeat", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ nowIso: new Date().toISOString() })
+  });
+  return new Response(response.body, { status: response.status, headers: response.headers });
+}
+
+async function recoverRunnerJobs(env: Env): Promise<Response> {
+  const response = await stateStub(env).fetch("https://state/recover", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ nowIso: new Date().toISOString() })

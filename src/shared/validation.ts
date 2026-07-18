@@ -11,7 +11,7 @@ const criterionSchema = z.object({
   label: z.string().min(1),
   score: z.number().int().min(0).max(10),
   reason: z.string().min(1).max(280),
-  evidencePaths: z.array(z.string().min(1).max(300)).max(8)
+  evidencePaths: z.array(z.string().min(1).max(300)).max(24)
 });
 
 export const publicScoreResultSchema = z.object({
@@ -63,6 +63,7 @@ export const codexOutputSchema = {
           reason: { type: "string" },
           evidencePaths: {
             type: "array",
+            maxItems: 24,
             items: { type: "string" }
           }
         }

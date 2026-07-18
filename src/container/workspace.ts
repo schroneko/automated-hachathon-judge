@@ -4,6 +4,8 @@ import type { RepoEvidenceSnapshot } from "../shared/types";
 
 export async function createReadonlyWorkspace(submissionId: string, snapshot: RepoEvidenceSnapshot): Promise<string> {
   const workspace = join("/tmp", "nukoevi-evals", submissionId);
+  await chmod(workspace, 0o700).catch(() => undefined);
+  await chmod(join(workspace, "input"), 0o700).catch(() => undefined);
   await rm(workspace, { recursive: true, force: true });
   await mkdir(join(workspace, "input"), { recursive: true });
   await writeFile(join(workspace, "input", "snapshot.json"), JSON.stringify(snapshot, null, 2), "utf8");

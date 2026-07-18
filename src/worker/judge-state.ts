@@ -1,7 +1,7 @@
 import { jsonResponse } from "../shared/json";
 import { RUNNER_ONLINE_WINDOW_MS } from "../shared/constants";
 import { DurableObject } from "cloudflare:workers";
-import { claimJob, createInitialSnapshot, finalizeJob, getRanking, getRecentSubmissions, getSubmission, submitJob, toPublicSubmission } from "./state-machine";
+import { claimJob, createInitialSnapshot, finalizeJob, getRanking, getRecentSubmissions, getSubmission, recoverProcessingJobs, submitJob, toPublicSubmission } from "./state-machine";
 import type { AppStateSnapshot, FinalizePayload, SubmissionRecord, SubmitJobInput } from "../shared/types";
 
 export class JudgeState extends DurableObject<Env> {
@@ -35,6 +35,13 @@ export class JudgeState extends DurableObject<Env> {
       snapshot.runnerLastSeenAt = body.nowIso;
       await this.save(snapshot);
       return jsonResponse({ ok: true });
+    }
+
+    if (request.method === "POST" && url.pathname === "/recover") {
+      const body = (await request.json()) as { nowIso: string };
+      const recovered = recoverProcessingJobs(snapshot, body.nowIso);
+      await this.save(snapshot);
+      return jsonResponse({ ok: true, recovered });
     }
 
     if (request.method === "GET" && url.pathname.startsWith("/submission/")) {

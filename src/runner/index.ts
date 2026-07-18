@@ -1,4 +1,5 @@
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { FinalizePayload, LeaseJob } from "../shared/types";
@@ -14,13 +15,17 @@ interface PendingResult {
 const baseUrl = (process.env.RUNNER_BASE_URL ?? "https://hackathon.nukoevi.app").replace(/\/+$/, "");
 const tokenFile = process.env.RUNNER_TOKEN_FILE ?? join(homedir(), "Library", "Application Support", "Hackathon Judge", "runner-token");
 const spoolDir = process.env.RUNNER_SPOOL_DIR ?? join(homedir(), "Library", "Application Support", "Hackathon Judge", "spool");
-const concurrency = boundedInteger(process.env.RUNNER_CONCURRENCY, 4, 1, 4);
+const concurrency = boundedInteger(process.env.RUNNER_CONCURRENCY, 10, 1, 10);
 const pollIntervalMs = boundedInteger(process.env.RUNNER_POLL_INTERVAL_MS, 2000, 500, 30000);
 const token = (await readFile(tokenFile, "utf8")).trim();
 let shuttingDown = false;
 
 if (!token) {
   throw new Error("Runner token is empty");
+}
+
+if (!process.env.GITHUB_TOKEN?.trim()) {
+  process.env.GITHUB_TOKEN = execFileSync("gh", ["auth", "token"], { encoding: "utf8" }).trim();
 }
 
 process.once("SIGINT", () => {
@@ -32,6 +37,7 @@ process.once("SIGTERM", () => {
 
 await mkdir(spoolDir, { recursive: true, mode: 0o700 });
 await replayPendingResults();
+await recoverProcessingJobs();
 
 const heartbeatTimer = setInterval(() => {
   void sendHeartbeat();
@@ -84,6 +90,7 @@ async function processJob(job: LeaseJob): Promise<void> {
       result: await scoreSubmission(job)
     };
   } catch (error) {
+    console.error(`Job ${job.submissionId} failed`, error);
     outcome = {
       kind: "failed",
       message: error instanceof Error ? error.message : "Unexpected failure"
@@ -159,6 +166,19 @@ async function sendHeartbeat(): Promise<void> {
   } catch (error) {
     console.error("Heartbeat error", error);
   }
+}
+
+async function recoverProcessingJobs(): Promise<void> {
+  const response = await fetch(`${baseUrl}/internal/runner/recover`, {
+    method: "POST",
+    headers: runnerHeaders(),
+    signal: AbortSignal.timeout(15000)
+  });
+  if (!response.ok) {
+    throw new Error(`Recovery failed with status ${response.status}`);
+  }
+  const body = (await response.json()) as { recovered: number };
+  console.log(`Recovered ${body.recovered} interrupted jobs`);
 }
 
 function runnerHeaders(): Record<string, string> {

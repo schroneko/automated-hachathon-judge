@@ -4,7 +4,7 @@ import { buildScoringPrompt } from "../shared/prompt";
 import { calculateNukoScore, visibleNukoScore } from "../shared/nuko-score";
 import { validatePublicScoreResult, codexOutputSchema } from "../shared/validation";
 import type { LeaseJob, PublicScoreResult } from "../shared/types";
-import { fetchRepoEvidence, RetryableGithubError, zeroResultForAssessment } from "./github";
+import { fetchRepoEvidence, resolveRepoEvidence, RetryableGithubError, zeroResultForAssessment } from "./github";
 import { createReadonlyWorkspace } from "./workspace";
 
 export class RetryableScoringError extends Error {}
@@ -12,7 +12,9 @@ export class RetryableScoringError extends Error {}
 export async function scoreSubmission(job: LeaseJob): Promise<PublicScoreResult> {
   let snapshot;
   try {
-    snapshot = await fetchRepoEvidence(job.repo, job.pinnedSha, job.defaultBranch, job.summary);
+    snapshot = job.pinnedSha && job.defaultBranch
+      ? await fetchRepoEvidence(job.repo, job.pinnedSha, job.defaultBranch, job.summary)
+      : await resolveRepoEvidence(job.repo, job.summary);
   } catch (error) {
     if (error instanceof RetryableGithubError) {
       throw new RetryableScoringError(error.message);

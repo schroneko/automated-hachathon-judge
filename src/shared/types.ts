@@ -79,8 +79,8 @@ export interface LeaseJob {
   callbackToken: string;
   callbackUrl: string;
   attempt: number;
-  pinnedSha: string;
-  defaultBranch: string;
+  pinnedSha: string | null;
+  defaultBranch: string | null;
   summary: string;
 }
 
