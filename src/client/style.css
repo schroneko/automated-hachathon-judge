@@ -1,0 +1,277 @@
+:root {
+  color-scheme: light;
+  font-family: "Hiragino Sans", "Yu Gothic", "Noto Sans JP", sans-serif;
+  background: #edf2f7;
+  color: #132238;
+  line-height: 1.5;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at top right, rgba(25, 118, 210, 0.14), transparent 24rem),
+    linear-gradient(180deg, #f8fbff 0%, #edf2f7 100%);
+}
+
+a,
+.link-button {
+  color: #0b5cad;
+  text-decoration: none;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.page {
+  width: min(1120px, calc(100vw - 2rem));
+  margin: 0 auto;
+  padding: 2rem 0 3rem;
+}
+
+.hero,
+.grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.hero {
+  grid-template-columns: 1.4fr 1fr;
+  align-items: start;
+  margin-bottom: 1rem;
+}
+
+.grid {
+  grid-template-columns: 1fr 1fr;
+  margin-bottom: 1rem;
+}
+
+.ranking-section {
+  margin-bottom: 1rem;
+}
+
+.eyebrow {
+  margin: 0 0 0.5rem;
+  color: #41607f;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-size: 0.8rem;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin-top: 0;
+}
+
+h1 {
+  font-size: clamp(2rem, 5vw, 3.4rem);
+  line-height: 1.05;
+  margin-bottom: 1rem;
+}
+
+.lede {
+  max-width: 46rem;
+  color: #405366;
+}
+
+.panel {
+  min-width: 0;
+  border: 1px solid rgba(19, 34, 56, 0.08);
+  border-radius: 1.25rem;
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 18px 48px rgba(19, 34, 56, 0.08);
+  padding: 1.25rem;
+  backdrop-filter: blur(16px);
+}
+
+.form-panel {
+  position: sticky;
+  top: 1rem;
+}
+
+.field {
+  display: grid;
+  gap: 0.5rem;
+}
+
+input {
+  width: 100%;
+  padding: 0.9rem 1rem;
+  border-radius: 0.8rem;
+  border: 1px solid rgba(19, 34, 56, 0.18);
+  background: #f7fafc;
+  font: inherit;
+}
+
+button {
+  margin-top: 1rem;
+  width: 100%;
+  padding: 0.9rem 1rem;
+  border-radius: 999px;
+  border: 0;
+  background: linear-gradient(135deg, #0b5cad, #1e7acb);
+  color: white;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: progress;
+  opacity: 0.6;
+}
+
+.ghost {
+  width: auto;
+  margin: 0;
+  background: #e8eef5;
+  color: #1f3650;
+}
+
+.message,
+.meta,
+.anchor {
+  color: #607388;
+  font-size: 0.92rem;
+}
+
+.meta,
+.rank-line > a,
+.rank-line > .link-button {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.criteria-list,
+.criterion-results,
+.list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.criteria-list > .anchor {
+  margin-bottom: 0;
+}
+
+.criterion,
+.criterion-result,
+.list-item,
+.active-card {
+  border-radius: 1rem;
+  background: #f7fafc;
+  padding: 1rem;
+}
+
+.list-item.is-unranked {
+  background: #e9edf1;
+  color: #687481;
+}
+
+.list-item.is-unranked a,
+.list-item.is-unranked .score-row {
+  color: #687481;
+}
+
+.criterion-head,
+.rank-line,
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.criterion-index,
+.badge,
+.status {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  min-width: 2rem;
+  padding: 0.3rem 0.65rem;
+  font-size: 0.82rem;
+}
+
+.criterion-index,
+.badge {
+  background: #dcecff;
+  color: #0b5cad;
+}
+
+.badge.badge-muted {
+  background: #d4dae0;
+  color: #596573;
+}
+
+.status-queued {
+  background: #eef2f6;
+  color: #42576c;
+}
+
+.status-processing {
+  background: #fff4d6;
+  color: #9a6b00;
+}
+
+.status-completed {
+  background: #dbf3e4;
+  color: #0d6b3c;
+}
+
+.status-failed {
+  background: #ffe4e4;
+  color: #a33434;
+}
+
+.score-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  color: #405366;
+  font-size: 0.92rem;
+}
+
+.nuko-score {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.3rem 0.65rem;
+  background: #fce4f1;
+  color: #8a285d;
+  font-weight: 700;
+}
+
+.empty-state {
+  color: #607388;
+}
+
+@media (max-width: 900px) {
+  .hero,
+  .grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .form-panel {
+    position: static;
+  }
+
+  .rank-line {
+    flex-wrap: wrap;
+  }
+
+  .rank-line > strong,
+  .rank-line > .status {
+    flex-shrink: 0;
+  }
+}

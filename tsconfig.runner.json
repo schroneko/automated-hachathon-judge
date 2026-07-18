@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": [
+      "ES2022"
+    ],
+    "types": [
+      "node"
+    ],
+    "rootDir": "src",
+    "outDir": "build/runner"
+  },
+  "include": [
+    "src/shared/**/*.ts",
+    "src/runner/**/*.ts",
+    "src/container/scorer.ts",
+    "src/container/github.ts",
+    "src/container/workspace.ts"
+  ]
+}

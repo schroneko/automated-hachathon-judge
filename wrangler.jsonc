@@ -1,0 +1,40 @@
+{
+  "name": "hackathon-nukoevi-app",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2026-07-17",
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/api/*",
+      "/internal/*"
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "JUDGE_STATE",
+        "class_name": "JudgeState"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["JudgeState", "ScorerBucketContainer"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["ScorerBucketContainer"]
+    }
+  ],
+  "routes": [
+    {
+      "pattern": "hackathon.nukoevi.app",
+      "custom_domain": true
+    }
+  ]
+}

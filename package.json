@@ -1,0 +1,32 @@
+{
+  "name": "hackathon-nukoevi-app",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "npm run build:client && npm run build:worker && npm run build:runner",
+    "build:client": "vite build",
+    "build:worker": "tsc -p tsconfig.worker.json",
+    "build:runner": "esbuild src/runner/index.ts --bundle --platform=node --format=esm --target=node22 --outfile=build/runner/index.js --external:@openai/codex-sdk",
+    "dev:client": "vite",
+    "runner:start": "node build/runner/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.runner.json --noEmit && tsc -p tsconfig.client.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7",
+    "@openai/codex-sdk": "^0.144.4",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260715.1",
+    "@types/node": "^22.20.1",
+    "esbuild": "^0.25.12",
+    "typescript": "^6.0.3",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
+  }
+}
