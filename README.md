@@ -1,116 +1,175 @@
-# hackathon-nukoevi-app
+# Automated Hackathon Judge
 
-GitHub リポジトリ URL だけを受け取り、Cloudflare Workers と Mac 上の Codex SDK Runner で自動ジャッジを行う小さな Web アプリです。採点は 4 観点を 0〜10 点で 1 回だけ実行し、最新の completed 結果だけをランキングに反映します。
+公開 GitHub リポジトリを、4 つの観点で自動ジャッジしてランキングを公開する Web アプリです。Cloudflare Workers と Durable Objects が受付と状態管理を担当し、別ホストの Codex SDK Runner がリポジトリの証拠を読み取って採点します。
+
+稼働例: https://hackathon.nukoevi.app/
+
+稼働例ではイベント終了後のため新規投稿を停止しています。ランキングと既存結果は閲覧できます。
+
+## Features
+
+- 入力は公開 GitHub リポジトリ URL のみ
+- default branch の現在の commit SHA を固定して評価
+- clone、archive 展開、リポジトリ内コード実行を行わない
+- README 内の外部リンクを評価対象にしない
+- 4 観点を各 0〜10 点、合計 40 点で 1 回だけ採点
+- リポジトリごとの最新 completed 結果だけをランキングへ反映
+- 最大 10 件を並列処理
+- prompt injection の兆候を通常点とは別の「ぬこスコア」として検出
+- 設定値だけで投稿受付の停止と再開が可能
+
+## Scoring
+
+| 観点 | 確認内容 |
+| --- | --- |
+| 技術的な実装 | completeness、architecture、robustness、security |
+| デザインとユーザー体験 | UI structure、flow、consistency、accessibility |
+| 潜在的なインパクト | importance、audience、practicality、growth potential |
+| アイデアの質 | originality、problem-solution fit、insight |
+
+点数の共通基準は、0 が評価可能な証拠なし、1〜2 が初期段階、3〜4 が大きな不足あり、5〜6 が基準到達、7〜8 が明確に強い、9〜10 がハッカソンとして突出、です。
+
+採点結果には短い公開理由と根拠ファイルパスを含めます。chain-of-thought や非公開の推論は保存しません。
 
 ## Architecture
 
-- Worker が静的 frontend と `/api/*`、`/internal/*` を配信します。
-- `JudgeState` Durable Object が submission 履歴、最新 completed、in-flight 重複防止、IP cooldown、10 バケットの待ち行列を保持します。
-- Mac Runner は認証済みの internal endpoint から job を atomic claim し、最大 10 件を並列処理します。
-- Runner は GitHub REST API と raw content API だけで pinned SHA の証拠ファイルを bounded snapshot に落として `@openai/codex-sdk` に渡します。
-- ジャッジ callback は per-job random token を使います。グローバル callback secret は使いません。
-- ChatGPT 認証は Mac の Codex auth だけを使い、Cloudflare には保存しません。
+1. frontend が GitHub URL を Worker へ送信します。
+2. Worker が入力、受付状態、Runner の稼働状態、IP cooldown、同一リポジトリの重複処理を検証します。
+3. Durable Object が submission と 10 個の bucket queue を永続化します。
+4. Runner が job を取得し、認証済み GitHub API で default branch と commit SHA を解決します。
+5. Runner が上限付きのテキスト snapshot を作り、read-only の Codex SDK thread へ渡します。
+6. Codex が strict JSON schema に従って採点します。
+7. Runner が job 固有の callback token で結果を返し、ランキングを更新します。
 
-## Scoring flow
+詳細は [Architecture](docs/architecture.md) を参照してください。
 
-1. frontend から GitHub URL を `/api/submissions` に送ります。
-2. Worker が URL、body size、IP cooldown、同一 repo の in-flight 重複を検証します。
-3. `JudgeState` が submission を保存します。
-4. Mac Runner が job を claim します。
-5. Runner は raw content API で限られた証拠だけを取得し、read-only snapshot を作ります。
-6. Codex SDK が strict JSON schema で 4 観点を採点します。
-7. Runner が callback token 付きで Worker に結果を返し、`JudgeState` が履歴とランキングを更新します。
-
-## Local development
-
-前提:
+## Requirements
 
 - Node.js 20.19 以上
-- Cloudflare 用の `wrangler` コマンド
+- npm
+- Cloudflare Workers と Durable Objects を利用できる Cloudflare account
+- global installation の `wrangler`
+- GitHub CLI `gh`
+- Codex CLI で利用できる OpenAI account
+- Runner を継続稼働させる macOS または Linux host
 
-セットアップ:
+Codex SDK は server-side の Node.js で動作します。Runner host で `codex login` を実行すると、ChatGPT sign-in または API key sign-in の認証を Codex SDK が利用します。公式情報は [Codex SDK documentation](https://learn.chatgpt.com/docs/codex-sdk) と [OpenAI authentication](https://learn.chatgpt.com/docs/auth) を参照してください。
+
+## Setup
+
+依存関係を導入し、検証します。
 
 ```bash
 npm install
-```
-
-frontend build と TypeScript build:
-
-```bash
-npm run build
-```
-
-型検査:
-
-```bash
 npm run typecheck
-```
-
-テスト:
-
-```bash
 npm test
+npm run build
 ```
 
-ローカル開発では frontend を先に build してから Worker を起動してください。`wrangler` はグローバルコマンドを使います。
+Cloudflare と Runner のセットアップは [Deployment](docs/deployment.md) を参照してください。
+
+## Local development
+
+frontend と Worker を起動します。
 
 ```bash
-npm run build
+npm run build:client
 wrangler dev
 ```
 
-## Runner
-
-Runner は Mac にログイン済みの Codex auth を利用します。`RUNNER_TOKEN_FILE` の token は Cloudflare Worker の `RUNNER_TOKEN` secret と一致させます。
-
-build 後に foreground で起動できます。
+別 terminal で Runner を起動します。ローカルで投稿を受け付ける場合は `wrangler.jsonc` の `SUBMISSIONS_OPEN` を `true` にします。
 
 ```bash
+RUNNER_BASE_URL=http://127.0.0.1:8787 \
+RUNNER_TOKEN_FILE=/absolute/path/to/runner-token \
+RUNNER_SPOOL_DIR=/absolute/path/to/spool \
 npm run runner:start
 ```
 
-既定値は production URL、10 並列、token file `~/Library/Application Support/Hackathon Judge/runner-token` です。完了結果は callback 成功まで `~/Library/Application Support/Hackathon Judge/spool` に保存されるため、callback 障害で再採点しません。
+## Configuration
 
-本番 Mac では `~/Library/LaunchAgents/app.nukoevi.hackathon-runner.plist` が Runner を常駐させます。`caffeinate -i` で Runner 稼働中の system sleep を防ぎますが、画面の sleep は妨げません。heartbeat が 30 秒途切れると Worker は新規投稿を `503` で拒否します。
+Worker の設定は `wrangler.jsonc` に置きます。
 
-## Deploy
+| 名前 | 種類 | 説明 |
+| --- | --- | --- |
+| `RUNNER_TOKEN` | Worker secret | internal Runner endpoint の bearer token |
+| `PUBLIC_BASE_URL` | Worker variable | callback URL の public origin。未設定時は request origin |
+| `SUBMISSIONS_OPEN` | Worker variable | `true` のときだけ新規投稿を許可。未設定時は停止 |
+| `UNRANKED_OWNERS` | Worker variable | ランキング末尾へ送る GitHub owner のカンマ区切り一覧 |
 
-このリポジトリの `wrangler.jsonc` は custom domain `hackathon.nukoevi.app` を前提にしています。デプロイ前に以下を確認します。
+Runner の環境変数です。
 
-- Cloudflare zone 側で `hackathon.nukoevi.app` を custom domain として使えること
-- `RUNNER_TOKEN` が Worker secret として設定済みであること
-- Mac Runner が起動していること
+| 名前 | 既定値 | 説明 |
+| --- | --- | --- |
+| `RUNNER_BASE_URL` | 稼働例の URL | Worker の origin |
+| `RUNNER_TOKEN_FILE` | macOS Application Support 配下 | `RUNNER_TOKEN` と同じ値を入れた file |
+| `RUNNER_SPOOL_DIR` | macOS Application Support 配下 | callback 完了前の結果を保護する directory |
+| `RUNNER_CONCURRENCY` | `10` | 並列数。1〜10 |
+| `RUNNER_POLL_INTERVAL_MS` | `2000` | queue polling interval。500〜30000 ms |
+| `CODEX_MODEL` | `gpt-5.4` | Runner が使用する Codex model |
+| `GITHUB_TOKEN` | `gh auth token` の結果 | GitHub API token。未設定時は Runner が `gh` から取得 |
 
-デプロイ例:
+## Submission control
 
-```bash
-wrangler deploy
+受付停止中もランキングと既存結果は公開されます。
+
+受付を停止する場合:
+
+```json
+"SUBMISSIONS_OPEN": "false"
 ```
 
-## Test coverage
+受付を再開する場合:
 
-最低限の unit tests として次を含めています。
+```json
+"SUBMISSIONS_OPEN": "true"
+```
 
-- GitHub URL validation
-- scoring schema と total validation
-- latest completed のみが ranking に残ること
-- empty repository と missing/private repository の zero score handling
-- retryable failure が 1 回だけ再試行されること
-- prompt injection boundary text
-- API surface の基本挙動
+変更後に `npm run build` と `wrangler deploy` を実行してください。API は停止中の新規投稿へ `403` を返します。
 
-## Security limitations
+## API
 
-- ジャッジ対象 repo は untrusted data として扱い、コード実行、clone、archive 展開はしません。
-- evidence は pinned SHA の snapshot に限定し、README 内リンクは追いません。
-- 取得済みテキストは Codex の実行前にルールベースで検査し、ぬこスコアが 80 点以上の場合だけ結果画面へ表示します。通常の 40 点と順位には影響しません。
-- abuse controls は one-day event 向けの最小構成です。body size cap、repo URL validation、same-repo in-flight rejection、per-IP cooldown を実装しています。
-- Codex SDK には read-only workspace と strict schema を渡しますが、Codex CLI の内部ツール完全無効化までは保証していません。read-only workspace と prompt hardening で影響を最小化しています。
+| Method | Path | 用途 |
+| --- | --- | --- |
+| `POST` | `/api/submissions` | submission の作成 |
+| `GET` | `/api/submission-status` | 受付状態 |
+| `GET` | `/api/submissions/:id` | submission の状態と結果 |
+| `GET` | `/api/results/:id` | submission の状態と結果 |
+| `GET` | `/api/recent` | 最新 50 件 |
+| `GET` | `/api/ranking` | リポジトリごとの最新 completed 結果 |
+| `GET` | `/api/runner-status` | Runner の heartbeat 状態 |
 
-## Operational notes
+`/internal/*` は Runner 用です。public client から使用しないでください。
 
-- ranking は normalized repo ごとに latest completed だけを使います。
-- older results は history として保持されます。
-- completed 後の submission は再試行しません。
-- GitHub または Codex の失敗は `ジャッジ不能` とし、自動再採点しません。
-- missing/private repository、default branch なし、genuinely empty repository は 4 観点すべて 0 点です。
+## Security model
+
+- 対象リポジトリは untrusted data として扱います。
+- GitHub REST API と raw content API だけを使い、対象コードを実行しません。
+- 最大 24 files、合計 120 KB、1 file 12 KB に証拠を制限します。
+- Codex thread は read-only sandbox、network disabled、web search disabled で実行します。
+- Codex subprocess へは `HOME` と `PATH` だけを明示的に渡し、GitHub token を渡しません。
+- callback は submission ごとの random token で認証します。
+- public result から callback token と IP hash を除外します。
+- Runner token と Codex credentials は Cloudflare source や Git history に保存しません。
+- submission と結果は public data です。秘密情報を含むリポジトリを投稿しないでください。
+
+これは一日規模のイベント用に作られた最小構成です。multi-tenant SaaS として利用する場合は、認証、rate limiting、moderation、retention policy、監査、Runner 分離を追加してください。
+
+脆弱性の報告方法は [Security Policy](SECURITY.md) を参照してください。
+
+## Operations
+
+- Runner heartbeat が 30 秒途切れると Worker は新規投稿を拒否します。
+- Runner 起動時に中断された processing job を queue へ戻します。
+- callback 未完了の結果は spool directory に `0600` で保存し、再起動後に再送します。
+- missing、private、default branch なし、空のリポジトリは 4 観点すべて 0 点です。
+- GitHub または Codex の採点失敗は terminal failure とし、自動再採点しません。
+- 同じリポジトリは前回の処理完了後に再投稿できます。
+
+## Contributing
+
+[Contributing Guide](CONTRIBUTING.md) を参照してください。
+
+## License
+
+[MIT License](LICENSE) で公開しています。
