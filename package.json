@@ -1,7 +1,16 @@
 {
-  "name": "hackathon-nukoevi-app",
+  "name": "automated-hachathon-judge",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/schroneko/automated-hachathon-judge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/schroneko/automated-hachathon-judge/issues"
+  },
+  "homepage": "https://github.com/schroneko/automated-hachathon-judge#readme",
   "type": "module",
   "scripts": {
     "build": "npm run build:client && npm run build:worker && npm run build:runner",
@@ -17,7 +26,6 @@
     "node": ">=20.19.0"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.3.7",
     "@openai/codex-sdk": "^0.144.4",
     "zod": "^4.4.3"
   },

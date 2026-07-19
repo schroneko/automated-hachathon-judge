@@ -166,7 +166,7 @@ function githubHeaders(): Record<string, string> {
   const token = process.env.GITHUB_TOKEN?.trim();
   return {
     accept: "application/vnd.github+json",
-    "user-agent": "hackathon-nukoevi-app",
+    "user-agent": "automated-hachathon-judge",
     ...(token ? { authorization: `Bearer ${token}` } : {})
   };
 }

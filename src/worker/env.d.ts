@@ -4,4 +4,5 @@ interface Env {
   RUNNER_TOKEN?: string;
   PUBLIC_BASE_URL?: string;
   SUBMISSIONS_OPEN?: string;
+  UNRANKED_OWNERS?: string;
 }

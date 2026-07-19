@@ -38,6 +38,7 @@
     }
   ],
   "vars": {
-    "SUBMISSIONS_OPEN": "false"
+    "SUBMISSIONS_OPEN": "false",
+    "UNRANKED_OWNERS": "schroneko"
   }
 }

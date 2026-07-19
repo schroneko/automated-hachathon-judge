@@ -59,15 +59,16 @@ describe("state machine", () => {
     expect(claimJob(state, "https://hackathon.nukoevi.app", now(3))?.submissionId).toBe(interrupted?.submissionId);
   });
 
-  it("excludes schroneko repositories from ranking", () => {
-    expect(isRankingEligible("example/demo")).toBe(true);
-    expect(isRankingEligible("schroneko/demo")).toBe(false);
+  it("excludes configured owners from ranking", () => {
+    expect(isRankingEligible("example/demo", ["organizer"])).toBe(true);
+    expect(isRankingEligible("organizer/demo", ["organizer"])).toBe(false);
+    expect(isRankingEligible("Organizer/demo", ["ORGANIZER"])).toBe(false);
   });
 
   it("sorts unranked repositories after ranked entries", () => {
     const state = createInitialSnapshot();
     submitJob(state, {
-      repoUrl: "https://github.com/schroneko/demo",
+      repoUrl: "https://github.com/organizer/demo",
       ipHash: "owner",
       callbackBaseUrl: "https://hackathon.nukoevi.app",
       nowIso: now(0),
@@ -83,7 +84,7 @@ describe("state machine", () => {
 
     for (let index = 1; index <= 2; index += 1) {
       const start = claimJob(state, "https://hackathon.nukoevi.app", now(index));
-      const total = start!.repo.normalized.startsWith("schroneko/") ? 10 : 1;
+      const total = start!.repo.normalized.startsWith("organizer/") ? 10 : 1;
       const base = buildZeroScoreResult({
         summary: start!.repo.normalized,
         publicReason: "done",
@@ -111,8 +112,8 @@ describe("state machine", () => {
       });
     }
 
-    const ranking = getRanking(state);
-    expect(ranking.map((item) => item.repo)).toEqual(["example/demo", "schroneko/demo"]);
+    const ranking = getRanking(state, ["organizer"]);
+    expect(ranking.map((item) => item.repo)).toEqual(["example/demo", "organizer/demo"]);
     expect(ranking.map((item) => item.ranked)).toEqual([true, false]);
   });
 

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { RepoEvidenceSnapshot } from "../shared/types";
 
 export async function createReadonlyWorkspace(submissionId: string, snapshot: RepoEvidenceSnapshot): Promise<string> {
-  const workspace = join("/tmp", "nukoevi-evals", submissionId);
+  const workspace = join("/tmp", "automated-hackathon-judge", submissionId);
   await chmod(workspace, 0o700).catch(() => undefined);
   await chmod(join(workspace, "input"), 0o700).catch(() => undefined);
   await rm(workspace, { recursive: true, force: true });

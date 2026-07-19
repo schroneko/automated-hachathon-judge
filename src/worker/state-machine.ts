@@ -197,13 +197,13 @@ export function getRecentSubmissions(state: AppStateSnapshot): SubmissionListIte
     }));
 }
 
-export function getRanking(state: AppStateSnapshot): RankingEntry[] {
+export function getRanking(state: AppStateSnapshot, unrankedOwners: readonly string[] = []): RankingEntry[] {
   return Object.values(state.repoLatestCompleted)
     .map((id) => state.jobs[id])
     .filter((job): job is SubmissionRecord => Boolean(job?.result))
     .sort((left, right) => {
-      const leftRanked = isRankingEligible(left.repo.normalized);
-      const rightRanked = isRankingEligible(right.repo.normalized);
+      const leftRanked = isRankingEligible(left.repo.normalized, unrankedOwners);
+      const rightRanked = isRankingEligible(right.repo.normalized, unrankedOwners);
       if (leftRanked !== rightRanked) {
         return leftRanked ? -1 : 1;
       }
@@ -223,12 +223,13 @@ export function getRanking(state: AppStateSnapshot): RankingEntry[] {
       completedAt: job.completedAt,
       summary: job.result?.summary ?? "",
       nukoScore: job.result?.nukoScore ?? null,
-      ranked: isRankingEligible(job.repo.normalized)
+      ranked: isRankingEligible(job.repo.normalized, unrankedOwners)
     }));
 }
 
-export function isRankingEligible(normalizedRepo: string): boolean {
-  return normalizedRepo.split("/", 1)[0] !== "schroneko";
+export function isRankingEligible(normalizedRepo: string, unrankedOwners: readonly string[] = []): boolean {
+  const owner = normalizedRepo.split("/", 1)[0]?.toLowerCase() ?? "";
+  return !unrankedOwners.some((candidate) => candidate.toLowerCase() === owner);
 }
 
 function leaseNextJob(

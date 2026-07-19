@@ -58,7 +58,7 @@ export class JudgeState extends DurableObject<Env> {
     }
 
     if (request.method === "GET" && url.pathname === "/ranking") {
-      return jsonResponse({ items: getRanking(snapshot) });
+      return jsonResponse({ items: getRanking(snapshot, unrankedOwners(this.env)) });
     }
 
     if (request.method === "GET" && url.pathname === "/runner-status") {
@@ -88,4 +88,11 @@ export class JudgeState extends DurableObject<Env> {
     await this.ctx.storage.put("meta", meta);
     await this.ctx.storage.put(Object.fromEntries(Object.entries(jobs).map(([id, job]) => [`job:${id}`, job])));
   }
+}
+
+function unrankedOwners(env: Env): string[] {
+  return (env.UNRANKED_OWNERS ?? "")
+    .split(",")
+    .map((owner) => owner.trim().toLowerCase())
+    .filter(Boolean);
 }
