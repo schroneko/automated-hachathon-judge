@@ -99,6 +99,7 @@ const refreshRankingButton = document.querySelector<HTMLButtonElement>("#refresh
 
 let activeSubmissionId: string | null = null;
 let pollTimer: number | null = null;
+let submissionsOpen = true;
 
 criteriaList.innerHTML = `
   <p class="anchor">0 は証拠なし、1〜2 は初期段階、3〜4 は大きな不足あり、5〜6 は基準到達、7〜8 は明確に強い、9〜10 はハッカソンとして突出。</p>
@@ -117,6 +118,10 @@ criteriaList.innerHTML = `
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!submissionsOpen) {
+    formMessage.textContent = "新しい投稿の受付は停止中です。";
+    return;
+  }
   const repoUrl = repoUrlInput.value.trim();
   if (!repoUrl) {
     formMessage.textContent = "GitHub URL を入れてね。";
@@ -152,11 +157,26 @@ form.addEventListener("submit", async (event) => {
 
 refreshRankingButton.addEventListener("click", () => void loadRanking());
 
-void refreshAll();
+void initialize();
 
 function setSubmitting(isSubmitting: boolean) {
-  submitButton.disabled = isSubmitting;
-  repoUrlInput.disabled = isSubmitting;
+  submitButton.disabled = isSubmitting || !submissionsOpen;
+  repoUrlInput.disabled = isSubmitting || !submissionsOpen;
+}
+
+async function initialize() {
+  await Promise.all([loadSubmissionStatus(), refreshAll()]);
+}
+
+async function loadSubmissionStatus() {
+  const response = await fetch("/api/submission-status");
+  const data = (await response.json()) as { open: boolean };
+  submissionsOpen = data.open;
+  if (!submissionsOpen) {
+    submitButton.textContent = "受付停止中";
+    formMessage.textContent = "新しい投稿の受付は停止中です。";
+  }
+  setSubmitting(false);
 }
 
 async function refreshAll() {

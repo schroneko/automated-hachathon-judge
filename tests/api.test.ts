@@ -12,7 +12,8 @@ function makeEnv(fetchImpl: (request: Request) => Promise<Response> | Response) 
       get: vi.fn(() => stub)
     },
     PUBLIC_BASE_URL: "https://hackathon.nukoevi.app",
-    RUNNER_TOKEN: "runner-secret"
+    RUNNER_TOKEN: "runner-secret",
+    SUBMISSIONS_OPEN: "true"
   } as any;
 }
 
@@ -27,6 +28,32 @@ describe("handleApiRequest", () => {
       { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
     );
     expect(response.status).toBe(400);
+  });
+
+  it("rejects submissions while reception is closed", async () => {
+    const env = makeEnv(async () => new Response("{}", { status: 500 }));
+    env.SUBMISSIONS_OPEN = "false";
+    const response = await handleApiRequest(
+      new Request("https://hackathon.nukoevi.app/api/submissions", {
+        method: "POST",
+        body: JSON.stringify({ repoUrl: "https://github.com/example/demo" })
+      }),
+      env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
+    );
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({ error: "新しい投稿の受付は停止中です。" });
+  });
+
+  it("reports whether submissions are open", async () => {
+    const env = makeEnv(async () => new Response("{}", { status: 500 }));
+    env.SUBMISSIONS_OPEN = "false";
+    const response = await handleApiRequest(
+      new Request("https://hackathon.nukoevi.app/api/submission-status"),
+      env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
+    );
+    await expect(response.json()).resolves.toEqual({ open: false });
   });
 
   it("proxies ranking reads to the state object", async () => {

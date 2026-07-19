@@ -36,5 +36,8 @@
       "pattern": "hackathon.nukoevi.app",
       "custom_domain": true
     }
-  ]
+  ],
+  "vars": {
+    "SUBMISSIONS_OPEN": "false"
+  }
 }

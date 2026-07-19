@@ -8,6 +8,9 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
   if (request.method === "POST" && url.pathname === "/api/submissions") {
     return createSubmission(request, env);
   }
+  if (request.method === "GET" && url.pathname === "/api/submission-status") {
+    return jsonResponse({ open: submissionsOpen(env) });
+  }
   if (request.method === "GET" && url.pathname.startsWith("/api/submissions/")) {
     const id = url.pathname.split("/").at(-1) ?? "";
     return forwardState(env, `/submission/${id}`);
@@ -41,6 +44,13 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
 }
 
 async function createSubmission(request: Request, env: Env): Promise<Response> {
+  if (!submissionsOpen(env)) {
+    return jsonResponse(
+      { error: "新しい投稿の受付は停止中です。" },
+      { status: 403 }
+    );
+  }
+
   const raw = await request.text();
   let repoUrl: string;
   try {
@@ -98,6 +108,10 @@ async function createSubmission(request: Request, env: Env): Promise<Response> {
     },
     { status: 202 }
   );
+}
+
+function submissionsOpen(env: Env): boolean {
+  return env.SUBMISSIONS_OPEN?.trim().toLowerCase() === "true";
 }
 
 async function claimRunnerJob(request: Request, env: Env): Promise<Response> {
