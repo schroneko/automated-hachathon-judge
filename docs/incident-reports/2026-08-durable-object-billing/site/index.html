@@ -1,0 +1,1053 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>$666 の Durable Objects 請求はなぜ発生したか</title>
+    <meta name="description" content="2026 年 7 月 4 日〜8 月 3 日の Cloudflare 請求書に記載された Durable Objects Storage Rows Written $666 をきっかけに、automated-hachathon-judge の JudgeState 全件再保存を見つけた技術失敗談。">
+    <meta name="theme-color" content="#171715">
+    <meta name="color-scheme" content="dark">
+    <meta property="og:type" content="article">
+    <meta property="og:locale" content="ja_JP">
+    <meta property="og:title" content="$666 の Durable Objects 請求はなぜ発生したか">
+    <meta property="og:description" content="automated-hachathon-judge commit 8b494bd では、審査キューが空の間も続く claim と heartbeat が JudgeState の全 job key 再保存へ増幅されていた。全件保存を差分保存へ変更した commit c2ffc4a を公開する技術失敗談。">
+    <meta property="og:url" content="https://cloudflare-do-report.nukoevi.app/">
+    <meta property="og:image" content="https://cloudflare-do-report.nukoevi.app/og.png">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="$666 の Durable Objects 請求。何も処理していなくても、全履歴を書き直していた。">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="$666 の Durable Objects 請求はなぜ発生したか">
+    <meta name="twitter:description" content="2026 年 7 月 4 日〜8 月 3 日の Cloudflare 請求書に記載された Rows Written $666 をきっかけに、JudgeState の全 job key 再保存を検証した技術失敗談。">
+    <meta name="twitter:image" content="https://cloudflare-do-report.nukoevi.app/og.png">
+    <link rel="canonical" href="https://cloudflare-do-report.nukoevi.app/">
+    <style>
+      :root {
+        color-scheme: dark;
+        --ink: #e7e2d8;
+        --ink-soft: #aaa49a;
+        --paper: #171715;
+        --paper-alt: #22211f;
+        --panel: #1f1e1b;
+        --rule: #393632;
+        --rule-dark: #676159;
+        --accent: #e7865f;
+        --accent-soft: #f0a07e;
+        --site-width: 72rem;
+        --content-width: 54rem;
+        --text-width: 47.5rem;
+        --sans: "Hiragino Sans", "Yu Gothic", "YuGothic", "Noto Sans JP", system-ui, sans-serif;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+        background: var(--paper);
+      }
+
+      body {
+        margin: 0;
+        color: var(--ink);
+        background: var(--paper);
+        font-family: var(--sans);
+        font-size: 1.0625rem;
+        line-height: 1.75;
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+      }
+
+      a {
+        color: var(--ink);
+        text-decoration-color: var(--accent);
+        text-decoration-thickness: 0.1em;
+        text-underline-offset: 0.18em;
+      }
+
+      a:hover {
+        color: var(--accent);
+      }
+
+      a:focus-visible,
+      [tabindex]:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 4px;
+      }
+
+      .skip-link {
+        position: fixed;
+        z-index: 10;
+        top: 0.75rem;
+        left: 0.75rem;
+        padding: 0.55rem 0.8rem;
+        color: var(--paper);
+        background: var(--ink);
+        transform: translateY(-160%);
+      }
+
+      .skip-link:focus {
+        transform: translateY(0);
+      }
+
+      .masthead {
+        position: sticky;
+        z-index: 5;
+        top: 0;
+        border-bottom: 1px solid var(--rule);
+        background: rgba(23, 23, 21, 0.94);
+        backdrop-filter: blur(14px);
+      }
+
+      .masthead-inner,
+      .report-header {
+        width: min(calc(100% - 2rem), var(--site-width));
+        margin-inline: auto;
+      }
+
+      .section,
+      .overview,
+      .footer-inner {
+        width: min(calc(100% - 2rem), var(--content-width));
+        margin-inline: auto;
+      }
+
+      .masthead-inner {
+        min-height: 4rem;
+        padding-block: 0.65rem;
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .brand {
+        display: inline-flex;
+        gap: 0.7rem;
+        align-items: center;
+        color: var(--ink);
+        text-decoration: none;
+      }
+
+      .brand-mark {
+        width: 2rem;
+        height: 2rem;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--accent);
+        color: var(--accent-soft);
+        font-size: 0.72rem;
+        font-weight: 800;
+        letter-spacing: 0.06em;
+      }
+
+      .brand-copy {
+        font-size: 0.82rem;
+        font-weight: 700;
+        line-height: 1.25;
+      }
+
+      .brand-copy small {
+        display: block;
+        color: var(--ink-soft);
+        font-size: 0.68rem;
+        font-weight: 400;
+      }
+
+      .masthead-nav {
+        display: flex;
+        gap: 1.25rem;
+        align-items: center;
+        font-size: 0.76rem;
+      }
+
+      .masthead-nav a {
+        color: var(--ink-soft);
+        text-decoration: none;
+      }
+
+      .masthead-nav a:hover {
+        color: var(--ink);
+      }
+
+      .published {
+        padding-left: 1.25rem;
+        border-left: 1px solid var(--rule);
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+
+      .report-header {
+        min-height: calc(100svh - 4rem);
+        padding-block: clamp(3rem, 7vw, 5.5rem);
+        display: flex;
+        align-items: center;
+      }
+
+      .hero-grid {
+        width: 100%;
+        display: grid;
+        gap: clamp(2rem, 4vw, 3.75rem);
+        align-items: center;
+      }
+
+      .hero-amount-panel {
+        min-height: 28rem;
+        padding: 2rem clamp(1.5rem, 3vw, 2.5rem);
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        border-left: 0.65rem solid var(--accent);
+        border-right: 1px solid var(--accent);
+        background: rgba(255, 255, 255, 0.015);
+      }
+
+      .hero-amount {
+        margin: 0;
+        color: var(--ink);
+        font-size: clamp(5rem, 8.5vw, 7rem);
+        font-weight: 800;
+        letter-spacing: -0.08em;
+        line-height: 0.86;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .hero-amount-label {
+        margin: 1.4rem 0 0;
+        color: var(--ink-soft);
+        font-size: 0.72rem;
+        line-height: 1.55;
+      }
+
+      .hero-copy {
+        min-width: 0;
+      }
+
+      .hero-topline {
+        margin-bottom: 1.25rem;
+        display: flex;
+        gap: 1rem;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      .hero-status {
+        margin: 0;
+        display: flex;
+        gap: 0.55rem;
+        align-items: center;
+        color: var(--ink-soft);
+        font-size: 0.78rem;
+      }
+
+      .hero-status::before {
+        width: 0.55rem;
+        height: 0.55rem;
+        border-radius: 50%;
+        background: #72b987;
+        box-shadow: 0 0 0 0.28rem rgba(114, 185, 135, 0.12);
+        content: "";
+      }
+
+      .hero-status strong {
+        color: var(--ink);
+        font-weight: 700;
+      }
+
+      .report-meta {
+        margin: 0;
+        color: var(--accent);
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      h1,
+      h2,
+      h3 {
+        color: var(--ink);
+        text-wrap: pretty;
+      }
+
+      h1 {
+        max-width: 18ch;
+        margin: 0;
+        font-size: clamp(2.5rem, 4.6vw, 3.8rem);
+        font-weight: 750;
+        letter-spacing: -0.04em;
+        line-height: 1.16;
+      }
+
+      h1 .amount {
+        color: var(--accent);
+        font-family: var(--sans);
+        font-weight: 800;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .summary {
+        max-width: 42rem;
+        margin: 1.5rem 0 0;
+        color: var(--ink-soft);
+        font-size: clamp(0.95rem, 1.4vw, 1.08rem);
+        line-height: 1.75;
+      }
+
+      .hero-caveat {
+        max-width: 42rem;
+        margin: 0.8rem 0 0;
+        color: var(--ink-soft);
+        font-size: 0.72rem;
+        line-height: 1.6;
+      }
+
+      .hero-tagline {
+        max-width: 39rem;
+        margin: 1.4rem 0 0;
+        padding-top: 1.25rem;
+        border-top: 1px solid var(--accent);
+        color: var(--ink);
+        font-size: clamp(1.35rem, 2.7vw, 2rem);
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        line-height: 1.45;
+        text-wrap: balance;
+      }
+
+      .hero-actions {
+        margin-top: 2rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.75rem;
+      }
+
+      .hero-button {
+        min-height: 2.9rem;
+        padding: 0.65rem 1rem;
+        display: inline-flex;
+        gap: 0.55rem;
+        align-items: center;
+        justify-content: center;
+        border: 1px solid var(--rule-dark);
+        color: var(--ink);
+        font-size: 0.84rem;
+        font-weight: 700;
+        text-decoration: none;
+      }
+
+      .hero-button.primary {
+        border-color: var(--accent);
+        color: #171715;
+        background: var(--accent);
+      }
+
+      .hero-button:hover {
+        border-color: var(--accent-soft);
+        color: var(--ink);
+      }
+
+      .hero-button.primary:hover {
+        color: #171715;
+        background: var(--accent-soft);
+      }
+
+      .visually-hidden {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+      }
+
+      .overview {
+        padding-block: clamp(2.5rem, 6vw, 4.5rem);
+        border-top: 1px solid var(--rule);
+      }
+
+      .overview h2 {
+        max-width: none;
+        margin: 0;
+        color: var(--accent);
+        font-size: 0.82rem;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        line-height: 1.5;
+      }
+
+      .overview-list {
+        max-width: var(--text-width);
+        margin: 1.5rem 0 0;
+        padding-left: 1.25rem;
+      }
+
+      .overview-list li {
+        color: var(--ink-soft);
+        font-size: 0.94rem;
+        line-height: 1.7;
+      }
+
+      .overview-list li + li {
+        margin-top: 0.35rem;
+      }
+
+      .metrics {
+        margin: 1.5rem 0 0;
+        display: grid;
+        border-top: 2px solid var(--ink);
+        border-bottom: 1px solid var(--rule-dark);
+      }
+
+      .metric {
+        padding-block: 1rem;
+      }
+
+      .metric + .metric {
+        border-top: 1px solid var(--rule);
+      }
+
+      .metric dt,
+      .metric dd {
+        margin: 0;
+      }
+
+      .metric dt {
+        color: var(--ink-soft);
+        font-size: 0.78rem;
+        line-height: 1.55;
+      }
+
+      .metric dd {
+        margin-top: 0.15rem;
+        font-size: clamp(1.45rem, 4vw, 2rem);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        line-height: 1.3;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .section {
+        padding-block: clamp(3.5rem, 8vw, 6rem);
+        border-top: 1px solid var(--rule);
+      }
+
+      .section-number {
+        margin: 0 0 0.4rem;
+        color: var(--accent);
+        font-size: 0.76rem;
+        font-weight: 700;
+      }
+
+      h2 {
+        max-width: 20ch;
+        margin: 0;
+        scroll-margin-top: 5.5rem;
+        font-size: clamp(1.55rem, 3.5vw, 2.1rem);
+        font-weight: 700;
+        letter-spacing: -0.018em;
+        line-height: 1.4;
+      }
+
+      h3 {
+        margin: 0;
+        font-size: 1.15rem;
+        font-weight: 700;
+        line-height: 1.55;
+      }
+
+      .lede {
+        max-width: var(--text-width);
+        margin: 1.1rem 0 0;
+        color: var(--ink-soft);
+      }
+
+      .steps {
+        max-width: var(--text-width);
+        margin: 2.2rem 0 0;
+        padding: 0;
+        list-style: none;
+        counter-reset: steps;
+      }
+
+      .steps li {
+        position: relative;
+        padding: 1.2rem 0 1.2rem 3.2rem;
+        border-top: 1px solid var(--rule);
+        counter-increment: steps;
+      }
+
+      .steps li:last-child {
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .steps li::before {
+        position: absolute;
+        top: 1.25rem;
+        left: 0;
+        color: var(--accent);
+        font-size: 1.05rem;
+        font-weight: 700;
+        line-height: 1.5;
+        content: counter(steps) ".";
+      }
+
+      .steps p {
+        margin: 0.4rem 0 0;
+        color: var(--ink-soft);
+      }
+
+      .formula {
+        max-width: var(--text-width);
+        margin: 2rem 0 0;
+        padding: 1rem 1.1rem;
+        border-left: 3px solid var(--accent);
+        background: var(--paper-alt);
+        font-size: 1.05rem;
+      }
+
+      .calculation {
+        max-width: var(--text-width);
+        margin: 2rem 0 0;
+        padding-block: 1.25rem;
+        border-top: 2px solid var(--ink);
+        border-bottom: 1px solid var(--rule-dark);
+      }
+
+      .calculation figcaption {
+        color: var(--ink-soft);
+        font-size: 0.78rem;
+        font-weight: 700;
+      }
+
+      .calculation p {
+        margin: 0.65rem 0 0;
+      }
+
+      .calculation-value {
+        color: var(--accent);
+        font-size: clamp(1.15rem, 3vw, 1.55rem);
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        overflow-wrap: anywhere;
+      }
+
+      .evidence-list {
+        max-width: var(--text-width);
+        margin: 1rem 0 0;
+        padding-left: 1.25rem;
+      }
+
+      .evidence-list li + li {
+        margin-top: 0.55rem;
+      }
+
+      .subsection {
+        max-width: var(--text-width);
+        margin-top: 2.5rem;
+      }
+
+      .subsection + .subsection {
+        padding-top: 2rem;
+        border-top: 1px solid var(--rule);
+      }
+
+      .subsection p {
+        margin: 0.7rem 0 0;
+        color: var(--ink-soft);
+      }
+
+      .context-note {
+        max-width: var(--text-width);
+        margin: 2.5rem 0 0;
+        padding: 1.3rem 0 0 1rem;
+        border-top: 1px solid var(--rule);
+        border-left: 3px solid var(--accent);
+      }
+
+      .context-note p {
+        margin: 0.6rem 0 0;
+        color: var(--ink-soft);
+      }
+
+      .changes {
+        max-width: var(--text-width);
+        margin: 2.2rem 0 0;
+        border-top: 2px solid var(--ink);
+      }
+
+      .changes > div {
+        padding-block: 1.15rem;
+        border-bottom: 1px solid var(--rule);
+      }
+
+      .changes dt {
+        margin: 0 0 0.65rem;
+        font-weight: 700;
+      }
+
+      .changes dd {
+        margin: 0.35rem 0 0;
+        color: var(--ink-soft);
+      }
+
+      .changes.comparison dd {
+        display: grid;
+        grid-template-columns: 7rem minmax(0, 1fr);
+        gap: 0.8rem;
+      }
+
+      .changes.comparison .change-label {
+        font-size: 0.78rem;
+        font-weight: 700;
+      }
+
+      .changes.comparison .change-copy {
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+
+      .changes .after {
+        color: var(--accent);
+      }
+
+      .ref {
+        margin-left: 0.2em;
+        color: var(--accent);
+        font-size: 0.75em;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .sources {
+        margin: 2rem 0 0;
+        padding: 0;
+        border-top: 1px solid var(--rule-dark);
+        list-style: none;
+        counter-reset: sources;
+      }
+
+      .sources li {
+        position: relative;
+        padding: 0.85rem 0 0.85rem 2.8rem;
+        border-bottom: 1px solid var(--rule);
+        counter-increment: sources;
+      }
+
+      .sources li::before {
+        position: absolute;
+        top: 0.92rem;
+        left: 0;
+        color: var(--ink-soft);
+        font-size: 0.75rem;
+        content: "[" counter(sources, decimal-leading-zero) "]";
+      }
+
+      .sources a {
+        overflow-wrap: anywhere;
+        font-size: 0.88rem;
+        line-height: 1.65;
+      }
+
+      .footer {
+        border-top: 1px solid var(--rule-dark);
+      }
+
+      .footer-inner {
+        padding-block: 1.5rem 2.5rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem 2rem;
+        justify-content: space-between;
+      }
+
+      .footer p {
+        margin: 0;
+        color: var(--ink-soft);
+        font-size: 0.75rem;
+      }
+
+      @media (min-width: 44rem) {
+        .metrics {
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+        }
+
+        .metric {
+          padding: 1rem 1.1rem;
+        }
+
+        .metric:first-child {
+          padding-left: 0;
+        }
+
+        .metric + .metric {
+          border-top: 0;
+          border-left: 1px solid var(--rule);
+        }
+      }
+
+      @media (min-width: 54rem) {
+        .hero-grid {
+          grid-template-columns: minmax(20rem, 0.78fr) minmax(0, 1.62fr);
+        }
+      }
+
+      @media (max-width: 53.99rem) {
+        .report-header {
+          min-height: auto;
+        }
+
+        .hero-amount-panel {
+          min-height: auto;
+          padding-block: 1.5rem;
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
+          gap: 1.25rem;
+          align-items: end;
+          border-right: 0;
+          border-bottom: 1px solid var(--accent);
+        }
+
+        .hero-amount {
+          font-size: clamp(4.2rem, 17vw, 7rem);
+        }
+
+        .hero-amount-label {
+          margin: 0 0 0.25rem;
+        }
+      }
+
+      @media (max-width: 32rem) {
+        .masthead-inner {
+          min-height: 3.6rem;
+        }
+
+        .masthead-nav a {
+          display: none;
+        }
+
+        .published {
+          padding-left: 0;
+          border-left: 0;
+          font-size: 0.68rem;
+        }
+
+        .report-header {
+          padding-block: 2.25rem 3rem;
+        }
+
+        .hero-grid {
+          gap: 2rem;
+        }
+
+        .hero-amount-panel {
+          padding: 1.2rem 1.1rem;
+          border-left-width: 0.45rem;
+        }
+
+        .hero-topline {
+          display: block;
+        }
+
+        .hero-status {
+          margin-top: 0.55rem;
+          justify-content: flex-start;
+          text-align: left;
+        }
+
+        h1 {
+          font-size: clamp(2.25rem, 11.5vw, 3.15rem);
+        }
+
+        .hero-tagline {
+          font-size: 1.3rem;
+        }
+
+        .hero-actions {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr);
+        }
+
+        .hero-button {
+          width: 100%;
+        }
+
+        .changes.comparison dd {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 0.2rem;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        html {
+          scroll-behavior: auto;
+        }
+
+        *,
+        *::before,
+        *::after {
+          transition-duration: 0.01ms !important;
+          animation-duration: 0.01ms !important;
+          animation-iteration-count: 1 !important;
+        }
+      }
+
+      @media print {
+        @page {
+          margin: 16mm;
+        }
+
+        :root {
+          color-scheme: light;
+          --ink: #22211f;
+          --ink-soft: #5c5954;
+          --paper: #ffffff;
+          --paper-alt: #f4f4f4;
+          --rule: #d5d0c7;
+          --rule-dark: #817b72;
+          --accent: #a6421d;
+        }
+
+        body {
+          background: #ffffff;
+          font-size: 10pt;
+        }
+
+        .skip-link,
+        .masthead {
+          display: none;
+        }
+
+        .report-header,
+        .section,
+        .footer-inner {
+          width: 100%;
+          padding-block: 1.2rem;
+        }
+
+        .metrics,
+        .steps,
+        .calculation,
+        .changes,
+        .context-note,
+        .subsection {
+          break-inside: avoid;
+        }
+
+        .sources a::after {
+          color: var(--ink-soft);
+          font-size: 0.72em;
+          overflow-wrap: anywhere;
+          content: " [" attr(href) "]";
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">本文へ移動</a>
+
+    <header class="masthead">
+      <div class="masthead-inner">
+        <a class="brand" href="#main" aria-label="Durable Objects 請求事故レポートの先頭へ移動">
+          <span class="brand-mark" aria-hidden="true">DO</span>
+          <span class="brand-copy">Durable Objects<small>ぬこぬこさんのポカ共有</small></span>
+        </a>
+        <nav class="masthead-nav" aria-label="ページ内ナビゲーション">
+          <a href="#cause-title">原因</a>
+          <a href="#fix-title">修正</a>
+          <a href="#principles-title">教訓</a>
+          <span class="published">2026.08.10</span>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <article>
+        <header class="report-header">
+          <div class="hero-grid">
+            <div class="hero-amount-panel" aria-hidden="true">
+              <p class="hero-amount">$666</p>
+              <p class="hero-amount-label">Cloudflare 請求書の Rows Written 明細<br>2026 年 7 月 4 日〜8 月 3 日</p>
+            </div>
+            <div class="hero-copy">
+              <div class="hero-topline">
+                <p class="report-meta">INCIDENT REPORT · 2026.08</p>
+                <p class="hero-status"><strong>ソース修正済み</strong> / 本番停止中</p>
+              </div>
+              <h1><span class="visually-hidden">$666 の </span>Durable Objects 請求はなぜ発生したか</h1>
+              <p class="hero-tagline">何も処理していなくても、全履歴を書き直していた。</p>
+              <p class="summary">ぬこぬこさんが automated-hachathon-judge の JudgeState でやらかした、全件再保存の実装事故です。Cloudflare 請求書の Rows Written $666 明細をきっかけに、増幅経路を確認して差分保存と日次上限で塞ぐまでを公開します。</p>
+              <p class="hero-caveat">Cloudflare 請求書は Cloudflare アカウント全体の合算です。$666 全額を JudgeState Durable Object namespace へ帰属できる過去メトリクスはありません。</p>
+              <div class="hero-actions" aria-label="レポートの主要項目">
+                <a class="hero-button primary" href="#cause-title">原因を見る <span aria-hidden="true">↓</span></a>
+                <a class="hero-button" href="#fix-title">修正内容を見る</a>
+              </div>
+            </div>
+          </div>
+        </header>
+
+        <section class="overview" aria-labelledby="overview-title">
+          <h2 id="overview-title">まず結論</h2>
+          <dl class="metrics" aria-label="Cloudflare Durable Objects 請求事故の主要指標">
+            <div class="metric">
+              <dt>請求書の Rows Written</dt>
+              <dd>665,418,208 行</dd>
+            </div>
+            <div class="metric">
+              <dt>旧 Runner の名目送信頻度</dt>
+              <dd>約 5.2 回 / 秒</dd>
+            </div>
+            <div class="metric">
+              <dt>新しい日次書き込み上限</dt>
+              <dd>50,000 行</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section class="section" aria-labelledby="invoice-title">
+          <p class="section-number">1</p>
+          <h2 id="invoice-title">請求書に現れた 6.6 億行</h2>
+          <p class="lede">2026 年 7 月 4 日〜8 月 3 日の Cloudflare 請求書には、Durable Objects Storage Rows Written が 665,418,208 行、金額は $666 と記載されていました。<a class="ref" href="#source-1" aria-label="出典 1">[1]</a></p>
+
+          <div class="subsection">
+            <p>Rows Written は保存容量ではありません。<code>storage.put</code> または <code>storage.delete</code> が処理した key の数です。1 回の処理で 100 個の key を書けば、100 行として数えられます。<a class="ref" href="#source-2" aria-label="出典 2">[2]</a></p>
+            <p>この請求書は Cloudflare アカウント内の全 Durable Object namespace を合算しています。namespace 別の過去メトリクスがないため、hackathon-nukoevi-app の JudgeState と influ-quest の寄与を分離できません。</p>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="purpose-title">
+          <p class="section-number">2</p>
+          <h2 id="purpose-title">Durable Object を使った理由</h2>
+          <p class="lede">Durable Object は、同じ ID への処理を 1 個のインスタンスへ集めます。複数のリクエストを順番に処理しながら、状態を保存できる仕組みです。</p>
+
+          <div class="subsection">
+            <h3>automated-hachathon-judge</h3>
+            <p>JudgeState は、審査キュー、処理中ジョブ、審査結果を保存します。Runner（審査を実行する常駐プログラム）の複数の処理枠が同時に仕事を取りに来ても、同じジョブを重複取得しないためです。<a class="ref" href="#source-3" aria-label="出典 3">[3]</a></p>
+          </div>
+
+          <aside class="context-note">
+            <h3>influ-quest</h3>
+            <p>QuestAgent はゲーム状態、BrowserChatSession はチャット状態を利用者単位で保存します。書き込みは利用者の操作で発生し、何もしていない時間に全セッションを再保存する処理は確認できませんでした。<a class="ref" href="#source-7" aria-label="出典 7">[7]</a><a class="ref" href="#source-8" aria-label="出典 8">[8]</a></p>
+          </aside>
+
+          <p class="formula">Durable Object の採用は要件に合っていました。問題は、高頻度の定期通信と全件保存をつないだことです。</p>
+        </section>
+
+        <section class="section" aria-labelledby="cause-title">
+          <p class="section-number">3</p>
+          <h2 id="cause-title">1 回の通信が全件保存になった</h2>
+          <p class="lede">旧 Runner は仕事がない時間も JudgeState へ通信し、JudgeState はそのたびに保存済みジョブ全体を書き戻していました。</p>
+
+          <ol class="steps">
+            <li>
+              <h3>空のキューを何度も確認する</h3>
+              <p>10 個の処理枠が 2 秒ごとに claim を送り、5 秒ごとに heartbeat を送ります。旧 Runner の既定値では、合計の名目頻度が約 5.2 回 / 秒でした。<a class="ref" href="#source-4" aria-label="出典 4">[4]</a></p>
+            </li>
+            <li>
+              <h3>変化がなくても保存する</h3>
+              <p>空振りの claim と heartbeat の後にも、JudgeState は meta key と保存済みの全 job key を書き戻していました。<a class="ref" href="#source-5" aria-label="出典 5">[5]</a></p>
+            </li>
+            <li>
+              <h3>保存件数だけが増え続ける</h3>
+              <p>「最近の投稿」は 50 件までの表示でしたが、保存する job key には上限がありませんでした。ジョブが増えるほど、1 回の通信で書く行数も増えます。<a class="ref" href="#source-6" aria-label="出典 6">[6]</a></p>
+            </li>
+          </ol>
+
+          <p class="formula">概算 Rows Written ≈ 保存頻度 ×（保存済み job key 数 + meta key 1 件）× 稼働時間</p>
+
+          <figure class="calculation">
+            <figcaption>保存済みジョブを 50 件と仮定した感度分析</figcaption>
+            <p class="calculation-value">5.2 回 / 秒 × 51 行 / 回 × 86,400 秒 / 日 = 22,913,280 行 / 日</p>
+            <p>書き込み増幅の大きさを示す計算であり、$666 を再現した実測値ではありません。</p>
+          </figure>
+        </section>
+
+        <section class="section" aria-labelledby="fix-title">
+          <p class="section-number">4</p>
+          <h2 id="fix-title">全件保存をやめ、二重に止めた</h2>
+          <p class="lede">JudgeState は、値が変わった key だけを保存するように変更しました。異常へ早く気づく通知と、自動停止する上限も追加しています。<a class="ref" href="#source-9" aria-label="出典 9">[9]</a></p>
+
+          <dl class="changes comparison">
+            <div>
+              <dt>状態が変わらない処理</dt>
+              <dd><span class="change-label before">修正前</span><span class="change-copy">meta key と保存済みの全 job key を再保存</span></dd>
+              <dd><span class="change-label after">修正後</span><span class="change-copy">空のキューを確認する claim などは put と delete が 0 件</span></dd>
+            </div>
+            <div>
+              <dt>状態が変わる処理</dt>
+              <dd><span class="change-label before">修正前</span><span class="change-copy">変更していない job key まで再保存</span></dd>
+              <dd><span class="change-label after">修正後</span><span class="change-copy">値が変わった job key と meta key だけを保存</span></dd>
+            </div>
+            <div>
+              <dt>通信と入力</dt>
+              <dd><span class="change-label before">修正前</span><span class="change-copy">2 秒間隔の claim と、無認証の scoring callback</span></dd>
+              <dd><span class="change-label after">修正後</span><span class="change-copy">空振り時は最大 30 秒まで待機し、callback は認証と入力を検証</span></dd>
+            </div>
+          </dl>
+
+          <div class="subsection">
+            <h3>通知と停止は別の仕組みにする</h3>
+            <p>Cloudflare アカウント全体には、従量課金額が $1 と $10 に達したときの Budget Alert を設定しました。これはメール通知だけで、Worker を停止しません。<a class="ref" href="#source-10" aria-label="出典 10">[10]</a></p>
+            <p>JudgeState は成功した key 書き込みを UTC 日ごとに数えます。25,000 行で警告し、次の保存で 50,000 行を超える場合は HTTP 507 で拒否します。<a class="ref" href="#source-11" aria-label="出典 11">[11]</a></p>
+            <p>Budget Alert はアカウント全体の異常を知らせ、日次上限は JudgeState の異常な保存を止めます。監視範囲と役割が違うため、両方を使います。</p>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="principles-title">
+          <p class="section-number">5</p>
+          <h2 id="principles-title">この失敗から持ち帰ること</h2>
+          <p class="lede">今回のポカは Durable Object を選んだことではなく、高頻度の定期処理と全件保存をつないだことでした。</p>
+
+          <ol class="steps principles">
+            <li>
+              <h3>変化がなければ書かない</h3>
+              <p>状態を変えないリクエストは、永続ストレージへの put と delete を 0 件にします。</p>
+            </li>
+            <li>
+              <h3>回数だけでなく 1 回の重さを見る</h3>
+              <p>費用は「通信頻度 × 1 回に書く key 数 × 稼働時間」で見積もります。</p>
+            </li>
+            <li>
+              <h3>通知だけで終わらせない</h3>
+              <p>書き込み件数をテストし、保存件数に上限を設け、異常時はアプリ側でも止めます。</p>
+            </li>
+          </ol>
+
+          <aside class="context-note">
+            <h3>確定していることと、確定していないこと</h3>
+            <p>旧コードに Rows Written を増幅する経路があったことは確認済みです。$666 の namespace 別内訳は確定できません。</p>
+          </aside>
+        </section>
+
+        <section class="section" aria-labelledby="sources-title">
+          <p class="section-number">資料</p>
+          <h2 id="sources-title">出典</h2>
+          <ol class="sources">
+            <li id="source-1"><a href="https://cloudflare-do-report.nukoevi.app/invoice-line-item.jpg">Cloudflare 請求書の Durable Objects Storage Rows Written 明細（2026 年 7 月 4 日〜8 月 3 日）</a></li>
+            <li id="source-2"><a href="https://developers.cloudflare.com/durable-objects/platform/pricing/">Cloudflare Durable Objects Pricing</a></li>
+            <li id="source-3"><a href="https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/docs/architecture.md#L9-L59">automated-hachathon-judge の構成と Durable Object の役割</a></li>
+            <li id="source-4"><a href="https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/runner/index.ts#L18-L57">automated-hachathon-judge commit 8b494bd の Runner 並列数、claim 間隔、heartbeat</a></li>
+            <li id="source-5"><a href="https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/judge-state.ts#L10-L90">automated-hachathon-judge commit 8b494bd の JudgeState 無条件保存と全 job key 再保存</a></li>
+            <li id="source-6"><a href="https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/state-machine.ts#L76-L79">automated-hachathon-judge commit 8b494bd の recentIds 50 件上限と上限のない jobs 保持</a></li>
+            <li id="source-7"><a href="https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/wrangler.jsonc#L33-L53">influ-quest commit 9c518da の QuestAgent と BrowserChatSession Durable Object binding</a></li>
+            <li id="source-8"><a href="https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/src/chat-session.js#L91-L203">influ-quest commit 9c518da の BrowserChatSession によるセッション単位の状態保存とリクエスト直列化</a></li>
+            <li id="source-9"><a href="https://github.com/schroneko/automated-hachathon-judge/commit/c2ffc4a5c3e5423dabb26f5f17180b183f9fc1c5">automated-hachathon-judge commit c2ffc4a の差分保存、claim backoff、scoring callback 検証</a></li>
+            <li id="source-10"><a href="https://developers.cloudflare.com/billing/manage/budget-alerts/">Cloudflare Budget Alerts</a></li>
+            <li id="source-11"><a href="https://github.com/schroneko/automated-hachathon-judge/commit/e376e44fc8bed0060f82b49a4896852713c68ba3">automated-hachathon-judge commit e376e44 の日次書き込みガードと HTTP 507 による停止</a></li>
+          </ol>
+        </section>
+      </article>
+    </main>
+
+    <footer class="footer">
+      <div class="footer-inner">
+        <p>automated-hachathon-judge Durable Objects Rows Written 増幅レポート</p>
+        <p>Cloudflare 請求期間: 2026 年 7 月 4 日〜8 月 3 日</p>
+      </div>
+    </footer>
+  </body>
+</html>
