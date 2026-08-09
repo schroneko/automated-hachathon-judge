@@ -77,7 +77,7 @@ describe("Runner runtime", () => {
         callbackUrls.push(url);
         callbackAuthorizations.push(new Headers(init?.headers).get("authorization"));
         const payload = JSON.parse(String(init?.body)) as { submissionId: string };
-        return new Response(null, { status: payload.submissionId === "terminal" ? 400 : 204 });
+        return new Response(null, { status: payload.submissionId === "terminal" ? 507 : 204 });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
@@ -87,7 +87,7 @@ describe("Runner runtime", () => {
 
     try {
       vi.resetModules();
-      await expect(import("../src/runner/index")).rejects.toThrow("Callback failed with status 400");
+      await expect(import("../src/runner/index")).rejects.toThrow("Callback failed with status 507");
 
       expect(claimCount).toBe(2);
       expect(callbackUrls).toEqual([

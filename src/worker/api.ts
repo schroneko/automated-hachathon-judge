@@ -31,6 +31,12 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
     }
     return forwardState(env, "/runner-status");
   }
+  if (request.method === "GET" && url.pathname === "/internal/runner/write-budget") {
+    if (!runnerAuthorized(request, env)) {
+      return unauthorizedRunner(env);
+    }
+    return forwardState(env, "/write-budget");
+  }
   if (request.method === "POST" && url.pathname === "/internal/runner/claim") {
     if (!runnerAuthorized(request, env)) {
       return unauthorizedRunner(env);
@@ -116,6 +122,9 @@ async function createSubmission(request: Request, env: Env): Promise<Response> {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body)
   });
+  if (response.status === 507) {
+    return new Response(response.body, { status: response.status, headers: response.headers });
+  }
   const result = (await response.json()) as SubmitJobResult;
   if (!result.ok) {
     const init: ResponseInit = {
@@ -234,6 +243,9 @@ async function finalizeSubmission(request: Request, env: Env): Promise<Response>
     headers: { "content-type": "application/json" },
     body: JSON.stringify(statePayload)
   });
+  if (response.status === 507) {
+    return new Response(response.body, { status: response.status, headers: response.headers });
+  }
   const result = (await response.json()) as FinalizeResult;
   return jsonResponse(result, { status: response.status });
 }

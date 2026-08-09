@@ -169,6 +169,43 @@ describe("handleApiRequest", () => {
     expect(env.JUDGE_STATE.get).not.toHaveBeenCalled();
   });
 
+  it("requires Runner authentication for write budget status even while disabled", async () => {
+    const env = makeEnv(async () => Response.json({
+      utcDate: "2026-08-09",
+      rowsWritten: 12,
+      warningEmitted: false,
+      exhausted: false,
+      exhaustedAt: null,
+      warningRows: 25_000,
+      hardLimitRows: 50_000,
+      remainingRows: 49_988
+    }));
+    env.RUNNER_ENABLED = "false";
+    env.CALLBACKS_ENABLED = "false";
+
+    const denied = await handleApiRequest(
+      new Request("https://hackathon.nukoevi.app/internal/runner/write-budget"),
+      env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
+    );
+    expect(denied.status).toBe(401);
+    expect(env.JUDGE_STATE.get).not.toHaveBeenCalled();
+
+    const accepted = await handleApiRequest(
+      new Request("https://hackathon.nukoevi.app/internal/runner/write-budget", {
+        headers: { authorization: "Bearer runner-secret" }
+      }),
+      env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
+    );
+    expect(accepted.status).toBe(200);
+    await expect(accepted.json()).resolves.toMatchObject({
+      rowsWritten: 12,
+      hardLimitRows: 50_000
+    });
+    expect(env.JUDGE_STATE.get).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects submissions when the Runner is disabled before accessing state", async () => {
     const env = makeEnv(async () => new Response("{}", { status: 500 }));
     env.RUNNER_ENABLED = "false";
@@ -224,6 +261,36 @@ describe("handleApiRequest", () => {
     );
     expect(oversized.status).toBe(413);
     expect(oversizedEnv.JUDGE_STATE.get).not.toHaveBeenCalled();
+  });
+
+  it("preserves write budget exhaustion responses", async () => {
+    let requestCount = 0;
+    const env = makeEnv(async () => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return Response.json({ online: true });
+      }
+      return Response.json(
+        {
+          ok: false,
+          code: "write_budget_exhausted",
+          message: "Durable Object write budget exhausted"
+        },
+        { status: 507 }
+      );
+    });
+
+    const response = await handleApiRequest(
+      new Request("https://hackathon.nukoevi.app/api/submissions", {
+        method: "POST",
+        body: JSON.stringify({ repoUrl: "https://github.com/example/budget" })
+      }),
+      env,
+      { waitUntil: vi.fn(), passThroughOnException: vi.fn() } as any
+    );
+
+    expect(response.status).toBe(507);
+    await expect(response.json()).resolves.toMatchObject({ code: "write_budget_exhausted" });
   });
 
   it("forwards a schema-valid multibyte callback larger than 64 KiB", async () => {

@@ -70,6 +70,28 @@ export interface AppStateSnapshot {
   bucketQueues: Record<string, string[]>;
   bucketActive: Record<string, boolean>;
   runnerLastSeenAt: string | null;
+  writeBudget?: StateWriteBudget;
+}
+
+export interface StateWriteBudget {
+  utcDate: string;
+  rowsWritten: number;
+  warningEmitted: boolean;
+  exhausted: boolean;
+  exhaustedAt: string | null;
+}
+
+export interface StateWriteBudgetStatus extends StateWriteBudget {
+  warningRows: number;
+  hardLimitRows: number;
+  remainingRows: number;
+}
+
+export interface WriteBudgetExceededResult {
+  ok: false;
+  code: "write_budget_exhausted";
+  message: string;
+  writeBudget: StateWriteBudgetStatus;
 }
 
 export interface LeaseJob {

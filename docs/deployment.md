@@ -7,6 +7,8 @@
 - `name`: Worker 名
 - `routes`: custom domain
 - `CALLBACKS_ENABLED`: 初回は `false`
+- `JUDGE_STATE_ROWS_WRITTEN_DAILY_LIMIT`: UTC 日次 hard limit。既定値は `50000`
+- `JUDGE_STATE_ROWS_WRITTEN_DAILY_WARNING`: UTC 日次 warning。既定値は `25000`
 - `MAX_ACCEPTED_SUBMISSIONS`: event 全体の投稿上限
 - `RUNNER_ENABLED`: 初回は `false`
 - `SUBMISSIONS_OPEN`: 初回は `false` を推奨
@@ -15,6 +17,8 @@
 既存の `migrations` は Durable Object の履歴なので削除しないでください。
 
 clone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しません。以降の deploy を実行すると、自分の Cloudflare account で Worker と Durable Objects の利用量が計測されます。
+
+Cloudflare dashboard の Manage Account > Billing > Billable Usage で、account 全体の従量課金額に `$1` と `$10` の Budget Alert を設定します。Budget Alert は日次集計による遅延がある通知機能です。Budget Alert は Worker、Durable Object、従量課金を自動停止しません。
 
 ## 2. Runner token
 
@@ -84,6 +88,9 @@ Runner 起動後に public endpoint を確認します。
 curl https://judge.example.com/api/runner-status
 curl https://judge.example.com/api/submission-status
 curl https://judge.example.com/api/ranking
+RUNNER_TOKEN="$(<"$HOME/Library/Application Support/Hackathon Judge/runner-token")"
+curl -H "Authorization: Bearer $RUNNER_TOKEN" \
+  https://judge.example.com/internal/runner/write-budget
 ```
 
 ## 7. Open submissions
@@ -100,6 +107,12 @@ wrangler deploy
 課金や障害への緊急対応では、`CALLBACKS_ENABLED`、`RUNNER_ENABLED`、`SUBMISSIONS_OPEN` を同時に `false` にして deploy し、Runner process を停止します。無効化後の投稿、claim、heartbeat、recover、callback は Durable Object へ到達しません。
 
 状態保存は差分方式です。待機中の claim、拒否された submission と callback、変更のない recover は 0 write です。job の更新は保存済み履歴件数に比例せず、event 全体の投稿総数にも上限があります。
+
+日次書き込みガードは、`JUDGE_STATE` binding が参照する `global` JudgeState instance で成功した `storage.put` と `storage.delete` の key 数を UTC 日ごとに記録します。25,000 行に達すると構造化 warning を 1 回記録します。50,000 行の hard limit を超える保存は拒否します。Runner は HTTP `507` を受けると停止し、未送信結果を spool directory に残します。
+
+`GET /internal/runner/write-budget` は Runner bearer token で認証した read-only endpoint です。UTC 日付、成功した put / delete の key 数、warning、hard limit、停止状態を返し、Durable Object Storage を更新しません。
+
+日次書き込みガードの計測値は、Cloudflare 請求書に記載される Durable Objects Rows Written そのものではありません。別の Durable Object namespace、Cloudflare 内部処理、Requests、Duration は日次書き込みガードの計測対象外です。
 
 ## Update procedure
 

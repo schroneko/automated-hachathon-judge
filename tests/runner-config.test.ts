@@ -22,6 +22,7 @@ describe("runner configuration", () => {
     expect(shouldStopRunner(new Response(null, { status: 401 }))).toBe(true);
     expect(shouldStopRunner(new Response(null, { status: 403 }))).toBe(true);
     expect(shouldStopRunner(new Response(null, { status: 410 }))).toBe(true);
+    expect(shouldStopRunner(new Response(null, { status: 507 }))).toBe(true);
     expect(shouldStopRunner(new Response(null, { status: 503 }))).toBe(false);
   });
 
@@ -33,5 +34,6 @@ describe("runner configuration", () => {
     expect(isPermanentCallbackFailure(new Response(null, { status: 409 }))).toBe(false);
     expect(isPermanentCallbackFailure(new Response(null, { status: 429 }))).toBe(false);
     expect(isPermanentCallbackFailure(new Response(null, { status: 503 }))).toBe(false);
+    expect(isPermanentCallbackFailure(new Response(null, { status: 507 }))).toBe(true);
   });
 });

@@ -24,13 +24,15 @@ export function requireRunnerBaseUrl(value: string | undefined): string {
 }
 
 export function shouldStopRunner(response: Response): boolean {
-  return response.status === 401 || response.status === 403 || response.status === 410;
+  return response.status === 401 || response.status === 403 || response.status === 410 || response.status === 507;
 }
 
 export function isPermanentCallbackFailure(response: Response): boolean {
-  return response.status >= 400
+  return response.status === 507 || (
+    response.status >= 400
     && response.status < 500
     && response.status !== 408
     && response.status !== 409
-    && response.status !== 429;
+    && response.status !== 429
+  );
 }

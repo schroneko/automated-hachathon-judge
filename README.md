@@ -17,6 +17,7 @@
 - 最大 10 件を並列処理
 - prompt injection の兆候を通常点とは別の「ぬこスコア」として検出
 - 設定値だけで投稿受付の停止と再開が可能
+- JudgeState の日次書き込み件数に warning と hard limit を設定
 
 ## Scoring
 
@@ -95,6 +96,8 @@ Worker の設定は `wrangler.jsonc` に置きます。
 | 名前 | 種類 | 説明 |
 | --- | --- | --- |
 | `CALLBACKS_ENABLED` | Worker variable | `true` のときだけ認証済み scoring callback を許可。未設定時は停止 |
+| `JUDGE_STATE_ROWS_WRITTEN_DAILY_LIMIT` | Worker variable | JUDGE_STATE の UTC 日次 hard limit。未設定時は `50000` |
+| `JUDGE_STATE_ROWS_WRITTEN_DAILY_WARNING` | Worker variable | JUDGE_STATE の UTC 日次 warning。未設定時は `25000` |
 | `MAX_ACCEPTED_SUBMISSIONS` | Worker variable | 1 event で受け付ける submission の総数。未設定時は `500` |
 | `RUNNER_TOKEN` | Worker secret | internal Runner endpoint の bearer token |
 | `RUNNER_ENABLED` | Worker variable | `true` のときだけ claim、heartbeat、recover を許可。未設定時は停止 |
@@ -142,6 +145,10 @@ Runner の環境変数です。
 
 `RUNNER_ENABLED` が `false` のとき、claim、heartbeat、recover は Durable Object へ到達する前に拒否されます。処理中の結果を完了させながら停止する場合だけ `CALLBACKS_ENABLED` を一時的に `true` のまま残します。緊急停止では両方を `false` にします。
 
+JUDGE_STATE の日次書き込みガードは、`JUDGE_STATE` binding が参照する `global` JudgeState instance で成功した `storage.put` と `storage.delete` の key 数を UTC 日ごとに記録します。25,000 行に達すると構造化 warning を 1 回記録します。50,000 行の hard limit を超える保存は拒否します。拒否時の HTTP `507` を受けた Runner は停止し、未送信結果を spool directory に残します。
+
+日次書き込みガードの計測値は、Cloudflare 請求書に記載される Durable Objects Rows Written そのものではありません。別の Durable Object namespace、Cloudflare 内部処理、Requests、Duration は日次書き込みガードの計測対象外です。
+
 ## API
 
 | Method | Path | 用途 |
@@ -154,7 +161,7 @@ Runner の環境変数です。
 | `GET` | `/api/ranking` | リポジトリごとの最新 completed 結果 |
 | `GET` | `/api/runner-status` | Runner の heartbeat 状態 |
 
-`/internal/*` は Runner 用です。public client から使用しないでください。
+`/internal/*` は Runner 用です。public client から使用しないでください。`GET /internal/runner/write-budget` は Runner bearer token で認証した read-only endpoint で、UTC 日付、成功した put / delete の key 数、warning、hard limit、停止状態を返します。endpoint の呼び出しでは Durable Object Storage を更新しません。
 
 ## Security model
 
@@ -179,6 +186,8 @@ Runner の環境変数です。
 - Runner が無効なときは新規投稿と Runner の定期処理を Durable Object の手前で拒否します。
 - 状態保存は変更された job と metadata だけを書き込み、待機中や拒否された処理では書き込みません。
 - 1 イベントで受け付ける submission の総数を設定値で制限し、保存 job が無制限に増えないようにします。
+- JUDGE_STATE の成功した put / delete の key 数を UTC 日ごとに数え、25,000 行で warning を記録し、50,000 行で追加保存を停止します。
+- Cloudflare account 全体の従量課金額に `$1` と `$10` の Budget Alert を設定します。Budget Alert は日次集計による遅延があり、通知だけを行って Worker や Durable Object を停止しません。
 - Runner 起動時に中断された processing job を queue へ戻します。
 - callback 未完了の結果は spool directory に `0600` で保存し、再起動後に再送します。
 - missing、private、default branch なし、空のリポジトリは 4 観点すべて 0 点です。
