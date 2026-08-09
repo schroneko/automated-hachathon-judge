@@ -14,6 +14,23 @@ const resolution = {
 };
 
 describe("state machine", () => {
+  it("rejects submissions after the configured event limit", () => {
+    const state = createInitialSnapshot();
+    state.acceptedSubmissions = 2;
+
+    const result = submitJob(state, {
+      repoUrl: "https://github.com/example/limited",
+      ipHash: "limited",
+      callbackBaseUrl: "https://hackathon.nukoevi.app",
+      nowIso: now(0),
+      maxAcceptedSubmissions: 2,
+      resolution
+    });
+
+    expect(result).toMatchObject({ ok: false, code: "submission_limit" });
+    expect(state.jobs).toEqual({});
+  });
+
   it("allows another submission from the same IP after one second", () => {
     const state = createInitialSnapshot();
     const first = submitJob(state, {
@@ -57,6 +74,24 @@ describe("state machine", () => {
     expect(interrupted).toBeDefined();
     expect(recoverProcessingJobs(state, now(2))).toBe(1);
     expect(claimJob(state, "https://hackathon.nukoevi.app", now(3))?.submissionId).toBe(interrupted?.submissionId);
+  });
+
+  it("bounds recovered jobs per request", () => {
+    const state = createInitialSnapshot();
+    for (let index = 0; index < 25; index += 1) {
+      submitJob(state, {
+        repoUrl: `https://github.com/example/recover-${index}`,
+        ipHash: `recover-${index}`,
+        callbackBaseUrl: "https://hackathon.nukoevi.app",
+        nowIso: now(index),
+        resolution
+      });
+      claimJob(state, "https://hackathon.nukoevi.app", now(index));
+    }
+
+    expect(recoverProcessingJobs(state, now(30))).toBe(10);
+    expect(recoverProcessingJobs(state, now(31))).toBe(10);
+    expect(recoverProcessingJobs(state, now(32))).toBe(5);
   });
 
   it("excludes configured owners from ranking", () => {

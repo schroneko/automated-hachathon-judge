@@ -1,4 +1,4 @@
-import { IP_SUBMISSION_COOLDOWN_MS, MAX_RECENT_SUBMISSIONS, SCORER_BUCKET_COUNT } from "../shared/constants";
+import { DEFAULT_MAX_ACCEPTED_SUBMISSIONS, IP_SUBMISSION_COOLDOWN_MS, MAX_RECENT_SUBMISSIONS, MAX_RECOVERED_JOBS_PER_REQUEST, SCORER_BUCKET_COUNT } from "../shared/constants";
 import type {
   AppStateSnapshot,
   FinalizePayload,
@@ -16,6 +16,7 @@ import { buildZeroScoreResult } from "../shared/scoring";
 
 export function createInitialSnapshot(): AppStateSnapshot {
   return {
+    acceptedSubmissions: 0,
     jobs: {},
     recentIds: [],
     repoInflight: {},
@@ -32,6 +33,15 @@ export function createInitialSnapshot(): AppStateSnapshot {
 }
 
 export function submitJob(state: AppStateSnapshot, input: SubmitJobInput): SubmitJobResult {
+  const submissionLimit = validSubmissionLimit(input.maxAcceptedSubmissions);
+  if (state.acceptedSubmissions >= submissionLimit) {
+    return {
+      ok: false,
+      code: "submission_limit",
+      message: "このイベントの投稿上限に達しました。"
+    };
+  }
+
   const repo = normalizeGitHubRepoUrl(input.repoUrl);
   const cooldownUntilIso = state.ipCooldowns[input.ipHash];
   if (cooldownUntilIso) {
@@ -74,6 +84,7 @@ export function submitJob(state: AppStateSnapshot, input: SubmitJobInput): Submi
   };
 
   state.jobs[id] = record;
+  state.acceptedSubmissions += 1;
   state.recentIds.unshift(id);
   state.recentIds = state.recentIds.slice(0, MAX_RECENT_SUBMISSIONS);
   state.ipCooldowns[input.ipHash] = new Date(
@@ -136,6 +147,9 @@ export function recoverProcessingJobs(state: AppStateSnapshot, nowIso: string): 
       queue.unshift(job.id);
     }
     recovered += 1;
+    if (recovered >= MAX_RECOVERED_JOBS_PER_REQUEST) {
+      break;
+    }
   }
   return recovered;
 }
@@ -282,4 +296,10 @@ function bucketQueue(state: AppStateSnapshot, bucket: number): string[] {
   }
   state.bucketQueues[key] = [];
   return state.bucketQueues[key];
+}
+
+function validSubmissionLimit(value: number | undefined): number {
+  return Number.isSafeInteger(value) && value && value > 0
+    ? value
+    : DEFAULT_MAX_ACCEPTED_SUBMISSIONS;
 }

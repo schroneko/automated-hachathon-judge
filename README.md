@@ -68,6 +68,8 @@ npm run build
 
 Cloudflare と Runner のセットアップは [Deployment](docs/deployment.md) を参照してください。
 
+リポジトリの clone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しません。課金が始まるのは、自分の Cloudflare account へ明示的に deploy して Worker を利用した後です。
+
 ## Local development
 
 frontend と Worker を起動します。
@@ -77,7 +79,7 @@ npm run build:client
 wrangler dev
 ```
 
-別 terminal で Runner を起動します。ローカルで投稿を受け付ける場合は `wrangler.jsonc` の `SUBMISSIONS_OPEN` を `true` にします。
+別 terminal で Runner を起動します。ローカルで投稿を受け付ける場合は `wrangler.jsonc` の `CALLBACKS_ENABLED`、`RUNNER_ENABLED`、`SUBMISSIONS_OPEN` を `true` にします。
 
 ```bash
 RUNNER_BASE_URL=http://127.0.0.1:8787 \
@@ -92,7 +94,10 @@ Worker の設定は `wrangler.jsonc` に置きます。
 
 | 名前 | 種類 | 説明 |
 | --- | --- | --- |
+| `CALLBACKS_ENABLED` | Worker variable | `true` のときだけ認証済み scoring callback を許可。未設定時は停止 |
+| `MAX_ACCEPTED_SUBMISSIONS` | Worker variable | 1 event で受け付ける submission の総数。未設定時は `500` |
 | `RUNNER_TOKEN` | Worker secret | internal Runner endpoint の bearer token |
+| `RUNNER_ENABLED` | Worker variable | `true` のときだけ claim、heartbeat、recover を許可。未設定時は停止 |
 | `PUBLIC_BASE_URL` | Worker variable | callback URL の public origin。未設定時は request origin |
 | `SUBMISSIONS_OPEN` | Worker variable | `true` のときだけ新規投稿を許可。未設定時は停止 |
 | `UNRANKED_OWNERS` | Worker variable | ランキング末尾へ送る GitHub owner のカンマ区切り一覧 |
@@ -101,17 +106,17 @@ Runner の環境変数です。
 
 | 名前 | 既定値 | 説明 |
 | --- | --- | --- |
-| `RUNNER_BASE_URL` | 稼働例の URL | Worker の origin |
+| `RUNNER_BASE_URL` | なし。必須 | Worker の origin。未設定時は Runner を起動しない |
 | `RUNNER_TOKEN_FILE` | macOS Application Support 配下 | `RUNNER_TOKEN` と同じ値を入れた file |
 | `RUNNER_SPOOL_DIR` | macOS Application Support 配下 | callback 完了前の結果を保護する directory |
 | `RUNNER_CONCURRENCY` | `10` | 並列数。1〜10 |
-| `RUNNER_POLL_INTERVAL_MS` | `2000` | queue polling interval。500〜30000 ms |
+| `RUNNER_POLL_INTERVAL_MS` | `2000` | queue polling の初期間隔。待機中は最大 30000 ms まで自動的に延長 |
 | `CODEX_MODEL` | `gpt-5.4` | Runner が使用する Codex model |
 | `GITHUB_TOKEN` | `gh auth token` の結果 | GitHub API token。未設定時は Runner が `gh` から取得 |
 
 ## Submission control
 
-受付停止中もランキングと既存結果は公開されます。
+`SUBMISSIONS_OPEN` は新規投稿だけを制御します。Runner と Durable Object への定期アクセスも止める場合は、`RUNNER_ENABLED` も `false` にします。
 
 受付を停止する場合:
 
@@ -126,6 +131,16 @@ Runner の環境変数です。
 ```
 
 変更後に `npm run build` と `wrangler deploy` を実行してください。API は停止中の新規投稿へ `403` を返します。
+
+完全停止する場合:
+
+```json
+"CALLBACKS_ENABLED": "false",
+"RUNNER_ENABLED": "false",
+"SUBMISSIONS_OPEN": "false"
+```
+
+`RUNNER_ENABLED` が `false` のとき、claim、heartbeat、recover は Durable Object へ到達する前に拒否されます。処理中の結果を完了させながら停止する場合だけ `CALLBACKS_ENABLED` を一時的に `true` のまま残します。緊急停止では両方を `false` にします。
 
 ## API
 
@@ -149,6 +164,7 @@ Runner の環境変数です。
 - Codex thread は read-only sandbox、network disabled、web search disabled で実行します。
 - Codex subprocess へは `HOME` と `PATH` だけを明示的に渡し、GitHub token を渡しません。
 - callback は submission ごとの random token で認証します。
+- callback endpoint 自体も Runner の bearer token で認証し、body size、schema、score の整合性を Durable Object の手前で検証します。
 - public result から callback token と IP hash を除外します。
 - Runner token と Codex credentials は Cloudflare source や Git history に保存しません。
 - submission と結果は public data です。秘密情報を含むリポジトリを投稿しないでください。
@@ -160,6 +176,9 @@ Runner の環境変数です。
 ## Operations
 
 - Runner heartbeat が 30 秒途切れると Worker は新規投稿を拒否します。
+- Runner が無効なときは新規投稿と Runner の定期処理を Durable Object の手前で拒否します。
+- 状態保存は変更された job と metadata だけを書き込み、待機中や拒否された処理では書き込みません。
+- 1 イベントで受け付ける submission の総数を設定値で制限し、保存 job が無制限に増えないようにします。
 - Runner 起動時に中断された processing job を queue へ戻します。
 - callback 未完了の結果は spool directory に `0600` で保存し、再起動後に再送します。
 - missing、private、default branch なし、空のリポジトリは 4 観点すべて 0 点です。

@@ -6,10 +6,15 @@
 
 - `name`: Worker 名
 - `routes`: custom domain
+- `CALLBACKS_ENABLED`: 初回は `false`
+- `MAX_ACCEPTED_SUBMISSIONS`: event 全体の投稿上限
+- `RUNNER_ENABLED`: 初回は `false`
 - `SUBMISSIONS_OPEN`: 初回は `false` を推奨
 - `UNRANKED_OWNERS`: 主催者の GitHub owner。不要なら空文字
 
 既存の `migrations` は Durable Object の履歴なので削除しないでください。
+
+clone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しません。以降の deploy を実行すると、自分の Cloudflare account で Worker と Durable Objects の利用量が計測されます。
 
 ## 2. Runner token
 
@@ -45,7 +50,22 @@ codex login
 
 Runner は `gh auth token` を process memory に読み込みます。Codex SDK は Runner host の Codex authentication を利用します。
 
-## 5. Start Runner
+## 5. Enable and start Runner
+
+投稿受付を閉じたまま `CALLBACKS_ENABLED` と `RUNNER_ENABLED` を `true` にして deploy します。
+
+```json
+"CALLBACKS_ENABLED": "true",
+"RUNNER_ENABLED": "true",
+"SUBMISSIONS_OPEN": "false"
+```
+
+```bash
+npm run build
+wrangler deploy
+```
+
+`RUNNER_BASE_URL` は必須です。公開中の別環境へ接続する既定値はありません。
 
 ```bash
 RUNNER_BASE_URL=https://judge.example.com \
@@ -75,7 +95,11 @@ npm run build
 wrangler deploy
 ```
 
-イベント終了後は `false` に戻して deploy します。既存ランキングは残ります。
+イベント終了時は、最初に `SUBMISSIONS_OPEN` と `RUNNER_ENABLED` を `false`、`CALLBACKS_ENABLED` を `true` にして deploy します。新しい job の取得を止めた状態で処理中 callback の完了を確認し、`CALLBACKS_ENABLED` も `false` にして再度 deploy します。その後、process supervisor から Runner を停止します。既存ランキングは残ります。
+
+課金や障害への緊急対応では、`CALLBACKS_ENABLED`、`RUNNER_ENABLED`、`SUBMISSIONS_OPEN` を同時に `false` にして deploy し、Runner process を停止します。無効化後の投稿、claim、heartbeat、recover、callback は Durable Object へ到達しません。
+
+状態保存は差分方式です。待機中の claim、拒否された submission と callback、変更のない recover は 0 write です。job の更新は保存済み履歴件数に比例せず、event 全体の投稿総数にも上限があります。
 
 ## Update procedure
 

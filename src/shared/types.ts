@@ -61,6 +61,7 @@ export interface RepoResolution {
 }
 
 export interface AppStateSnapshot {
+  acceptedSubmissions: number;
   jobs: Record<string, SubmissionRecord>;
   recentIds: string[];
   repoInflight: Record<string, string>;
@@ -89,6 +90,7 @@ export interface SubmitJobInput {
   ipHash: string;
   callbackBaseUrl: string;
   nowIso: string;
+  maxAcceptedSubmissions?: number;
   resolution: RepoResolution;
 }
 
@@ -99,7 +101,7 @@ export interface SubmitJobSuccess {
 
 export interface SubmitJobError {
   ok: false;
-  code: "cooldown" | "duplicate_inflight" | "invalid_repo";
+  code: "cooldown" | "duplicate_inflight" | "invalid_repo" | "submission_limit";
   message: string;
   retryAfterMs?: number;
 }

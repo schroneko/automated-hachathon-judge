@@ -38,6 +38,9 @@
     }
   ],
   "vars": {
+    "CALLBACKS_ENABLED": "false",
+    "MAX_ACCEPTED_SUBMISSIONS": "500",
+    "RUNNER_ENABLED": "false",
     "SUBMISSIONS_OPEN": "false",
     "UNRANKED_OWNERS": "schroneko"
   }

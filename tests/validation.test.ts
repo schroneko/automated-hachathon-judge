@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeGitHubRepoUrl, validatePublicScoreResult } from "../src/shared/validation";
+import { normalizeGitHubRepoUrl, parseScoringCallbackBody, validatePublicScoreResult } from "../src/shared/validation";
 
 describe("normalizeGitHubRepoUrl", () => {
   it("normalizes a standard GitHub repository URL", () => {
@@ -67,5 +67,63 @@ describe("validatePublicScoreResult", () => {
         ]
       })
     ).toThrow(/zero scores/);
+  });
+});
+
+describe("parseScoringCallbackBody", () => {
+  it("applies semantic score validation to completed callbacks", () => {
+    expect(() => parseScoringCallbackBody(JSON.stringify({
+      submissionId: "submission-id",
+      callbackToken: "callback-token",
+      bucket: 0,
+      outcome: {
+        kind: "completed",
+        result: {
+          summary: "bad",
+          publicReason: "bad",
+          repoAssessment: "scored",
+          pinnedSha: "a".repeat(40),
+          total: 1,
+          criteria: [
+            { key: "technical", label: "技術的な実装", score: 0, reason: "no", evidencePaths: [] },
+            { key: "ux", label: "デザインとユーザー体験", score: 0, reason: "no", evidencePaths: [] },
+            { key: "impact", label: "潜在的なインパクト", score: 0, reason: "no", evidencePaths: [] },
+            { key: "idea", label: "アイデアの質", score: 0, reason: "no", evidencePaths: [] }
+          ]
+        }
+      }
+    }))).toThrow(/Total score/);
+  });
+
+  it("accepts the maximum configured evidence path payload", () => {
+    const evidencePaths = Array.from({ length: 24 }, (_, index) =>
+      `${String(index).padStart(2, "0")}-${"あ".repeat(297)}`
+    );
+    const body = JSON.stringify({
+      submissionId: "submission-id",
+      callbackToken: "callback-token",
+      bucket: 0,
+      outcome: {
+        kind: "completed",
+        result: {
+          summary: "empty",
+          publicReason: "empty",
+          repoAssessment: "empty_repository",
+          pinnedSha: null,
+          total: 0,
+          criteria: [
+            { key: "technical", label: "技術的な実装", score: 0, reason: "no", evidencePaths },
+            { key: "ux", label: "デザインとユーザー体験", score: 0, reason: "no", evidencePaths },
+            { key: "impact", label: "潜在的なインパクト", score: 0, reason: "no", evidencePaths },
+            { key: "idea", label: "アイデアの質", score: 0, reason: "no", evidencePaths }
+          ]
+        }
+      }
+    });
+    expect(new TextEncoder().encode(body).byteLength).toBeGreaterThan(65_536);
+
+    const parsed = parseScoringCallbackBody(body);
+
+    expect(parsed.outcome.kind).toBe("completed");
   });
 });

@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { API_BODY_LIMIT_BYTES, CRITERIA, SCORE_ANCHORS, SCORER_BUCKET_COUNT } from "./constants";
-import type { CriterionKey, NormalizedRepo, PublicScoreResult } from "./types";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, CRITERIA, SCORE_ANCHORS, SCORER_BUCKET_COUNT } from "./constants";
+import type { CriterionKey, FinalizePayload, NormalizedRepo, PublicScoreResult } from "./types";
 
 const submissionBodySchema = z.object({
   repoUrl: z.string().min(1).max(512)
@@ -30,6 +30,26 @@ export const publicScoreResultSchema = z.object({
   total: z.number().int().min(0).max(40),
   nukoScore: z.number().int().min(80).max(100).nullable().default(null)
 });
+
+const scoringCallbackBodySchema = z.object({
+  submissionId: z.string().min(1).max(100),
+  callbackToken: z.string().min(1).max(100),
+  bucket: z.number().int().min(0).max(SCORER_BUCKET_COUNT - 1),
+  outcome: z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("completed"),
+      result: publicScoreResultSchema
+    }).strict(),
+    z.object({
+      kind: z.literal("retryable_failure"),
+      message: z.string().min(1).max(400)
+    }).strict(),
+    z.object({
+      kind: z.literal("failed"),
+      message: z.string().min(1).max(400)
+    }).strict()
+  ])
+}).strict();
 
 export const codexOutputSchema = {
   type: "object",
@@ -79,6 +99,25 @@ export function parseSubmissionBody(input: string): { repoUrl: string } {
   }
   const parsed = JSON.parse(input);
   return submissionBodySchema.parse(parsed);
+}
+
+export function parseScoringCallbackBody(
+  input: string
+): Omit<FinalizePayload, "callbackBaseUrl" | "nowIso"> {
+  if (new TextEncoder().encode(input).length > CALLBACK_BODY_LIMIT_BYTES) {
+    throw new Error("Request body too large");
+  }
+  const parsed = scoringCallbackBodySchema.parse(JSON.parse(input));
+  if (parsed.outcome.kind === "completed") {
+    return {
+      ...parsed,
+      outcome: {
+        ...parsed.outcome,
+        result: validatePublicScoreResult(parsed.outcome.result)
+      }
+    };
+  }
+  return parsed;
 }
 
 export function normalizeGitHubRepoUrl(input: string): NormalizedRepo {

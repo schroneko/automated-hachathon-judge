@@ -3,7 +3,9 @@ import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { FinalizePayload, LeaseJob } from "../shared/types";
+import { MAX_RECOVERED_JOBS_PER_REQUEST } from "../shared/constants";
 import { scoreSubmission } from "../container/scorer";
+import { isPermanentCallbackFailure, requireRunnerBaseUrl, shouldStopRunner } from "./config";
 
 type RunnerOutcome = Omit<FinalizePayload, "callbackBaseUrl" | "nowIso">;
 
@@ -12,13 +14,19 @@ interface PendingResult {
   payload: RunnerOutcome;
 }
 
-const baseUrl = (process.env.RUNNER_BASE_URL ?? "https://hackathon.nukoevi.app").replace(/\/+$/, "");
+class PermanentCallbackError extends Error {}
+
+const baseUrl = requireRunnerBaseUrl(process.env.RUNNER_BASE_URL);
+const callbackUrl = `${baseUrl}/internal/scoring-callback`;
 const tokenFile = process.env.RUNNER_TOKEN_FILE ?? join(homedir(), "Library", "Application Support", "Hackathon Judge", "runner-token");
 const spoolDir = process.env.RUNNER_SPOOL_DIR ?? join(homedir(), "Library", "Application Support", "Hackathon Judge", "spool");
 const concurrency = boundedInteger(process.env.RUNNER_CONCURRENCY, 10, 1, 10);
 const pollIntervalMs = boundedInteger(process.env.RUNNER_POLL_INTERVAL_MS, 2000, 500, 30000);
+const maxIdleBackoffMs = 30000;
 const token = (await readFile(tokenFile, "utf8")).trim();
 let shuttingDown = false;
+let runnerDisabled = false;
+let terminalError: PermanentCallbackError | null = null;
 
 if (!token) {
   throw new Error("Runner token is empty");
@@ -39,27 +47,46 @@ await mkdir(spoolDir, { recursive: true, mode: 0o700 });
 await replayPendingResults();
 await recoverProcessingJobs();
 
-const heartbeatTimer = setInterval(() => {
-  void sendHeartbeat();
-}, 5000);
-heartbeatTimer.unref();
-await sendHeartbeat();
+if (!shuttingDown && !runnerDisabled) {
+  const heartbeatTimer = setInterval(() => {
+    void sendHeartbeat();
+  }, 5000);
+  heartbeatTimer.unref();
+  await sendHeartbeat();
+}
 
-console.log(`Runner started with ${concurrency} slots`);
-await Promise.all(Array.from({ length: concurrency }, (_, slot) => runSlot(slot + 1)));
+if (!shuttingDown && !runnerDisabled) {
+  console.log(`Runner started with ${concurrency} slots`);
+  await Promise.all(Array.from({ length: concurrency }, (_, slot) => runSlot(slot + 1)));
+}
+
+if (terminalError) {
+  throw terminalError;
+}
 
 async function runSlot(slot: number): Promise<void> {
-  while (!shuttingDown) {
+  let idleDelayMs = pollIntervalMs;
+  while (!shuttingDown && !runnerDisabled) {
     try {
       const job = await claimJob();
       if (!job) {
-        await sleep(pollIntervalMs);
+        if (shuttingDown || runnerDisabled) {
+          return;
+        }
+        await sleep(idleDelayMs);
+        idleDelayMs = Math.min(idleDelayMs * 2, maxIdleBackoffMs);
         continue;
       }
+      idleDelayMs = pollIntervalMs;
       console.log(`Slot ${slot} claimed ${job.submissionId}`);
       await processJob(job);
       console.log(`Slot ${slot} completed ${job.submissionId}`);
     } catch (error) {
+      if (error instanceof PermanentCallbackError) {
+        terminalError ??= error;
+        runnerDisabled = true;
+        return;
+      }
       console.error(`Slot ${slot} error`, error);
       await sleep(5000);
     }
@@ -73,6 +100,10 @@ async function claimJob(): Promise<LeaseJob | null> {
     signal: AbortSignal.timeout(15000)
   });
   if (response.status === 204) {
+    return null;
+  }
+  if (shouldStopRunner(response)) {
+    runnerDisabled = true;
     return null;
   }
   if (!response.ok) {
@@ -98,7 +129,7 @@ async function processJob(job: LeaseJob): Promise<void> {
   }
 
   const pending: PendingResult = {
-    callbackUrl: job.callbackUrl,
+    callbackUrl,
     payload: {
       submissionId: job.submissionId,
       callbackToken: job.callbackToken,
@@ -134,17 +165,23 @@ async function deliverPendingResult(pending: PendingResult): Promise<void> {
   let delayMs = 1000;
   while (!shuttingDown) {
     try {
-      const response = await fetch(pending.callbackUrl, {
+      const response = await fetch(callbackUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: runnerHeaders(),
         body: JSON.stringify(pending.payload),
         signal: AbortSignal.timeout(15000)
       });
       if (response.ok || response.status === 409) {
         return;
       }
+      if (isPermanentCallbackFailure(response)) {
+        throw new PermanentCallbackError(`Callback failed with status ${response.status}`);
+      }
       throw new Error(`Callback failed with status ${response.status}`);
     } catch (error) {
+      if (error instanceof PermanentCallbackError) {
+        throw error;
+      }
       console.error(`Callback pending for ${pending.payload.submissionId}`, error);
       await sleep(delayMs);
       delayMs = Math.min(delayMs * 2, 30000);
@@ -154,12 +191,19 @@ async function deliverPendingResult(pending: PendingResult): Promise<void> {
 }
 
 async function sendHeartbeat(): Promise<void> {
+  if (runnerDisabled) {
+    return;
+  }
   try {
     const response = await fetch(`${baseUrl}/internal/runner/heartbeat`, {
       method: "POST",
       headers: runnerHeaders(),
       signal: AbortSignal.timeout(10000)
     });
+    if (shouldStopRunner(response)) {
+      runnerDisabled = true;
+      return;
+    }
     if (!response.ok) {
       throw new Error(`Heartbeat failed with status ${response.status}`);
     }
@@ -169,16 +213,27 @@ async function sendHeartbeat(): Promise<void> {
 }
 
 async function recoverProcessingJobs(): Promise<void> {
-  const response = await fetch(`${baseUrl}/internal/runner/recover`, {
-    method: "POST",
-    headers: runnerHeaders(),
-    signal: AbortSignal.timeout(15000)
-  });
-  if (!response.ok) {
-    throw new Error(`Recovery failed with status ${response.status}`);
+  let recoveredTotal = 0;
+  while (!shuttingDown) {
+    const response = await fetch(`${baseUrl}/internal/runner/recover`, {
+      method: "POST",
+      headers: runnerHeaders(),
+      signal: AbortSignal.timeout(15000)
+    });
+    if (shouldStopRunner(response)) {
+      runnerDisabled = true;
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(`Recovery failed with status ${response.status}`);
+    }
+    const body = (await response.json()) as { recovered: number };
+    recoveredTotal += body.recovered;
+    if (body.recovered < MAX_RECOVERED_JOBS_PER_REQUEST) {
+      break;
+    }
   }
-  const body = (await response.json()) as { recovered: number };
-  console.log(`Recovered ${body.recovered} interrupted jobs`);
+  console.log(`Recovered ${recoveredTotal} interrupted jobs`);
 }
 
 function runnerHeaders(): Record<string, string> {
