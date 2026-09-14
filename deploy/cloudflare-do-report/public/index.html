@@ -908,6 +908,37 @@
           </dl>
         </section>
 
+        <section class="section" aria-labelledby="about-do-title">
+          <p class="section-number">前提</p>
+          <h2 id="about-do-title">Durable Objects とは</h2>
+          <p class="lede">Cloudflare Durable Objects は、チャットルームや対戦部屋など、特定の対象に関する処理とデータをまとめて管理する仕組みです。同じ ID へのリクエストを同じ Object に集め、専用のストレージに状態を保存できます。複数の利用者が参加するチャットやゲーム、共同編集などで使われます。<a class="ref" href="#source-12" aria-label="出典 12">[12]</a></p>
+          <div class="subsection">
+            <p>たとえば対戦ゲームなら、部屋ごとに Object を用意し、参加者の操作を受け取ってゲームの状態を更新し、その結果を全員に送ります。データの保存に加えて、そのデータを扱う処理や参加者の接続も同じ場所で管理できるのが特徴です。</p>
+            <h3>他の Cloudflare サービスとの違い</h3>
+            <p>Workers が Web サイトや API の処理を実行し、D1 が SQL で扱うデータを保存するのに対して、Durable Objects は対象ごとの状態と処理を受け持ちます。KV は読み取り中心のデータ、R2 は画像などのファイル、Queues は後で実行する仕事の受け渡しを担当します。<a class="ref" href="#source-13" aria-label="出典 13">[13]</a></p>
+            <p>今回の審査アプリでは、審査待ちのジョブや処理状況を JudgeState という Durable Object に集めていました。複数の Runner（審査を実行するプログラム）の処理枠が同時に仕事を取りに来ても、同じジョブを重複して渡さないためです。<a class="ref" href="#source-3" aria-label="出典 3">[3]</a></p>
+          </div>
+        </section>
+
+        <section class="section" aria-labelledby="pricing-title">
+          <p class="section-number">前提</p>
+          <h2 id="pricing-title">Durable Objects の課金体系</h2>
+          <p class="lede">料金は処理とストレージに分かれます。以下は 2026 年 9 月 10 日に確認した SQLite ベースの Durable Objects の料金です。Workers Paid は月額最低 $5 で、含まれる利用枠を超えると従量料金が加わります。呼び出し元の Worker の利用料は別に計測されます。<a class="ref" href="#source-2" aria-label="出典 2">[2]</a></p>
+          <dl class="changes">
+            <div><dt>リクエスト数</dt><dd>Free: 10 万回 / 日。Paid: 100 万回 / 月まで含み、超過 100 万回につき $0.15。</dd></div>
+            <div><dt>稼働時間（Duration）</dt><dd>Free: 13,000 GB-s / 日。Paid: 400,000 GB-s / 月まで含み、超過 100 万 GB-s につき $12.50。</dd></div>
+            <div><dt>読み取り行数</dt><dd>Free: 500 万行 / 日。Paid: 250 億行 / 月まで含み、超過 100 万行につき $0.001。</dd></div>
+            <div><dt>書き込み行数</dt><dd>Free: 10 万行 / 日。Paid: 5,000 万行 / 月まで含み、超過 100 万行につき $1。</dd></div>
+            <div><dt>保存容量</dt><dd>Free: 合計 5 GB。Paid: 5 GB-month まで含み、超過 1 GB-month につき $0.20。</dd></div>
+          </dl>
+          <div class="subsection">
+            <p>Free は上限を超えた種類の操作がエラーになり、日次枠は UTC 0 時にリセットされます。Paid の超過利用量は課金単位へ切り上げられます。上記は SQLite ベースの料金で、旧 KV ベースのストレージには別の料金体系があります。</p>
+            <h3>稼働時間と書き込みは別に数える</h3>
+            <p>GB-s は割り当てメモリ容量と経過時間の積です。Duration は実際のメモリ使用量によらず Object ごとに 128 MB として計測され、CPU が計算した時間だけを指すものではありません。休止可能な待機中は対象外ですが、休止できない状態では待機中も対象になります。</p>
+            <p>SQLite ベースでは <code>put()</code> と <code>delete()</code> も書き込み行数に含まれます。保存容量が増えなくても、同じデータを書き直し続けると書き込み量は積み上がります。今回の $666 は、この Rows Written の請求明細です。<a class="ref" href="#source-1" aria-label="出典 1">[1]</a></p>
+          </div>
+        </section>
+
         <section class="section" aria-labelledby="invoice-title">
           <p class="section-number">1</p>
           <h2 id="invoice-title">請求書に現れた 6.6 億行</h2>
@@ -922,7 +953,7 @@
         <section class="section" aria-labelledby="purpose-title">
           <p class="section-number">2</p>
           <h2 id="purpose-title">Durable Object を使った理由</h2>
-          <p class="lede">Durable Object は、同じ ID への処理を 1 個のインスタンスへ集めます。複数のリクエストを順番に処理しながら、状態を保存できる仕組みです。</p>
+          <p class="lede">このレポートで確認した 2 つのアプリでは、審査ジョブや利用者ごとの状態を管理するために Durable Objects を使っていました。</p>
 
           <div class="subsection">
             <h3>automated-hachathon-judge</h3>
@@ -1038,6 +1069,8 @@
             <li id="source-9"><a href="https://github.com/schroneko/automated-hachathon-judge/commit/c2ffc4a5c3e5423dabb26f5f17180b183f9fc1c5">automated-hachathon-judge commit c2ffc4a の差分保存、claim backoff、scoring callback 検証</a></li>
             <li id="source-10"><a href="https://developers.cloudflare.com/billing/manage/budget-alerts/">Cloudflare Budget Alerts</a></li>
             <li id="source-11"><a href="https://github.com/schroneko/automated-hachathon-judge/commit/e376e44fc8bed0060f82b49a4896852713c68ba3">automated-hachathon-judge commit e376e44 の日次書き込みガードと HTTP 507 による停止</a></li>
+            <li id="source-12"><a href="https://developers.cloudflare.com/durable-objects/concepts/what-are-durable-objects/">Cloudflare: What are Durable Objects?</a></li>
+            <li id="source-13"><a href="https://developers.cloudflare.com/workers/platform/storage-options/">Cloudflare: Choosing a data or storage product</a></li>
           </ol>
         </section>
       </article>

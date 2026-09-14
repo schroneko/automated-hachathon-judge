@@ -1,0 +1,419 @@
+{
+  "ok": true,
+  "widget_type": "artifact",
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "$666 の Durable Objects 請求はなぜ発生したか",
+    "description": "Cloudflare Workers で発生した書き込み増幅事故を、2 つのサービスの実装、根本原因、再発防止策から読み解く公開インシデントレポート。",
+    "generatedAt": "2026-08-09T10:11:11Z",
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# $666 の Durable Objects 請求はなぜ発生したか\n\n対象期間: 2026 年 7 月 4 日〜8 月 3 日\n\n状態: main の source code を修正済み。本番は未 deploy のまま停止を継続。"
+      },
+      {
+        "id": "executive_summary",
+        "type": "markdown",
+        "sourceId": "incident_synthesis",
+        "body": "## Executive Summary: まず知ってほしいこと\n\n- 発生したこと: Cloudflare の請求で Durable Objects の課金対象書き込みが 665,418,208 行、$666 となった。月間無料枠を加えると、アカウント全体では約 7.15 億行が書き込まれたと推計される。\n- 最も有力な原因: 自動審査サービスの Runner（審査を実行する常駐プログラム）が、仕事のない間も最大 5.2 回/秒で状態を確認し、そのたびに保存済みの審査ジョブを全件書き戻していた。増幅機構はコードで確認できたが、請求全額の帰属は未確定である。\n- 現在と教訓: main の source code を修正した。本番は修正版を未 deploy のまま停止している。Durable Objects の採用自体ではなく、無変更でも全履歴を保存する設計、Runner の終了条件、使用量による自動停止がなかったことを改める。"
+      },
+      {
+        "id": "billing_metrics",
+        "type": "metric-strip",
+        "cardIds": [
+          "invoice_charge",
+          "billable_rows",
+          "max_save_rate"
+        ]
+      },
+      {
+        "id": "cost_cause",
+        "type": "markdown",
+        "sourceId": "judge_cause_synthesis",
+        "body": "## 何も処理していなくても、保存済みジョブ全体を書き直していた\n\n今回課金された書き込み行数（Rows Written）は、保存容量ではなく、Durable Objects に書き込んだ行の回数を表す。複数の保存項目を 1 回で保存しても、書き込んだ項目ごとに数えられる。\n\n1. Runner は 10 個の処理枠から 2 秒ごとに次のジョブを探し、5 秒ごとに生存通知も送る。仕事がなくても最大 5.2 回/秒のリクエストが発生する。\n2. ジョブが見つからない確認や生存通知でも、処理の最後に保存を実行する。状態が変わらない確認も書き込みになる。\n3. 保存は変更したジョブだけでなく、管理情報と保存済みの全ジョブを毎回書き戻す。履歴が 1 件増えるたび、以後のすべての確認が 1 行ずつ重くなる。\n4. 画面に出す最近の履歴は 50 件に制限していたが、保存済みジョブには保持上限がなかった。\n\n書き込み量は「保存頻度 ×（保存済みジョブ数 + 1）× 稼働時間」で増える。次の図は、コード上の設定を固定し、待機中だけで発生し得る推定書き込み行数を示した感度分析である。実測値や請求額の再現ではない。"
+      },
+      {
+        "id": "write_sensitivity_chart",
+        "type": "chart",
+        "chartId": "idle_rows_by_jobs"
+      },
+      {
+        "id": "chart_reading",
+        "type": "markdown",
+        "sourceId": "write_sensitivity",
+        "body": "### 保存済みジョブが増えるほど、待機中の費用も増える\n\n保存済みジョブが 50 件なら、何も採点していない日でも約 2,291 万行が発生する設計だった。200 件なら約 9,031 万行まで増える。つまり利用者の多さだけでなく、過去に蓄積した状態量が将来の 1 回のリクエストの費用を押し上げていた。"
+      },
+      {
+        "id": "do_roles_intro",
+        "type": "markdown",
+        "sourceId": "repo_assessment",
+        "body": "## Durable Objects の採用は妥当で、保存設計と運用が問題だった\n\nDurable Object は、ひとまとまりの状態を永続化し、同時に届く処理を順番に実行できる Cloudflare Workers の仕組みである。\n\n### 自動審査サービス（automated-hachathon-judge）\n\n審査の待ち行列、進行中のジョブ、結果を 1 個の共有状態で管理していた。複数の Runner が同じジョブを重複取得せず、Worker の再起動後も審査を続けるための選択だった。問題は、定期確認のたびに共有状態の全ジョブを保存したことにある。\n\n### RPG サービス（influ-quest）\n\nプレイヤーやチャットセッションごとに状態を分け、ゲームの再開と同じセッション内の処理順序を保っていた。書き込みは利用者のゲームやチャット操作が起点で、待機中に全履歴を書き戻すアプリ側の処理は確認できない。このため主因の可能性は低いが、寄与が 0 とは断定しない。"
+      },
+      {
+        "id": "public_repo_safety",
+        "type": "markdown",
+        "sourceId": "restart_controls",
+        "body": "## 公開リポジトリを clone すると、同じ請求になるのか\n\nclone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しない。自動 deploy や Runner の自動起動も設定されていない。\n\n一方、旧実装を自分の Cloudflare アカウントへ deploy し、Runner をその Worker へ接続して常駐させれば、同じ書き込み増幅が起き得た。実行時間や保存済みジョブ数で金額は変わるため、必ず $666 になるわけではない。\n\n2026 年 8 月 9 日に、空 queue の claim と拒否リクエストは書き込み 0、heartbeat は metadata 1 件に固定し、変更した項目だけを保存するよう main の source code を修正した。認証と入力検証を Durable Object の手前へ移し、Runner と callback は初期状態で停止、1 event の受付件数上限は 500 件とした。本番は修正版を未 deploy のまま停止している。"
+      },
+      {
+        "id": "lessons",
+        "type": "markdown",
+        "sourceId": "restart_controls",
+        "body": "## 今回の教訓と、再開までに満たす 4 条件\n\n### 1. 無変更の処理を明示的に扱う\n\n空 queue の claim と拒否したリクエストは書き込みを 0 にし、heartbeat は metadata 1 件に固定した。認証と入力検証も Durable Object の手前へ移し、回帰テストを実装済みである。\n\n### 2. 変更した状態だけを保存する\n\n1 件の更新で全履歴を書き直さず、対象の保存項目だけを書き込む。保存済みジョブが増えても 1 更新の書き込み数を一定にし、読み取りも必要な項目だけに限定した。\n\n### 3. 常駐処理に終了条件と安全な初期値を持たせる\n\nRunner と callback は明示的に有効化しない限り動かない。接続先を必須かつ固定し、停止フラグ、待機時間の延長、1 event の受付件数上限を実装した。\n\n### 4. 費用で検知し、費用で止める\n\nサービスと namespace（名前空間）ごとの Rows Written 増加率から日次費用を予測し、予算上限を超えたら自動停止する。この監視と自動停止は未実装で、本番再開前に少量の試験運転とともに確認する。"
+      },
+      {
+        "id": "containment",
+        "type": "markdown",
+        "sourceId": "incident_synthesis",
+        "body": "## 対応状況と、まだ分からないこと\n\n現在は 2 つの Worker と Runner を停止し、原因調査と復旧可能性のため保存データを残している。自動審査サービスの原因コードは修正したが、本番へは再 deploy していない。少量の試験運転と使用量監視を確認するまで停止を続ける。\n\nコードからは、自動審査サービスに最大 5.2 回/秒の保存呼び出しと、保存済みジョブ数に比例する全件再保存が存在したことを確認した。この実装が書き込みを増幅することの確度は高い。\n\n一方、請求書はアカウント全体の集計で、当時の namespace 別メトリクス、Runner の実行記録、保存済みジョブ数が残っていない。そのため「この実装が増幅装置だった」は結論だが、「$666 の全額がこの実装だけによる」は推定である。外部攻撃を示す証拠も確認されていない。\n\n同じ増加経路は停止したが、停止前の利用分、他の Durable Objects、保存容量、基本料金は次回も請求され得る。次回請求がゼロになるとは断定しない。"
+      }
+    ],
+    "cards": [
+      {
+        "id": "invoice_charge",
+        "description": "請求書に表示された当該明細の金額。",
+        "dataset": "billing_summary",
+        "sourceId": "billing_summary",
+        "metrics": [
+          {
+            "label": "明細額",
+            "field": "line_charge_usd",
+            "format": "currency"
+          }
+        ]
+      },
+      {
+        "id": "billable_rows",
+        "description": "月間 50,000,000 行の枠を超え、請求対象になった書き込み行数。",
+        "dataset": "billing_summary",
+        "sourceId": "billing_summary",
+        "metrics": [
+          {
+            "label": "課金対象 Rows Written",
+            "field": "billable_rows",
+            "format": "number"
+          }
+        ]
+      },
+      {
+        "id": "max_save_rate",
+        "description": "仕事がない場合のコード設定上の概算。実測値ではない。",
+        "dataset": "billing_summary",
+        "sourceId": "write_sensitivity",
+        "metrics": [
+          {
+            "label": "待機中の保存呼び出し/秒",
+            "field": "max_save_calls_per_second",
+            "format": "number"
+          }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "idle_rows_by_jobs",
+        "title": "保存済みジョブ数と待機中の推定書き込み行数",
+        "subtitle": "10 個の処理枠、2 秒間隔の確認、5 秒間隔の生存通知を前提とした感度分析。実測値ではない。",
+        "type": "bar",
+        "dataset": "write_sensitivity",
+        "sourceId": "write_sensitivity",
+        "encodings": {
+          "x": {
+            "field": "scenario",
+            "type": "ordinal",
+            "label": "保存済みジョブ数"
+          },
+          "y": {
+            "field": "rows_per_day",
+            "type": "quantitative",
+            "label": "1 日あたりの推定書き込み行数",
+            "format": "number"
+          }
+        },
+        "yAxisTitle": "推定書き込み行数/日",
+        "valueFormat": "number",
+        "layout": "full"
+      }
+    ],
+    "tables": [],
+    "sources": [
+      {
+        "id": "incident_synthesis",
+        "label": "請求、両リポジトリ、停止状態を統合した分析"
+      },
+      {
+        "id": "billing_summary",
+        "label": "請求書と Cloudflare Durable Objects 料金表",
+        "href": "https://developers.cloudflare.com/durable-objects/platform/pricing/"
+      },
+      {
+        "id": "invoice_screenshot",
+        "label": "Cloudflare 請求書スクリーンショット 2026 年 7 月 4 日〜8 月 3 日"
+      },
+      {
+        "id": "cloudflare_pricing",
+        "label": "Cloudflare Durable Objects Pricing",
+        "href": "https://developers.cloudflare.com/durable-objects/platform/pricing/"
+      },
+      {
+        "id": "judge_architecture_source",
+        "label": "automated-hachathon-judge の構成と Durable Object の役割",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/docs/architecture.md#L9-L59"
+      },
+      {
+        "id": "judge_runner_source",
+        "label": "Runner の concurrency、polling、heartbeat",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/runner/index.ts#L18-L57"
+      },
+      {
+        "id": "judge_cause_synthesis",
+        "label": "自動審査サービスの Runner と永続化処理",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/tree/8b494bdbc32e6cce41b4918eb945a26e9e89d56d"
+      },
+      {
+        "id": "judge_state_source",
+        "label": "JudgeState の無条件 save と全 job key 再保存",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/judge-state.ts#L10-L90"
+      },
+      {
+        "id": "judge_jobs_source",
+        "label": "recentIds の上限と jobs の保持",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/state-machine.ts#L76-L79"
+      },
+      {
+        "id": "influ_binding_source",
+        "label": "influ-quest の QuestAgent と BrowserChatSession binding",
+        "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/wrangler.jsonc#L33-L53"
+      },
+      {
+        "id": "influ_agent_source",
+        "label": "QuestAgent の player state 保存と session routing",
+        "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/src/index.ts#L34-L134"
+      },
+      {
+        "id": "influ_chat_source",
+        "label": "BrowserChatSession の状態保存と request 直列化",
+        "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/src/chat-session.js#L91-L203"
+      },
+      {
+        "id": "write_sensitivity",
+        "label": "JudgeState 実装から算出した待機中の書き込み感度分析"
+      },
+      {
+        "id": "repo_assessment",
+        "label": "両リポジトリの pinned commit に基づく比較"
+      },
+      {
+        "id": "restart_controls",
+        "label": "自動審査サービスの課金安全修正",
+        "href": "https://github.com/schroneko/automated-hachathon-judge/tree/c2ffc4a5c3e5423dabb26f5f17180b183f9fc1c5"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-09T10:11:11Z",
+    "status": "ready",
+    "datasets": {
+      "billing_summary": [
+        {
+          "line_charge_usd": 666,
+          "billable_rows": 665418208,
+          "included_rows": 50000000,
+          "inferred_gross_rows": 715418208,
+          "max_save_calls_per_second": 5.2
+        }
+      ],
+      "write_sensitivity": [
+        {
+          "scenario": "0 件",
+          "retained_jobs": 0,
+          "rows_per_day": 449280
+        },
+        {
+          "scenario": "50 件",
+          "retained_jobs": 50,
+          "rows_per_day": 22913280
+        },
+        {
+          "scenario": "100 件",
+          "retained_jobs": 100,
+          "rows_per_day": 45377280
+        },
+        {
+          "scenario": "200 件",
+          "retained_jobs": 200,
+          "rows_per_day": 90305280
+        }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "incident_synthesis",
+      "label": "請求、両リポジトリ、停止状態を統合した分析",
+      "query": {
+        "engine": "evidence-synthesis",
+        "language": "sql",
+        "description": "請求書、Cloudflare 料金表、両リポジトリの pinned commit、2026 年 8 月 9 日の停止状態を照合。",
+        "sql": "SELECT * FROM (VALUES ('invoice', '2026-07-04 to 2026-08-03 account-level usage line'), ('judge', 'commit 8b494bdbc32e6cce41b4918eb945a26e9e89d56d'), ('influ', 'commit 9c518daa5ced3056f108c92cf60c1953968ccdeb'), ('operations', 'kill switches and runner stop verified 2026-08-09')) AS evidence(source_kind, evidence_scope)",
+        "executed_at": "2026-08-09T08:05:17Z"
+      }
+    },
+    {
+      "id": "billing_summary",
+      "label": "請求書と Cloudflare Durable Objects 料金表",
+      "query": {
+        "engine": "deterministic-arithmetic",
+        "language": "sql",
+        "description": "請求書の課金対象行へ月間 50,000,000 行の枠を加え、アカウント全体の総量を推定。保存回数はコード設定から算出。",
+        "sql": "SELECT 666.0 AS line_charge_usd, 665418208 AS billable_rows, 50000000 AS included_rows, 665418208 + 50000000 AS inferred_gross_rows, 10.0 / 2.0 + 1.0 / 5.0 AS max_save_calls_per_second",
+        "executed_at": "2026-08-09T08:05:17Z"
+      },
+      "href": "https://developers.cloudflare.com/durable-objects/platform/pricing/"
+    },
+    {
+      "id": "invoice_screenshot",
+      "label": "Cloudflare 請求書スクリーンショット 2026 年 7 月 4 日〜8 月 3 日",
+      "query": {
+        "engine": "visual-inspection",
+        "language": "text",
+        "description": "Durable Objects Storage Rows Written の quantity、included allowance、unit price、line amount を目視転記。",
+        "executed_at": "2026-08-09T08:05:17Z"
+      }
+    },
+    {
+      "id": "cloudflare_pricing",
+      "label": "Cloudflare Durable Objects Pricing",
+      "href": "https://developers.cloudflare.com/durable-objects/platform/pricing/"
+    },
+    {
+      "id": "judge_architecture_source",
+      "label": "automated-hachathon-judge の構成と Durable Object の役割",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/docs/architecture.md#L9-L59"
+    },
+    {
+      "id": "judge_runner_source",
+      "label": "Runner の concurrency、polling、heartbeat",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/runner/index.ts#L18-L57"
+    },
+    {
+      "id": "judge_cause_synthesis",
+      "label": "自動審査サービスの Runner と永続化処理",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/tree/8b494bdbc32e6cce41b4918eb945a26e9e89d56d",
+      "query": {
+        "engine": "source-code-review",
+        "language": "sql",
+        "description": "Runner の定期確認と生存通知、JudgeState の無条件保存と全ジョブ再保存、ジョブ保持方針を同じ pinned commit で照合。",
+        "sql": "SELECT * FROM (VALUES ('src/runner/index.ts', '10 slots, 2 second polling, 5 second heartbeat'), ('src/worker/judge-state.ts', 'save after empty claim and heartbeat; meta plus all job keys'), ('src/worker/state-machine.ts', 'recent list capped while stored jobs remain')) AS reviewed_file(path, finding)",
+        "executed_at": "2026-08-09T09:07:24Z"
+      }
+    },
+    {
+      "id": "judge_state_source",
+      "label": "JudgeState の無条件 save と全 job key 再保存",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/judge-state.ts#L10-L90"
+    },
+    {
+      "id": "judge_jobs_source",
+      "label": "recentIds の上限と jobs の保持",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/blob/8b494bdbc32e6cce41b4918eb945a26e9e89d56d/src/worker/state-machine.ts#L76-L79"
+    },
+    {
+      "id": "influ_binding_source",
+      "label": "influ-quest の QuestAgent と BrowserChatSession binding",
+      "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/wrangler.jsonc#L33-L53"
+    },
+    {
+      "id": "influ_agent_source",
+      "label": "QuestAgent の player state 保存と session routing",
+      "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/src/index.ts#L34-L134"
+    },
+    {
+      "id": "influ_chat_source",
+      "label": "BrowserChatSession の状態保存と request 直列化",
+      "href": "https://github.com/schroneko/influ-quest/blob/9c518daa5ced3056f108c92cf60c1953968ccdeb/worker/src/chat-session.js#L91-L203"
+    },
+    {
+      "id": "write_sensitivity",
+      "label": "JudgeState 実装から算出した idle write 感度分析",
+      "query": {
+        "engine": "deterministic-arithmetic",
+        "language": "sql",
+        "description": "10 個の処理枠、2 秒間隔の確認、5 秒間隔の生存通知を固定し、保存済みジョブ数ごとの logical key writes を算出。実測値ではない。",
+        "sql": "WITH jobs AS (SELECT * FROM (VALUES (0), (50), (100), (200)) AS t(retained_jobs)), rates AS (SELECT 10.0 / 2.0 + 1.0 / 5.0 AS saves_per_second) SELECT retained_jobs, saves_per_second * 86400 * (retained_jobs + 1) AS rows_per_day FROM jobs CROSS JOIN rates",
+        "executed_at": "2026-08-09T08:05:17Z"
+      }
+    },
+    {
+      "id": "repo_assessment",
+      "label": "両リポジトリの pinned commit に基づく比較",
+      "query": {
+        "engine": "source-code-review",
+        "language": "sql",
+        "description": "Durable Object の状態単位、書き込みの起点、待機中のアプリ処理、履歴保持を同じ観点で比較。",
+        "sql": "SELECT * FROM (VALUES ('automated-hachathon-judge', 'shared judge state', 'autonomous polling and heartbeat', 'all stored jobs rewritten'), ('influ-quest', 'per player or session', 'user-driven game and chat', 'no app-level idle rewrite loop found')) AS repository_assessment(service, object_scope, write_trigger, idle_behavior)",
+        "executed_at": "2026-08-09T08:05:17Z"
+      }
+    },
+    {
+      "id": "restart_controls",
+      "label": "自動審査サービスの課金安全修正",
+      "href": "https://github.com/schroneko/automated-hachathon-judge/tree/c2ffc4a5c3e5423dabb26f5f17180b183f9fc1c5",
+      "query": {
+        "engine": "control-design",
+        "language": "sql",
+        "description": "書き込み増幅、Runner の終了条件、入口保護、使用量監視の各原因へ、実装済み対策と本番再開前の確認を対応付け。",
+        "sql": "SELECT * FROM (VALUES ('persistence', 'implemented: no-op zero writes and bounded job update'), ('runner', 'implemented: fail-closed flags, fixed origin, stop behavior, submission cap'), ('ingress', 'implemented: authentication, bounded body, semantic validation before Durable Object'), ('monitoring', 'pending before production restart: Rows Written alert, budget limit, and canary')) AS restart_controls(area, pass_condition)",
+        "executed_at": "2026-08-09T10:11:11Z"
+      }
+    }
+  ],
+  "package_info": {
+    "artifactRuntime": "portable-artifact-reader.html",
+    "deliveryMode": "portable_html",
+    "hostedReadOnly": true,
+    "mode": "portable_html",
+    "portableHtml": true,
+    "readOnly": true,
+    "controls": {
+      "copyAsImage": false,
+      "delete": false,
+      "drag": false,
+      "edit": false,
+      "export": false,
+      "exportHostedLink": false,
+      "fullscreen": false,
+      "hostedLink": false,
+      "persistence": false,
+      "refresh": false,
+      "reorder": false,
+      "share": false
+    }
+  },
+  "packageInfo": {
+    "artifactRuntime": "portable-artifact-reader.html",
+    "deliveryMode": "portable_html",
+    "hostedReadOnly": true,
+    "mode": "portable_html",
+    "portableHtml": true,
+    "readOnly": true,
+    "controls": {
+      "copyAsImage": false,
+      "delete": false,
+      "drag": false,
+      "edit": false,
+      "export": false,
+      "exportHostedLink": false,
+      "fullscreen": false,
+      "hostedLink": false,
+      "persistence": false,
+      "refresh": false,
+      "reorder": false,
+      "share": false
+    }
+  }
+}
