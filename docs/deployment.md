@@ -80,7 +80,7 @@ GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分�
 
 イベント終了後は両停止フラグをfalseにしたまま、最終保存結果を閲覧できる読み取り専用の審査画面を公開します。入力・送信・編集・再審査の操作を隠して無効化し、順位、採点理由、検索、CSV・JSON書き出し、デモへのリンクは保持します。画面は `readOnly: true` と `archivedAt` を受け取り、自動ポーリングしません。
 
-静的アセットの配信先は `./dist/client` です。`run_worker_first: false` と `not_found_handling: single-page-application` を使い、`workers_dev` と `preview_urls` はfalseのままにします。保存済みのdashboard、ranking、recent、個別結果、受付・実行状態は静的JSONのGETで返します。変更APIはWorkerの停止ガードがD1アクセス前に410で拒否します。QueueハンドラもD1へ接続せず全メッセージをackし、採点・理由生成の両Queueは配送停止を維持します。
+静的アセットの配信先は `./dist/client` です。`run_worker_first: false` と `not_found_handling: single-page-application` を使い、`workers_dev` と `preview_urls` はfalseのままにします。保存済みのdashboard、ranking、recent、個別結果、受付・実行状態は静的JSONのGETで返します。変更APIはWorkerの停止ガードがD1アクセス前に410で拒否し、既存の静的ファイルへ送るPATCH等はアセット配信層が405で拒否します。QueueハンドラもD1へ接続せず全メッセージをackし、採点・理由生成の両Queueは配送停止を維持します。
 
 停止時はWorker secretの `OPENAI_API_KEY_20261018_HACKATHON` も削除し、1Password Environmentの値は保持します。共有D1と審査結果・証拠・費用台帳は削除しません。最初の停止確認ではdashboard取得が失敗し、D1 Freeの日次行読み取り上限超過（code 7500）を確認しました。その後、OAuth認証の `wrangler d1 export` で提出・batch・費用台帳の専用テーブルを取得し、保存結果の静的配信を復旧しました。有料プランへの変更や費用予約のリセットは行いません。
 
@@ -94,7 +94,7 @@ GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分�
 
 ## Verify publication
 
-終了後は結果画面、静的JSONのGETが200、受付closed、実行offline、変更APIが410で拒否されることを確認します。入力・編集・再審査が表示されず、採点済みの順位と理由を閲覧でき、継続的なAPI取得が発生しないことも確認します。以下はdashboardの確認手順です。
+終了後は結果画面、静的JSONのGETが200、受付closed、実行offline、変更APIが410または405で拒否されることを確認します。入力・編集・再審査が表示されず、採点済みの順位と理由を閲覧でき、継続的なAPI取得が発生しないことも確認します。公開版 `d6e14383-2c0d-43db-9d01-aaa4d055ba1f` で22件の表示、別チームへの切り替え、1280pxと390pxの表示、操作後6.5秒間の追加取得0件、変更APIの拒否、Worker secret 0件、両Queueの配送停止を確認しました。以下はdashboardの確認手順です。
 
 ```bash
 curl -fsS https://hackathon.nukoevi.app/api/dashboard
