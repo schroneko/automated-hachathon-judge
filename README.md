@@ -80,12 +80,15 @@ API実行前に公式の入力トークン計数で両モデルの容量を確�
 npm ci
 npm run typecheck
 npm test
+npm run test:worker
 npm run build
 wrangler d1 migrations apply JUDGE_DB --local
 wrangler dev --ip 127.0.0.1 --port 8787 --var SUBMISSIONS_OPEN:false --var JUDGING_ENABLED:false
 ```
 
 この例は受付と採点を停止した画面確認用です。
+
+`npm run test:worker` は一時的なローカルworkerdでメモリ待機・Git取得・D1復元へ別リクエストを8件ずつ送り、32件の成功を検証します。GitとD1はオフラインfixtureで、APIキーや外部サービスの変更は不要です。`npm run test:worker -- --timeout` は実時間120秒の待機上限と、その後の回復も確認します。試験用プロセスと一時ファイルだけを終了・削除し、開発用サーバーは維持します。
 
 ## Event operation
 
@@ -104,7 +107,7 @@ wrangler dev --ip 127.0.0.1 --port 8787 --var SUBMISSIONS_OPEN:false --var JUDGI
 
 イベント後は受付と採点を停止してCSV・JSONを書き出します。データの保存期間はイベント後90日を目安とし、削除する対象と影響は別途確認します。
 
-詳細: [構成](docs/architecture.md)、[公開と運用](docs/deployment.md)、[クラウド実行の上限と停止](docs/cloud-execution.md)、[クラウド実 API 検証記録](docs/validation-cloud-20261018.json)、[Security Policy](SECURITY.md)。
+詳細: [構成](docs/architecture.md)、[公開と運用](docs/deployment.md)、[クラウド実行の上限と停止](docs/cloud-execution.md)、[全文審査の実API検証記録](docs/validation-full-source-20261018.json)、[旧方式の検証履歴](docs/validation-cloud-20261018.json)、[Security Policy](SECURITY.md)。
 
 ## License
 
