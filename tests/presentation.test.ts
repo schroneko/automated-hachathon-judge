@@ -114,8 +114,8 @@ describe("presentation snapshot readiness", () => {
   });
 });
 
-describe("truthful ranks and local cutoff selection", () => {
-  it("uses competition ranks and announces a tie even when only one tied entry is selected", () => {
+describe("truthful ranks and inclusive cutoff qualification", () => {
+  it("uses competition ranks and announces tied teams without assigning artificial positions", () => {
     const source = teams(12);
     source[2]!.result!.total = source[1]!.result!.total;
     const snapshot = capturePresentation(source);
@@ -126,32 +126,34 @@ describe("truthful ranks and local cutoff selection", () => {
   it("selects exactly ten automatically only for an unambiguous boundary", () => {
     const snapshot = capturePresentation(teams(15));
     const selection = selectPresentation(snapshot);
-    expect(snapshot.candidates).toEqual([]);
     expect(selection.valid).toBe(true);
+    expect(snapshot.cutoff).toBe(22);
+    expect(selection.order).toHaveLength(10);
     expect(selection.order.map((entry) => entry.total)).toEqual([22, 24, 26, 28, 30, 32, 34, 36, 38, 40]);
     expect(selection.order[0]!.rank).toBe(10);
-    expect(selectPresentation(snapshot, ["entry-9"]).valid).toBe(false);
   });
-  it.each([8, 9])("requires a deliberate choice after %s higher entries", (higherCount) => {
-    const source = teams(higherCount);
-    source.push(item(20, 20), item(21, 20), item(22, 20));
+  it("qualifies all four boundary ties after eight higher teams", () => {
+    const source = teams(8);
+    source.push(item(22, 24), item(20, 24), item(23, 24), item(21, 24), item(24, 22));
     const snapshot = capturePresentation(source);
-    expect(snapshot.automatic).toHaveLength(higherCount);
-    expect(snapshot.candidates).toHaveLength(3);
-    expect(snapshot.remaining).toBe(10 - higherCount);
-    expect(selectPresentation(snapshot).valid).toBe(false);
-    const ids = snapshot.candidates.slice(0, snapshot.remaining).map((entry) => entry.id);
-    const selection = selectPresentation(snapshot, ids);
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.cutoff).toBe(24);
+    expect(snapshot.automatic).toHaveLength(12);
+    expect(snapshot.message).toContain("12チーム");
+    const selection = selectPresentation(snapshot);
     expect(selection.valid).toBe(true);
-    expect(selection.order).toHaveLength(10);
-    expect(selection.order[0]!.rank).toBe(higherCount + 1);
-    expect(rankLabel(selection.order[0]!)).toBe(`同率第${higherCount + 1}位`);
-    expect(selection.order.filter((entry) => entry.total > 20)).toHaveLength(higherCount);
-    expect(selectPresentation(snapshot, [...ids, "entry-22"]).valid).toBe(false);
-    expect(selectPresentation(snapshot, ids.slice(1)).valid).toBe(false);
-    expect(selectPresentation(snapshot, [ids[0]!, ids[0]!]).valid).toBe(false);
-    expect(selectPresentation(snapshot, ["unknown"]).valid).toBe(false);
-    expect(selectPresentation(snapshot, [snapshot.automatic[0]!.id]).valid).toBe(false);
+    expect(selection.order).toHaveLength(12);
+    expect(selection.message).toContain("12チーム");
+    expect(selection.order.slice(0, 4).map((entry) => [entry.id, entry.rank, entry.tied])).toEqual([
+      ["entry-22", 9, true], ["entry-20", 9, true], ["entry-23", 9, true], ["entry-21", 9, true]
+    ]);
+    expect(rankLabel(selection.order[0]!)).toBe("同率第9位");
+    expect(selection.order.slice(4).map((entry) => entry.rank)).toEqual([8, 7, 6, 5, 4, 3, 2, 1]);
+    expect(selection.order.filter((entry) => entry.total > 24)).toHaveLength(8);
+    expect(selection.order.some((entry) => entry.id === "entry-24")).toBe(false);
+    expect(selection.order.map((entry) => entry.id)).toEqual([
+      "entry-22", "entry-20", "entry-23", "entry-21", "entry-7", "entry-6", "entry-5", "entry-4", "entry-3", "entry-2", "entry-1", "entry-0"
+    ]);
   });
   it("keeps stable original order for equal scores without inventing ranks", () => {
     const source = teams();
@@ -160,13 +162,35 @@ describe("truthful ranks and local cutoff selection", () => {
     expect(selectPresentation(snapshot).order.slice(-2).map((entry) => [entry.id, entry.rank])).toEqual([["entry-0", 1], ["entry-1", 1]]);
     expect(rankLabel(selectPresentation(snapshot).order[9]!)).toBe("同率第1位");
   });
-  it("handles ten-way selections within a larger all-tied group", () => {
-    const snapshot = capturePresentation(teams(12).map((entry) => ({ ...entry, result: { ...entry.result!, total: 20 } })));
-    expect(snapshot.automatic).toHaveLength(0);
-    expect(snapshot.remaining).toBe(10);
-    const selection = selectPresentation(snapshot, snapshot.candidates.slice(2).map((entry) => entry.id));
+  it("qualifies all twelve teams when every team has thirty points", () => {
+    const snapshot = capturePresentation(Array.from({ length: 12 }, (_, index) => item(index, 30)));
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.cutoff).toBe(30);
+    expect(snapshot.automatic).toHaveLength(12);
+    const selection = selectPresentation(snapshot);
     expect(selection.valid).toBe(true);
-    expect(selection.order.every((entry) => entry.rank === 1 && entry.tied)).toBe(true);
+    expect(selection.order).toHaveLength(12);
+    expect(selection.order.map((entry) => entry.id)).toEqual(Array.from({ length: 12 }, (_, index) => `entry-${index}`));
+    expect(selection.order.every((entry) => entry.total === 30 && entry.rank === 1 && entry.tied)).toBe(true);
+    expect(selection.order.every((entry) => rankLabel(entry) === "同率第1位")).toBe(true);
+  });
+  it("computes the tied cutoff from eligible results when excluded repositories have higher scores", () => {
+    const source = teams(8);
+    source.push(item(20, 22), item(21, 22), item(22, 22), item(23, 22));
+    const readmeOnly = item(24, 40);
+    readmeOnly.result!.eligibility = "no_implementation";
+    const unavailable = item(25, 40);
+    unavailable.result!.repoAssessment = "missing_or_private";
+    const snapshot = capturePresentation([...source, readmeOnly, unavailable]);
+    const selection = selectPresentation(snapshot);
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.cutoff).toBe(22);
+    expect(selection.valid).toBe(true);
+    expect(selection.order).toHaveLength(12);
+    expect(selection.order.slice(0, 4).map((entry) => [entry.id, entry.rank])).toEqual([
+      ["entry-20", 9], ["entry-21", 9], ["entry-22", 9], ["entry-23", 9]
+    ]);
+    expect(selection.order.some((entry) => entry.id === readmeOnly.id || entry.id === unavailable.id)).toBe(false);
   });
   it("isolates fictional preview data from real results and future captures", () => {
     const real = capturePresentation(teams());
@@ -223,5 +247,27 @@ describe("one-at-a-time reveal state", () => {
     for (let index = 0; index < 15; index++) state = revealState(revealState(state, "begin"), "complete");
     expect(state).toEqual({ revealed: 10, busy: false });
     expect(acceptsAdvance(state, {})).toBe(false);
+  });
+  it("reveals every qualified team and stops at twelve when the cutoff includes ties", () => {
+    const source = teams(8);
+    source.push(item(20, 24), item(21, 24), item(22, 24), item(23, 24));
+    const order = selectPresentation(capturePresentation(source)).order;
+    expect(order).toHaveLength(12);
+    let state = { revealed: 0, busy: false };
+    for (let index = 0; index < order.length; index++) {
+      expect(acceptsAdvance(state, {}, order.length)).toBe(true);
+      state = revealState(state, "begin", order.length);
+      expect(acceptsAdvance(state, {}, order.length)).toBe(false);
+      state = revealState(state, "complete", order.length);
+      expect(state.revealed).toBe(index + 1);
+    }
+    expect(state).toEqual({ revealed: 12, busy: false });
+    expect(order.slice(0, state.revealed)).toHaveLength(12);
+    expect(order.at(-1)!.rank).toBe(1);
+    expect(acceptsAdvance(state, {}, order.length)).toBe(false);
+    expect(revealState(state, "begin", order.length)).toBe(state);
+    expect(revealState(state, "complete", order.length)).toBe(state);
+    expect(revealState(state, "back", order.length)).toEqual({ revealed: 11, busy: false });
+    expect(revealState(state, "restart", order.length)).toEqual({ revealed: 0, busy: false });
   });
 });

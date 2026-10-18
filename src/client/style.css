@@ -142,37 +142,6 @@
   padding: 16px;
   font-weight: 700;
 }
-.presentation-candidates {
-  border: 2px solid #101325;
-  border-radius: 16px;
-  padding: clamp(14px, 2vw, 24px);
-  margin: 24px 0;
-  min-width: 0;
-}
-.presentation-candidates legend {
-  font-weight: 850;
-  padding: 0 8px;
-}
-.presentation-candidates label {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  border-top: 1px solid #10132533;
-  padding: 16px 0;
-  cursor: pointer;
-  overflow-wrap: anywhere;
-}
-.presentation-candidates input {
-  flex: 0 0 24px;
-  width: 24px;
-  height: 24px;
-  accent-color: #793755;
-}
-.presentation-candidates label > span {
-  display: grid;
-  gap: 3px;
-  min-width: 0;
-}
 .presentation-card {
   position: relative;
   isolation: isolate;
@@ -1958,3 +1927,13 @@ footer { border-color: #424960; color: #aeb6ca; }
   html { scroll-behavior: auto; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+.condition-checks { margin: 16px 0; overflow-wrap: anywhere; }
+.condition-checks summary { cursor: pointer; font-weight: 700; }
+.condition-checks ul { padding-left: 20px; }
+.condition-checks li { margin: 14px 0; }
+.condition-checks li p { margin-top: 6px; }
+.presentation-audio { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; margin: 16px 0; padding: 12px 16px; border: 1px solid #ffffff30; border-radius: 18px; background: #ffffff0b; color: #fff8e8; }
+.presentation-audio label { font-size: 13px; white-space: nowrap; }
+.presentation-audio input { width: clamp(80px, 16vw, 160px); accent-color: #dfff55; }
+.presentation-audio button { min-height: 40px; padding: 8px 14px; }
+.presentation-audio [role="status"] { font-size: 12px; color: #e6e1dc; }

@@ -1,5 +1,6 @@
 import "./style.css";
 import { capturePresentation, demoPresentation, selectPresentation, rankLabel, revealState, acceptsAdvance, type PresentationSnapshot, type RevealState } from "./presentation";
+import { createPresentationAudio } from "./presentation-audio";
 import type {
   PublicSubmissionRecord,
   PublicBatchRecord,
@@ -8,8 +9,9 @@ import type {
   SubmissionStatus as Status,
 } from "../shared/types";
 import { importSourceSignature, restorePendingImport, normalizeRepository, normalizeDemoUrl, formatTimestampJst, type ImportResult } from "./submission-import";
-import { CRITERIA, JUDGING_START_ISO } from "../shared/constants";
+import { CRITERIA, EVENT_NAME, JUDGING_START_ISO } from "../shared/constants";
 import { RUBRIC_VERSION, rubricLevels } from "../shared/rubric";
+import { DECISION_CONDITIONS, SOURCE_EVIDENCE } from "../shared/decision-conditions";
 type Effort = "low" | "medium" | "high";
 type ExplanationState = "pending" | "processing" | "completed" | "failed";
 type Submission = PublicSubmissionRecord;
@@ -53,15 +55,15 @@ if (!root) throw new Error("App root not found");
 root.innerHTML = `
   <main class="shell">
     <header class="topbar">
-      <span class="brand"><svg class="brand-symbol" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m12 0 3.5 8.5L24 12l-8.5 3.5L12 24l-3.5-8.5L0 12l8.5-3.5Z" fill="currentColor"/></svg> OPENAI DEVDAY <span>2026</span></span>
+      <span class="brand"><svg class="brand-symbol" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m12 0 3.5 8.5L24 12l-8.5 3.5L12 24l-3.5-8.5L0 12l8.5-3.5Z" fill="currentColor"/></svg> ${esc(EVENT_NAME)}</span>
       <span class="topbar-tag">COMMUNITY HACKATHON · TOKYO</span>
     </header>
     <section class="hero">
       <div class="hero-content">
         <p class="overline"><span class="signal-dot" aria-hidden="true"></span> 予選ジャッジ / 2026.10.18 / TOKYO</p>
         <h1>すごい作品、<br><span>次のステージへ。</span></h1>
-        <p class="event-name">OpenAI DevDay 2026 Community Hackathon Tokyo</p>
-        <p class="hero-copy">公開 GitHub ソースをもとに、約30チームから決勝進出10チームを選出します。</p>
+        <p class="event-name">${esc(EVENT_NAME)}</p>
+        <p class="hero-copy">公開 GitHub ソースをもとに、約30チームから原則上位10チームを選出します。10位と同点のチームは全員通過します。</p>
         <div class="hero-links"><a class="hero-link primary" href="#results-title">審査結果を見る <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M4 14 14 4M4 4h10v10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a><a class="hero-link secondary" href="#overview-title">進行状況 <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M9 3v12m-5-5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></div>
       </div>
       <div class="hero-art">
@@ -73,7 +75,7 @@ root.innerHTML = `
       </div>
       <div class="hero-facts">
         <div><span>審査対象</span><strong>約30<small> チーム</small></strong></div>
-        <div><span>決勝枠</span><strong>10<small> チーム</small></strong></div>
+        <div><span>決勝枠 / 同点全員通過</span><strong>10<small> チーム目安</small></strong></div>
         <div><span>評価</span><strong>4<small> 観点 / 40点</small></strong></div>
       </div>
     </section>
@@ -163,7 +165,7 @@ root.innerHTML = `
         </div>
       </div>
     </section>
-    <footer>OPENAI DEVDAY 2026 COMMUNITY HACKATHON TOKYO <span>PRELIMINARY REVIEW</span></footer>
+    <footer>${esc(EVENT_NAME)} <span>PRELIMINARY REVIEW</span></footer>
   </main>
 `;
 
@@ -614,7 +616,7 @@ function renderResults(): void {
   if (!data) return;
   const presentation = capturePresentation(data.items);
   el<HTMLButtonElement>("presentation-real").disabled = !presentation.ready;
-  el<HTMLElement>("presentation-readiness").textContent = presentation.ready && presentation.candidates.length ? `発表設定で同点候補${presentation.candidates.length}チームから${presentation.remaining}チームを選択してください。` : presentation.message;
+  el<HTMLElement>("presentation-readiness").textContent = presentation.message;
   const all = entries();
   const query = el<HTMLInputElement>("search").value.trim().toLocaleLowerCase();
   const visible = all.filter(({ item }) =>
@@ -645,7 +647,7 @@ function renderResults(): void {
     mode === "validation"
       ? "検証結果は決勝選考に含まれません。"
       : data.cutoff.tied
-        ? `通過ラインで${data.cutoff.tiedCount}チームが同点: 主催者確認`
+        ? `通過ライン ${data.cutoff.score}点: 同点${data.cutoff.tiedCount}チーム全員通過${provisional ? " · 暫定" : ""}`
         : data.cutoff.score === null
           ? "通過ラインは未確定です。"
           : `通過ライン ${data.cutoff.score}点${provisional ? " · 暫定" : ""}`;
@@ -663,7 +665,7 @@ function renderResults(): void {
   if (!selected || !visible.some((value) => value.item.id === selected))
     selected = visible[0]!.item.id;
   el<HTMLElement>("list").innerHTML =
-    `<div class="list-heading"><h3>${mode === "production" ? (provisional ? "暫定トップ10・審査一覧" : "トップ10・審査一覧") : "検証一覧"}</h3><span>${visible.length} 件</span></div><div class="table-head"><span>順位 / チーム・リポジトリ</span>${axes.map((axis) => `<span>${esc(axis.label)}</span>`).join("")}<span>合計</span><span>状態</span></div>` +
+    `<div class="list-heading"><h3>${mode === "production" ? (provisional ? "暫定通過候補・審査一覧" : "決勝進出・審査一覧") : "検証一覧"}</h3><span>${visible.length} 件</span></div><div class="table-head"><span>順位 / チーム・リポジトリ</span>${axes.map((axis) => `<span>${esc(axis.label)}</span>`).join("")}<span>合計</span><span>状態</span></div>` +
     visible
       .map(({ item, position }, index) => {
         const atCutoff =
@@ -704,6 +706,7 @@ function detail(
   provisional: boolean,
 ): void {
   const existingEditor = el<HTMLElement>("detail").querySelector<HTMLElement>(".metadata-editor");
+  const expandedConditions = new Set([...el<HTMLElement>("detail").querySelectorAll<HTMLDetailsElement>("details.condition-checks[open]")].map((entry) => entry.dataset.criterion));
   const editorFocus = existingEditor?.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
   const result = item.result;
   const explanation = explanationState(item);
@@ -714,10 +717,10 @@ function detail(
     position !== null &&
     position <= data!.event.finalistCount
       ? data!.cutoff.tied && data!.cutoff.score === result?.total
-        ? "通過ラインで同点: 主催者確認"
+        ? provisional ? "暫定通過候補 · 同点全員通過" : "決勝進出 · 同点全員通過"
         : provisional
-          ? "暫定トップ10"
-          : "上位10件"
+          ? "暫定通過候補"
+          : "決勝進出"
       : "";
   const safe = repo(item.repoUrl);
   const pinned =
@@ -740,7 +743,9 @@ function detail(
               const criterion = result.criteria.find(
                 (value) => value.key === axis.key,
               );
-              return `<section><div class="criterion-head"><h5>${esc(axis.label)}</h5><strong>${criterion ? esc(criterion.score) : "--"}<small> / 10</small></strong></div><p>${reasonsComplete ? esc(criterion?.reason || "評価理由はありません。") : reasonText}</p><div class="evidence"><span>根拠ファイル</span>${
+              const checks = result.usage?.decisionsConditions;
+              const conditions = checks ? `<details class="condition-checks" data-criterion="${axis.key}"${expandedConditions.has(axis.key) ? " open" : ""}><summary>段階条件の判定を見る</summary><p class="note">下位から連続して確認できた最高段階が得点です。${esc(SOURCE_EVIDENCE)}</p><ul>${DECISION_CONDITIONS.filter((condition) => condition.key === axis.key).map((condition) => `<li><strong>${condition.level}点条件: ${checks[condition.name] === true ? "確認済み" : "未達・根拠未確認"}</strong><p>${esc(condition.description.slice(SOURCE_EVIDENCE.length))}</p></li>`).join("")}</ul></details>` : "";
+              return `<section><div class="criterion-head"><h5>${esc(axis.label)}</h5><strong>${criterion ? esc(criterion.score) : "--"}<small> / 10</small></strong></div><p>${reasonsComplete ? esc(criterion?.reason || "評価理由はありません。") : reasonText}</p>${conditions}<div class="evidence"><span>根拠ファイル</span>${
                 !reasonsComplete ? "<p>理由と根拠は生成後に表示します</p>" : criterion?.evidencePaths.length
                   ? `<ul>${criterion.evidencePaths
                       .map((path) => {
@@ -888,17 +893,53 @@ function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): 
   let state: RevealState = { revealed: 0, busy: false };
   let selection = selectPresentation(snapshot);
   let started = false;
-  const chosen = new Set<string>();
+  const music = createPresentationAudio();
+  let musicMuted = false;
+  let musicStarted = false;
+  let musicStarting = false;
+  music.setVolume(0.35);
   const badge = snapshot.mode === "demo" ? "DEMO / 架空データ・演出プレビュー" : "REAL / 本番結果";
-  dialog.innerHTML = `<div class="presentation-inner"><header class="presentation-header"><div><p class="presentation-badge">${badge}</p><h2 id="presentation-title">次のステージへ。</h2></div><button type="button" id="stage-close">閉じる <span aria-hidden="true">×</span></button></header><p class="presentation-local">開始時の結果で固定します。</p><div id="stage-setup" class="presentation-setup"><p class="presentation-eyebrow">BEFORE THE SPOTLIGHT</p><h3>10チームの発表を準備</h3><p>低い点数から順に、1チームずつ発表します。同点は実際の同率順位で表示します。</p>${snapshot.warnings.map((warning) => `<p class="presentation-warning">${esc(warning)}</p>`).join("")}${snapshot.candidates.length ? `<fieldset class="presentation-candidates"><legend>通過ライン ${esc(snapshot.cutoff)}点: ${snapshot.remaining}チームを選択</legend><p>上位${snapshot.automatic.length}チームは確定枠です。選択はこの発表にだけ反映され、審査点数と同率順位は変わりません。同点候補は自動選択しません。</p>${snapshot.candidates.map((entry, index) => `<label><input type="checkbox" value="${index}"><span><strong>${esc(entry.teamName)}</strong><span>${esc(entry.repo)}</span><span>${rankLabel(entry)} · ${esc(entry.total)} / 40点${entry.reviewRequired ? " · 主催者確認" : ""}</span></span></label>`).join("")}</fieldset>` : ""}<p id="stage-selection" role="status"></p><button type="button" id="stage-start">発表画面へ</button></div><div id="stage-show" hidden><div id="stage-card" class="presentation-card"></div><div class="presentation-controls"><button type="button" id="stage-back">戻る</button><button type="button" id="stage-next" class="presentation-next">一つ発表</button><button type="button" id="stage-restart">最初から</button><span id="stage-progress"></span></div><p class="presentation-keyboard">Space / → 次へ · ← 戻る · Escape 閉じる</p></div><ol id="stage-slots" class="presentation-slots" aria-label="発表済みチームと未発表の枠"></ol><p id="stage-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
+  dialog.innerHTML = `<div class="presentation-inner"><header class="presentation-header"><div><p class="presentation-badge">${badge}</p><h2 id="presentation-title">次のステージへ。</h2></div><button type="button" id="stage-close">閉じる <span aria-hidden="true">×</span></button></header><div class="presentation-audio" aria-label="発表BGM"><button type="button" id="bgm-toggle" aria-pressed="true">BGM: オン</button><label for="bgm-volume">音量 <span id="bgm-volume-label">35%</span></label><input id="bgm-volume" type="range" min="0" max="100" step="5" value="35" aria-label="BGMの音量"><span id="bgm-status" role="status">発表開始と同時に再生します。</span></div><p class="presentation-local">開始時の結果で固定します。</p><div id="stage-setup" class="presentation-setup"><p class="presentation-eyebrow">BEFORE THE SPOTLIGHT</p><h3>${selection.order.length}チームの発表を準備</h3><p>低い点数から順に、1チームずつ発表します。10位と同点は全員通過し、同率順位で表示します。</p>${snapshot.warnings.map((warning) => `<p class="presentation-warning">${esc(warning)}</p>`).join("")}<p id="stage-selection" role="status"></p><button type="button" id="stage-start">発表画面へ</button></div><div id="stage-show" hidden><div id="stage-card" class="presentation-card"></div><div class="presentation-controls"><button type="button" id="stage-back">戻る</button><button type="button" id="stage-next" class="presentation-next">一つ発表</button><button type="button" id="stage-restart">最初から</button><span id="stage-progress"></span></div><p class="presentation-keyboard">Space / → 次へ · ← 戻る · Escape 閉じる</p></div><ol id="stage-slots" class="presentation-slots" aria-label="発表済みチームと未発表の枠"></ol><p id="stage-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
   const get = <T extends HTMLElement>(id: string) => dialog.querySelector<T>(`#${id}`)!;
-  get("presentation-title").textContent = "トップ10 発表ステージ";
+  get("presentation-title").textContent = "決勝進出 発表ステージ";
+  const startMusic = async () => {
+    if (musicMuted || musicStarted || musicStarting) return;
+    musicStarting = true;
+    try {
+      await music.start();
+      if (!dialog.isConnected || !started) { music.stop(); return; }
+      musicStarted = true;
+      get("bgm-status").textContent = musicMuted ? "BGMをミュートしています。" : "BGMを再生中です。";
+    } catch {
+      if (!dialog.isConnected) return;
+      musicMuted = true;
+      music.setMuted(true);
+      get("bgm-toggle").textContent = "BGM: 再生する";
+      get("bgm-toggle").setAttribute("aria-pressed", "false");
+      get("bgm-status").textContent = "音声を開始できませんでした。BGMボタンで再試行できます。";
+    } finally {
+      musicStarting = false;
+    }
+  };
+  get("bgm-toggle").addEventListener("click", () => {
+    musicMuted = !musicMuted;
+    music.setMuted(musicMuted);
+    get("bgm-toggle").textContent = musicMuted ? "BGM: オフ" : "BGM: オン";
+    get("bgm-toggle").setAttribute("aria-pressed", String(!musicMuted));
+    get("bgm-status").textContent = musicMuted ? "BGMをミュートしています。" : started ? "BGMを再生中です。" : "発表開始と同時に再生します。";
+    if (started && !musicMuted) void startMusic();
+  });
+  get<HTMLInputElement>("bgm-volume").addEventListener("input", (event) => {
+    const value = Number((event.currentTarget as HTMLInputElement).value);
+    music.setVolume(value / 100);
+    get("bgm-volume-label").textContent = `${value}%`;
+  });
   const cancel = () => {
     if (pending !== null) window.clearTimeout(pending);
     pending = null;
   };
   const updateSelection = () => {
-    selection = selectPresentation(snapshot, [...chosen]);
+    selection = selectPresentation(snapshot);
     get("stage-selection").textContent = selection.message;
     get<HTMLButtonElement>("stage-start").disabled = !selection.valid;
   };
@@ -906,29 +947,30 @@ function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): 
     const entry = state.revealed ? selection.order[state.revealed - 1] : null;
     const card = get("stage-card");
     card.className = `presentation-card${state.busy ? " is-anticipating" : ""}${!state.busy && entry?.rank === 1 ? " is-winner" : ""}`;
-    card.innerHTML = state.busy ? `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>NEXT SPOTLIGHT</p><h3>次のアイデアに、光を。</h3><p>まもなく発表</p></div>` : entry ? `<div class="presentation-reveal"><p class="presentation-rank">${rankLabel(entry)}</p><h3 class="presentation-team">${esc(entry.teamName)}</h3><p class="presentation-demo-link">${demoLink(entry.demoUrl, snapshot.mode === "demo" ? "デモ未設定（架空データ）" : "デモ未設定")}</p><p class="presentation-score">${esc(entry.total)}<span> / 40</span></p><dl class="presentation-axes">${axes.map((axis) => `<div><dt>${esc(axis.label)}</dt><dd>${esc(entry.criteria.find((criterion) => criterion.key === axis.key)?.score ?? "--")}<small> / 10</small></dd></div>`).join("")}</dl>${entry.rank === 1 ? `<div class="presentation-celebration" aria-hidden="true">${Array.from({ length: 12 }, (_, index) => `<i style="--ray:${index}"></i>`).join("")}</div>` : ""}</div><figure class="presentation-mascot"><img src="/images/nukoevi-original.jpg" width="886" height="886" alt="発表を見守るぬこエビ"><figcaption>YOUR NEXT STAGE</figcaption></figure>` : `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>10 IDEAS / ONE NEXT STAGE</p><h3>そのアイデアに、<br>スポットライトを。</h3><p>チーム名と点数は発表までお楽しみに。</p></div>`;
-    get("stage-slots").innerHTML = Array.from({ length: 10 }, (_, index) => {
+    card.innerHTML = state.busy ? `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>NEXT SPOTLIGHT</p><h3>次のアイデアに、光を。</h3><p>まもなく発表</p></div>` : entry ? `<div class="presentation-reveal"><p class="presentation-rank">${rankLabel(entry)}</p><h3 class="presentation-team">${esc(entry.teamName)}</h3><p class="presentation-demo-link">${demoLink(entry.demoUrl, snapshot.mode === "demo" ? "デモ未設定（架空データ）" : "デモ未設定")}</p><p class="presentation-score">${esc(entry.total)}<span> / 40</span></p><dl class="presentation-axes">${axes.map((axis) => `<div><dt>${esc(axis.label)}</dt><dd>${esc(entry.criteria.find((criterion) => criterion.key === axis.key)?.score ?? "--")}<small> / 10</small></dd></div>`).join("")}</dl>${entry.rank === 1 ? `<div class="presentation-celebration" aria-hidden="true">${Array.from({ length: 12 }, (_, index) => `<i style="--ray:${index}"></i>`).join("")}</div>` : ""}</div><figure class="presentation-mascot"><img src="/images/nukoevi-original.jpg" width="886" height="886" alt="発表を見守るぬこエビ"><figcaption>YOUR NEXT STAGE</figcaption></figure>` : `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>${selection.order.length} IDEAS / ONE NEXT STAGE</p><h3>そのアイデアに、<br>スポットライトを。</h3><p>チーム名と点数は発表までお楽しみに。</p></div>`;
+    get("stage-slots").innerHTML = Array.from({ length: selection.order.length }, (_, index) => {
       const revealed = index < state.revealed ? selection.order[index] : null;
       return revealed ? `<li class="is-revealed"><span>${rankLabel(revealed)}</span><strong>${esc(revealed.teamName)}</strong><span>${esc(revealed.total)} / 40</span></li>` : `<li><span>発表枠 ${index + 1}</span><strong>未発表</strong><span aria-hidden="true">•••</span></li>`;
     }).join("");
-    get<HTMLButtonElement>("stage-next").disabled = state.busy || state.revealed === 10;
-    get("stage-next").textContent = state.revealed === 10 ? "完了" : state.busy ? "発表中…" : state.revealed === 0 ? "一つ発表" : "次を発表";
+    get<HTMLButtonElement>("stage-next").disabled = state.busy || state.revealed === selection.order.length;
+    get("stage-next").textContent = state.revealed === selection.order.length ? "完了" : state.busy ? "発表中…" : state.revealed === 0 ? "一つ発表" : "次を発表";
     get<HTMLButtonElement>("stage-back").disabled = state.busy || state.revealed === 0;
-    get("stage-progress").textContent = `${state.revealed} / 10 発表済み`;
+    get("stage-progress").textContent = `${state.revealed} / ${selection.order.length} 発表済み`;
   };
   const advance = (event: { detail?: number; repeat?: boolean }) => {
-    if (!started || !acceptsAdvance(state, { detail: event.detail ?? 0, repeat: event.repeat ?? false, elapsedMs: Date.now() - lastAdvanceAt })) return;
+    if (!started || !acceptsAdvance(state, { detail: event.detail ?? 0, repeat: event.repeat ?? false, elapsedMs: Date.now() - lastAdvanceAt }, selection.order.length)) return;
     lastAdvanceAt = Date.now();
-    state = revealState(state, "begin");
+    state = revealState(state, "begin", selection.order.length);
     renderStage();
     dialog.focus({ preventScroll: true });
     let reduced = false;
     try { reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false; } catch { reduced = false; }
     pending = window.setTimeout(() => {
       pending = null;
-      state = revealState(state, "complete");
+      state = revealState(state, "complete", selection.order.length);
       renderStage();
       const entry = selection.order[state.revealed - 1]!;
+      if (musicStarted) music.cue?.(entry.rank);
       get("stage-live").textContent = `${snapshot.mode === "demo" ? "架空データ。" : ""}${rankLabel(entry)}、${entry.teamName}、${entry.total}点、40点満点。`;
     }, reduced ? 60 : 650);
   };
@@ -942,6 +984,7 @@ function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): 
   };
   const close = () => {
     cancel();
+    music.stop();
     document.removeEventListener("focusin", containFocus);
     dialog.remove();
     background.forEach(({ node, inert }) => { node.inert = inert; });
@@ -977,6 +1020,7 @@ function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): 
   get("stage-start").addEventListener("click", () => {
     if (!selection.valid || started) return;
     started = true;
+    void startMusic();
     dialog.classList.add("is-presenting");
     dialog.querySelector(".presentation-local")?.remove();
     get("stage-setup").remove();
@@ -984,12 +1028,6 @@ function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): 
     renderStage();
     dialog.focus({ preventScroll: true });
   });
-  dialog.querySelectorAll<HTMLInputElement>(".presentation-candidates input").forEach((input) => input.addEventListener("change", () => {
-    const entry = snapshot.candidates[Number(input.value)];
-    if (!entry) return;
-    if (input.checked) chosen.add(entry.id); else chosen.delete(entry.id);
-    updateSelection();
-  }));
   get("stage-next").addEventListener("click", advance);
   get("stage-back").addEventListener("click", back);
   get("stage-restart").addEventListener("click", () => {
