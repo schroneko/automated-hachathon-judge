@@ -29,6 +29,7 @@ export async function processScoringMessage(value: unknown, env: Env): Promise<v
     });
     outcome = { kind: "completed", result };
   } catch (error) {
+    console.error(JSON.stringify({ event: "judging_failed", submissionId: job.submissionId, name: error instanceof Error ? error.name : "UnknownError", message: error instanceof Error ? error.message.slice(0, 500) : "Unexpected scoring failure" }));
     const message = error instanceof Error && ["Budget exhausted", "Scoring service is unavailable", "Budget reservation failed", "Usage settlement failed"].includes(error.message)
       ? error.message
       : "Scoring failed. Review the submission and retry manually.";
@@ -50,7 +51,7 @@ async function requireModels(apiKey: string): Promise<void> {
     headers: { authorization: `Bearer ${apiKey}` },
     signal: AbortSignal.timeout(15_000)
   });
-  if (!response.ok) throw new Error("Model listing failed");
+  if (!response.ok) throw new Error(`Model listing failed with status ${response.status}`);
   const body: unknown = await response.json();
   if (typeof body !== "object" || body === null || !Array.isArray((body as { data?: unknown }).data)) throw new Error("Invalid model listing");
   const ids = new Set((body as { data: Array<{ id?: unknown }> }).data.map((item) => item?.id));
