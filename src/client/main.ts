@@ -56,15 +56,40 @@ if (!root) throw new Error("App root not found");
 root.innerHTML = `
   <main class="shell">
     <header class="topbar">
-      <span class="brand">OPENAI DEVDAY <span>2026</span></span>
-      <span>COMMUNITY HACKATHON · TOKYO</span>
+      <span class="brand"><svg class="brand-symbol" aria-hidden="true" focusable="false" viewBox="0 0 24 24"><path d="m12 0 3.5 8.5L24 12l-8.5 3.5L12 24l-3.5-8.5L0 12l8.5-3.5Z" fill="currentColor"/></svg> OPENAI DEVDAY <span>2026</span></span>
+      <span class="topbar-tag">COMMUNITY HACKATHON · TOKYO</span>
     </header>
     <section class="hero">
-      <div>
-        <p class="overline">2026.10.18 / TOKYO / PRELIMINARY</p>
-        <h1>予選審査<span class="mark">.</span></h1>
+      <div class="hero-content">
+        <p class="overline"><span class="signal-dot" aria-hidden="true"></span> 予選ジャッジ / 2026.10.18 / TOKYO</p>
+        <h1>すごい作品、<br><span>次のステージへ。</span></h1>
         <p class="event-name">OpenAI DevDay 2026 Community Hackathon Tokyo</p>
         <p class="hero-copy">公開 GitHub ソースをもとに、約30チームから決勝進出10チームを選出します。</p>
+        <div class="hero-links"><a class="hero-link primary" href="#results-title">審査結果を見る <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M4 14 14 4M4 4h10v10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a><a class="hero-link secondary" href="#overview-title">進行状況 <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M9 3v12m-5-5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></div>
+      </div>
+      <div class="hero-art" aria-hidden="true">
+        <span class="art-sticker sticker-one">FINAL<br>10</span>
+        <span class="art-sticker sticker-two">LET'S<br>GO!</span>
+        <svg class="mascot" viewBox="0 0 460 420" focusable="false" xmlns="http://www.w3.org/2000/svg">
+          <ellipse cx="234" cy="375" rx="146" ry="23" fill="#090c1b" opacity=".5"/>
+          <path d="M75 209C87 108 179 65 278 84c83 16 132 79 114 160-17 80-94 131-193 119C111 353 65 294 75 209Z" fill="#23294a" stroke="#d9fa5c" stroke-width="4"/>
+          <path d="M103 224C111 130 184 92 272 104c78 10 119 64 105 139-13 74-84 117-173 107-82-9-108-60-101-126Z" fill="#d9fa5c"/>
+          <path d="M140 161c29-39 94-54 151-37" fill="none" stroke="#f3ffb6" stroke-width="17" stroke-linecap="round" opacity=".67"/>
+          <path d="M110 269c-31-15-46-6-42 12 5 19 27 33 56 30M366 265c31-17 47-9 44 9-3 19-25 35-54 34" fill="#d9fa5c" stroke="#23294a" stroke-width="5" stroke-linejoin="round"/>
+          <path d="M162 343c-4 22-1 34 19 38 21 5 37-7 38-25M276 351c2 21 15 29 33 26 20-3 24-17 17-37" fill="#d9fa5c" stroke="#23294a" stroke-width="5"/>
+          <path d="M209 85c-4-36 0-52 14-61 10-6 19-1 22 8 5 16-10 32-24 38" fill="none" stroke="#d9fa5c" stroke-width="11" stroke-linecap="round"/>
+          <circle cx="222" cy="22" r="13" fill="#ffb8d4" stroke="#23294a" stroke-width="4"/>
+          <ellipse cx="174" cy="223" rx="18" ry="26" fill="#15192e"/>
+          <ellipse cx="282" cy="219" rx="18" ry="26" fill="#15192e"/>
+          <circle cx="179" cy="213" r="6" fill="#fff8e9"/>
+          <circle cx="287" cy="209" r="6" fill="#fff8e9"/>
+          <ellipse cx="135" cy="251" rx="24" ry="13" fill="#ffb8d4" opacity=".88"/>
+          <ellipse cx="326" cy="248" rx="24" ry="13" fill="#ffb8d4" opacity=".88"/>
+          <path d="M206 259c9 18 36 19 48-1" fill="none" stroke="#15192e" stroke-width="6" stroke-linecap="round"/>
+          <path d="M346 322l12-22 25 1-15-20 9-24-23 9-19-16-1 25-23 12 25 6Z" fill="#ffb8d4" stroke="#23294a" stroke-width="5" stroke-linejoin="round"/>
+          <path d="M45 95l7-18 7 18 18 7-18 7-7 18-7-18-18-7ZM388 70l5-13 5 13 13 5-13 5-5 13-5-13-13-5Z" fill="#fff8e9"/>
+          <circle cx="76" cy="159" r="4" fill="#ffb8d4"/><circle cx="411" cy="184" r="5" fill="#d9fa5c"/>
+        </svg>
       </div>
       <div class="hero-facts">
         <div><span>審査対象</span><strong>約30<small> チーム</small></strong></div>
