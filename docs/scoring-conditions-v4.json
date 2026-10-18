@@ -1196,5 +1196,152 @@
       "status": "passed",
       "failedCases": []
     }
-  ]
+  ],
+  "deployment": {
+    "versionId": "7d1f8cd5-159b-4f82-9832-4442cae08654",
+    "applicationCommit": "8d8cb55",
+    "url": "https://hackathon.nukoevi.app/",
+    "clientAsset": "/assets/index-F7FVAnLc.js",
+    "browserWidths": [
+      1280,
+      390,
+      320
+    ],
+    "publicBgmAndTiesVerified": true,
+    "productionBudgetUSD": 90,
+    "productionSpentUSD": 0,
+    "publicCanary": {
+      "batchId": "b4d6cd64-659a-413b-bc4a-6b4ea204ce7e",
+      "submissionId": "d3e42ddf-4c0d-4088-a9a1-b9fc5619f44d",
+      "repo": "sindresorhus/yocto-queue",
+      "status": "completed",
+      "explanationStatus": "completed",
+      "pinnedSha": "72a8fa96a9d389765cdf2bb9c6daba8302fc375d",
+      "result": {
+        "eligibility": "eligible",
+        "summary": "固定スコアは24点です。FIFOキューの実装、型定義、境界条件のテストを確認できますが、DevDay新機能の製品統合はありません。独創性8点の根拠には確認が必要です。",
+        "publicReason": "提示された固定ソースだけに基づく説明です。軽量なキューAPIの操作性と再利用性は実装から追えます。一方、標準的な連結リスト構造を独自の工夫と位置付ける根拠は不足しているため、点数は変更せずレビュー対象としています。実行による検証は行っていません。",
+        "repoAssessment": "scored",
+        "pinnedSha": "72a8fa96a9d389765cdf2bb9c6daba8302fc375d",
+        "criteria": [
+          {
+            "key": "technical",
+            "label": "新機能の活用",
+            "score": 0,
+            "reason": "index.jsは連結リストによるFIFO操作を実装し、test.jsもその操作を検証しています。固定ソース全体に、信頼済み一覧のDevDay新機能への呼び出しや接続された宣言的統合は確認できません。次の2点に必要な試験的呼び出しやスタブもありません。",
+            "evidencePaths": [
+              "index.js",
+              "test.js"
+            ]
+          },
+          {
+            "key": "ux",
+            "label": "使いやすさ",
+            "score": 8,
+            "reason": "index.jsの公開APIとindex.d.tsの型・説明が対応し、追加から取得まで追えます。空キューのundefined返却、clearによる初期化、空になった後の再追加はtest.jsにも検証例があります。次の10点に必要な、通常のAPI操作を超える摩擦低減を2つ以上の具体的利用場面で確認する根拠は不足しています。",
+            "evidencePaths": [
+              "index.js",
+              "index.d.ts",
+              "test.js",
+              "readme.md"
+            ]
+          },
+          {
+            "key": "impact",
+            "label": "有用性",
+            "score": 8,
+            "reason": "index.jsはhead・tail参照で全件走査せず追加・取得でき、開発者のFIFO処理を支援します。非破壊の反復と、取り出しながら処理するdrainを備え、複数の消費方法に再利用できます。test.jsに対応例もあります。次の10点に必要な、具体的な利用作業での突出した手順・労力削減までは検証できません。",
+            "evidencePaths": [
+              "index.js",
+              "test.js"
+            ]
+          },
+          {
+            "key": "idea",
+            "label": "独創性",
+            "score": 8,
+            "reason": "index.jsのtail保持は末尾探索を避け、drainは消費と削除をまとめています。ただし、いずれも標準的なキュー設計として説明でき、6点以上の前提となる独自の着眼点・仕組みを支持する証拠が不足しています。固定8点は維持しますが要確認です。次の10点に必要な、独自の仕組みに起因する便益の検証も確認できません。",
+            "evidencePaths": [
+              "index.js",
+              "test.js"
+            ]
+          }
+        ],
+        "total": 24,
+        "attackScore": null,
+        "attackProbability": 0.13,
+        "reviewRequired": true,
+        "usage": {
+          "fullSource": true,
+          "sourceFiles": 12,
+          "sourceBytes": 10836,
+          "sourceHash": "9a30f24be5583b464218b3a981f83e874cc22cca971327dd2480e92f22e1c351",
+          "model": "gpt-6-luna",
+          "effort": "medium",
+          "decisionsModel": "gpt-6-luna",
+          "rubricVersion": "2026-10-18-v4",
+          "inputTokens": 28536,
+          "outputTokens": 1031,
+          "costUsd": 0.023565,
+          "decisionsScores": {
+            "technical": 0,
+            "ux": 8,
+            "impact": 8,
+            "idea": 8
+          },
+          "decisionsConditions": {
+            "technical_level_2": false,
+            "technical_level_4": false,
+            "technical_level_6": false,
+            "technical_level_8": false,
+            "technical_level_10": false,
+            "ux_level_2": true,
+            "ux_level_4": true,
+            "ux_level_6": true,
+            "ux_level_8": true,
+            "ux_level_10": false,
+            "impact_level_2": true,
+            "impact_level_4": true,
+            "impact_level_6": true,
+            "impact_level_8": true,
+            "impact_level_10": false,
+            "idea_level_2": true,
+            "idea_level_4": true,
+            "idea_level_6": true,
+            "idea_level_8": true,
+            "idea_level_10": false
+          },
+          "decisionsConditionProbabilities": {
+            "technical_level_2": 0,
+            "technical_level_4": 0,
+            "technical_level_6": 0,
+            "technical_level_8": 0,
+            "technical_level_10": 0.03,
+            "ux_level_2": 1,
+            "ux_level_4": 1,
+            "ux_level_6": 0.97,
+            "ux_level_8": 0.8,
+            "ux_level_10": 0.07,
+            "impact_level_2": 1,
+            "impact_level_4": 1,
+            "impact_level_6": 0.92,
+            "impact_level_8": 0.94,
+            "impact_level_10": 0.15,
+            "idea_level_2": 1,
+            "idea_level_4": 0.99,
+            "idea_level_6": 0.95,
+            "idea_level_8": 1,
+            "idea_level_10": 0.1
+          },
+          "conditionThreshold": 0.8,
+          "requestIds": [
+            "req_bedfc876243848e891700b8a30dc0a3e",
+            "req_fdd940940b6149ea91c0bd93c0b02e4c"
+          ],
+          "referenceVersion": "2026-10-18-verified-v2",
+          "explanationModel": "gpt-6.1-sol"
+        }
+      }
+    }
+  }
 }
