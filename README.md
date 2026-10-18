@@ -1,203 +1,87 @@
 # Automated Hackathon Judge
 
-公開 GitHub リポジトリを、4 つの観点で自動ジャッジしてランキングを公開する Web アプリです。Cloudflare Workers と Durable Objects が受付と状態管理を担当し、別ホストの Codex SDK Runner がリポジトリの証拠を読み取って採点します。
+2026年10月18日の DevDay Community Hackathon Tokyo 向け予選審査ツールです。公開 GitHub リポジトリのソースを評価し、約30チームから決勝候補10チームを選びます。
 
-稼働例: https://hackathon.nukoevi.app/
+公開先: [hackathon.nukoevi.app](https://hackathon.nukoevi.app/)
 
-稼働例ではイベント終了後のため新規投稿を停止しています。ランキングと既存結果は閲覧できます。
+## Judging
 
-## Features
-
-- 入力は公開 GitHub リポジトリ URL のみ
-- default branch の現在の commit SHA を固定して評価
-- clone、archive 展開、リポジトリ内コード実行を行わない
-- README 内の外部リンクを評価対象にしない
-- 4 観点を各 0〜10 点、合計 40 点で 1 回だけ採点
-- リポジトリごとの最新 completed 結果だけをランキングへ反映
-- 最大 10 件を並列処理
-- prompt injection の兆候を通常点とは別の「ぬこスコア」として検出
-- 設定値だけで投稿受付の停止と再開が可能
-- JudgeState の日次書き込み件数に warning と hard limit を設定
-
-## Scoring
-
-| 観点 | 確認内容 |
+| 観点 | 評価内容 |
 | --- | --- |
-| 技術的な実装 | completeness、architecture、robustness、security |
-| デザインとユーザー体験 | UI structure、flow、consistency、accessibility |
-| 潜在的なインパクト | importance、audience、practicality、growth potential |
-| アイデアの質 | originality、problem-solution fit、insight |
+| 新機能の活用 | DevDay 2026で発表された機能を、目的に合った形で活用しているか？ |
+| 使いやすさ | 他の人にとって使いやすいものになっているか？ |
+| 有用性 | 他の人にとって今後どれだけ役に立つ可能性があるか？ |
+| 独創性 | 着眼点や解決方法にオリジナリティがあるか？ |
 
-点数の共通基準は、0 が評価可能な証拠なし、1〜2 が初期段階、3〜4 が大きな不足あり、5〜6 が基準到達、7〜8 が明確に強い、9〜10 がハッカソンとして突出、です。
+各観点は `0 / 2 / 4 / 6 / 8 / 10` の6段階、合計40点です。[ルーブリック](src/shared/rubric.ts) の版は `2026-10-18-v1` です。各観点に具体的な条件を定め、証拠で全条件を満たす最高段階を採用します。8点は6点の全条件、10点は8点の全条件を満たす必要があります。根拠と次の段階に不足する条件を理由に記載し、10点では最高段階を満たした根拠を示します。
 
-採点結果には短い公開理由と根拠ファイルパスを含めます。chain-of-thought や非公開の推論は保存しません。
+Decisions API の補助評価と攻撃判定に `gpt-6-luna`、最終採点と理由の生成に Responses API の `gpt-6.1-sol` を使います。同じルーブリックを画面、Decisions API、最終採点プロンプトで共有します。本番のreasoning effortは `high`、検証の既定値は `low` です。検証結果は `high` で再検証できます。各試行の開始前に指定モデルの利用権限を確認し、別モデルへ切り替えません。
 
-## Architecture
+新機能は公式発表を確認した [信頼済み参照情報](src/shared/devday-reference.ts) と実装の証拠に基づいて判定します。Codexで開発したことやREADMEの自己申告だけでは加点しません。操作性はソースから読み取れる範囲の評価です。
 
-1. frontend が GitHub URL を Worker へ送信します。
-2. Worker が入力、受付状態、Runner の稼働状態、IP cooldown、同一リポジトリの重複処理を検証します。
-3. Durable Object が submission と 10 個の bucket queue を永続化します。
-4. Runner が job を取得し、認証済み GitHub API で default branch と commit SHA を解決します。
-5. Runner が上限付きのテキスト snapshot を作り、read-only の Codex SDK thread へ渡します。
-6. Codex が strict JSON schema に従って採点します。
-7. Runner が job 固有の callback token で結果を返し、ランキングを更新します。
+攻撃確率が80%以上の場合だけ、5つ目の軸「攻撃 XX点」を表示します。これは攻撃を含む確率の百分率で、攻撃の成功率や高度さではありません。通常の40点や順位へ加算しません。教材の引用やゲーム内の台詞と、現在の審査を操作する指示を区別します。
 
-詳細は [Architecture](docs/architecture.md) を参照してください。
+## Interface
 
-## Requirements
+- 本番・検証を分離し、検証結果は順位と本番予算から除外
+- チーム名とGitHub URLの入力、最大30行の一括登録、重複防止
+- 進捗、上位10チームの境界、10位同点の主催者確認
+- 4観点の段階別基準、採点根拠と不足条件、採点に使ったcommitへのファイルリンク
+- 検索、CSV・JSON出力、スマートフォン表示
+- 主催者トークンが必要な登録と、認証不要の結果閲覧
 
-- Node.js 20.19 以上
-- npm
-- Cloudflare Workers と Durable Objects を利用できる Cloudflare account
-- global installation の `wrangler`
-- GitHub CLI `gh`
-- Codex CLI で利用できる OpenAI account
-- Runner を継続稼働させる macOS または Linux host
+登録後はクラウドのQueueが採点を実行します。会場のMacBook Airではブラウザだけを使います。Mac Studio、ローカルサーバー、ローカル保存に依存せず、ブラウザを閉じても開始済みの審査と残りのキュー処理は継続します。
 
-Codex SDK は server-side の Node.js で動作します。Runner host で `codex login` を実行すると、ChatGPT sign-in または API key sign-in の認証を Codex SDK が利用します。公式情報は [Codex SDK documentation](https://learn.chatgpt.com/docs/codex-sdk) と [OpenAI authentication](https://learn.chatgpt.com/docs/auth) を参照してください。
+## Architecture and limits
 
-## Setup
+Cloudflare Workers が画面・API・採点consumerを提供します。既存の共有D1 `wordplay-arcade-budget` の `devday_judge_` 専用テーブルに審査状態・結果・費用台帳を保存し、Queue `devday-judge-20261018` が審査IDを配信します。新しいD1の作成枠は不要です。
 
-依存関係を導入し、検証します。
+OpenAI APIキーは既存の1Password Environmentから取得した指定変数をWorker secretとして扱い、ブラウザへ渡しません。Cloudflareの管理と公開はWranglerのOAuth認証を使います。
+
+現在のリクエスト経路にDurable Objectsのbindingはありません。旧namespaceのデータを保持するため、過去のmigration履歴と呼び出しを拒否する旧classのexportだけを残します。
+
+| 制限 | 値 |
+| --- | --- |
+| 本番・検証登録数 | 本番40、検証20 |
+| 同時採点 | 最大4件 |
+| Queue | batch 1、自動再試行0 |
+| 試行・Queue送信 | 1件につき最大3回、イベント全体で最大180回 |
+| ソース証拠 | 最大24ファイル、各12KB、合計120KB |
+| API費用 | 本番$90、検証$20 |
+
+公開Gitのrefs広告からdefault branchとcommit SHAを固定し、SHAに対応するtreeをRESTで1回取得してからraw contentを読みます。GitHub tokenは使いません。対象コードの実行や、リポジトリ内リンクの巡回は行いません。
+
+API実行前に最大入力・出力から費用を予約し、実測usageで精算します。再試行時も過去の精算と未精算予約を保持します。費用が不明な予約を解放して再開しません。採点の自動再試行はなく、同じ区分の同じリポジトリの再登録は既存の結果を返します。
+
+更新するのは対象行だけです。結果取得、重複登録、処理済みQueueメッセージの重複配信は書き込み0件です。常駐ポーリング、定期heartbeat、Cronはありません。アカウント全体の$200上限とは別に、このイベントのAPI費用を制御します。
+
+## Development
+
+開発時だけNode.js 22.13以上、npm、mise管理のWranglerを使います。会場での操作にCLIは不要です。
 
 ```bash
-npm install
+npm ci
 npm run typecheck
 npm test
 npm run build
+wrangler d1 migrations apply JUDGE_DB --local
+wrangler dev --ip 127.0.0.1 --port 8787 --var RUNNER_TOKEN:local-preview --var SUBMISSIONS_OPEN:false --var JUDGING_ENABLED:false
 ```
 
-Cloudflare と Runner のセットアップは [Deployment](docs/deployment.md) を参照してください。
+`local-preview` はローカル検証用で、公開環境に使用しません。この例は受付と採点を停止した画面確認用です。
 
-リポジトリの clone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しません。課金が始まるのは、自分の Cloudflare account へ明示的に deploy して Worker を利用した後です。
+## Event operation
 
-## Local development
+主催者メニューに既存の `RUNNER_TOKEN` を入力し、チーム名と公開GitHub URLを登録します。本番はhigh、検証はlowで採点し、検証結果のhigh再検証も同じ画面から操作します。トークンの主催者への受け渡しは未完了です。
 
-frontend と Worker を起動します。
+採点キーは `OPENAI_API_KEY_20261018_HACKATHON` です。既存1Password EnvironmentからWorker secretへ安全に注入する手順は検証中です。設定値をリポジトリ、URL、画面へ記載しません。受付と採点の停止は `SUBMISSIONS_OPEN: false` と `JUDGING_ENABLED: false` で反映します。
 
-```bash
-npm run build:client
-wrangler dev
-```
+初回試験は [influ-quest](https://github.com/schroneko/influ-quest)、攻撃試験は [judge-injection-playground](https://github.com/schroneko/judge-injection-playground) を使い、検証区分へ登録します。
 
-別 terminal で Runner を起動します。ローカルで投稿を受け付ける場合は `wrangler.jsonc` の `CALLBACKS_ENABLED`、`RUNNER_ENABLED`、`SUBMISSIONS_OPEN` を `true` にします。
+イベント後は受付と採点を停止してCSV・JSONを書き出します。データの保存期間はイベント後90日を目安とし、削除する対象と影響は別途確認します。
 
-```bash
-RUNNER_BASE_URL=http://127.0.0.1:8787 \
-RUNNER_TOKEN_FILE=/absolute/path/to/runner-token \
-RUNNER_SPOOL_DIR=/absolute/path/to/spool \
-npm run runner:start
-```
-
-## Configuration
-
-Worker の設定は `wrangler.jsonc` に置きます。
-
-| 名前 | 種類 | 説明 |
-| --- | --- | --- |
-| `CALLBACKS_ENABLED` | Worker variable | `true` のときだけ認証済み scoring callback を許可。未設定時は停止 |
-| `JUDGE_STATE_ROWS_WRITTEN_DAILY_LIMIT` | Worker variable | JUDGE_STATE の UTC 日次 hard limit。未設定時は `50000` |
-| `JUDGE_STATE_ROWS_WRITTEN_DAILY_WARNING` | Worker variable | JUDGE_STATE の UTC 日次 warning。未設定時は `25000` |
-| `MAX_ACCEPTED_SUBMISSIONS` | Worker variable | 1 event で受け付ける submission の総数。未設定時は `500` |
-| `RUNNER_TOKEN` | Worker secret | internal Runner endpoint の bearer token |
-| `RUNNER_ENABLED` | Worker variable | `true` のときだけ claim、heartbeat、recover を許可。未設定時は停止 |
-| `PUBLIC_BASE_URL` | Worker variable | callback URL の public origin。未設定時は request origin |
-| `SUBMISSIONS_OPEN` | Worker variable | `true` のときだけ新規投稿を許可。未設定時は停止 |
-| `UNRANKED_OWNERS` | Worker variable | ランキング末尾へ送る GitHub owner のカンマ区切り一覧 |
-
-Runner の環境変数です。
-
-| 名前 | 既定値 | 説明 |
-| --- | --- | --- |
-| `RUNNER_BASE_URL` | なし。必須 | Worker の origin。未設定時は Runner を起動しない |
-| `RUNNER_TOKEN_FILE` | macOS Application Support 配下 | `RUNNER_TOKEN` と同じ値を入れた file |
-| `RUNNER_SPOOL_DIR` | macOS Application Support 配下 | callback 完了前の結果を保護する directory |
-| `RUNNER_CONCURRENCY` | `10` | 並列数。1〜10 |
-| `RUNNER_POLL_INTERVAL_MS` | `2000` | queue polling の初期間隔。待機中は最大 30000 ms まで自動的に延長 |
-| `CODEX_MODEL` | `gpt-5.4` | Runner が使用する Codex model |
-| `GITHUB_TOKEN` | `gh auth token` の結果 | GitHub API token。未設定時は Runner が `gh` から取得 |
-
-## Submission control
-
-`SUBMISSIONS_OPEN` は新規投稿だけを制御します。Runner と Durable Object への定期アクセスも止める場合は、`RUNNER_ENABLED` も `false` にします。
-
-受付を停止する場合:
-
-```json
-"SUBMISSIONS_OPEN": "false"
-```
-
-受付を再開する場合:
-
-```json
-"SUBMISSIONS_OPEN": "true"
-```
-
-変更後に `npm run build` と `wrangler deploy` を実行してください。API は停止中の新規投稿へ `403` を返します。
-
-完全停止する場合:
-
-```json
-"CALLBACKS_ENABLED": "false",
-"RUNNER_ENABLED": "false",
-"SUBMISSIONS_OPEN": "false"
-```
-
-`RUNNER_ENABLED` が `false` のとき、claim、heartbeat、recover は Durable Object へ到達する前に拒否されます。処理中の結果を完了させながら停止する場合だけ `CALLBACKS_ENABLED` を一時的に `true` のまま残します。緊急停止では両方を `false` にします。
-
-JUDGE_STATE の日次書き込みガードは、`JUDGE_STATE` binding が参照する `global` JudgeState instance で成功した `storage.put` と `storage.delete` の key 数を UTC 日ごとに記録します。25,000 行に達すると構造化 warning を 1 回記録します。50,000 行の hard limit を超える保存は拒否します。拒否時の HTTP `507` を受けた Runner は停止し、未送信結果を spool directory に残します。
-
-日次書き込みガードの計測値は、Cloudflare 請求書に記載される Durable Objects Rows Written そのものではありません。別の Durable Object namespace、Cloudflare 内部処理、Requests、Duration は日次書き込みガードの計測対象外です。
-
-## API
-
-| Method | Path | 用途 |
-| --- | --- | --- |
-| `POST` | `/api/submissions` | submission の作成 |
-| `GET` | `/api/submission-status` | 受付状態 |
-| `GET` | `/api/submissions/:id` | submission の状態と結果 |
-| `GET` | `/api/results/:id` | submission の状態と結果 |
-| `GET` | `/api/recent` | 最新 50 件 |
-| `GET` | `/api/ranking` | リポジトリごとの最新 completed 結果 |
-| `GET` | `/api/runner-status` | Runner の heartbeat 状態 |
-
-`/internal/*` は Runner 用です。public client から使用しないでください。`GET /internal/runner/write-budget` は Runner bearer token で認証した read-only endpoint で、UTC 日付、成功した put / delete の key 数、warning、hard limit、停止状態を返します。endpoint の呼び出しでは Durable Object Storage を更新しません。
-
-## Security model
-
-- 対象リポジトリは untrusted data として扱います。
-- GitHub REST API と raw content API だけを使い、対象コードを実行しません。
-- 最大 24 files、合計 120 KB、1 file 12 KB に証拠を制限します。
-- Codex thread は read-only sandbox、network disabled、web search disabled で実行します。
-- Codex subprocess へは `HOME` と `PATH` だけを明示的に渡し、GitHub token を渡しません。
-- callback は submission ごとの random token で認証します。
-- callback endpoint 自体も Runner の bearer token で認証し、body size、schema、score の整合性を Durable Object の手前で検証します。
-- public result から callback token と IP hash を除外します。
-- Runner token と Codex credentials は Cloudflare source や Git history に保存しません。
-- submission と結果は public data です。秘密情報を含むリポジトリを投稿しないでください。
-
-これは一日規模のイベント用に作られた最小構成です。multi-tenant SaaS として利用する場合は、認証、rate limiting、moderation、retention policy、監査、Runner 分離を追加してください。
-
-脆弱性の報告方法は [Security Policy](SECURITY.md) を参照してください。
-
-## Operations
-
-- Runner heartbeat が 30 秒途切れると Worker は新規投稿を拒否します。
-- Runner が無効なときは新規投稿と Runner の定期処理を Durable Object の手前で拒否します。
-- 状態保存は変更された job と metadata だけを書き込み、待機中や拒否された処理では書き込みません。
-- 1 イベントで受け付ける submission の総数を設定値で制限し、保存 job が無制限に増えないようにします。
-- JUDGE_STATE の成功した put / delete の key 数を UTC 日ごとに数え、25,000 行で warning を記録し、50,000 行で追加保存を停止します。
-- Cloudflare account 全体の従量課金額に `$1` と `$10` の Budget Alert を設定します。Budget Alert は日次集計による遅延があり、通知だけを行って Worker や Durable Object を停止しません。
-- Runner 起動時に中断された processing job を queue へ戻します。
-- callback 未完了の結果は spool directory に `0600` で保存し、再起動後に再送します。
-- missing、private、default branch なし、空のリポジトリは 4 観点すべて 0 点です。
-- GitHub または Codex の採点失敗は terminal failure とし、自動再採点しません。
-- 同じリポジトリは前回の処理完了後に再投稿できます。
-
-## Contributing
-
-[Contributing Guide](CONTRIBUTING.md) を参照してください。
+詳細: [構成](docs/architecture.md)、[公開と運用](docs/deployment.md)、[クラウド実行の上限と停止](docs/cloud-execution.md)、[Security Policy](SECURITY.md)。
 
 ## License
 
-[MIT License](LICENSE) で公開しています。
+MIT License

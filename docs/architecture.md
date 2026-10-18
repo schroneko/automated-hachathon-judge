@@ -1,79 +1,43 @@
 # Architecture
 
-## Components
+## Request flow
 
-### Cloudflare Worker
+1. 主催者がチーム名、公開GitHub URL、本番または検証区分を登録します。
+2. Workerがtoken、入力、区分別件数、重複を検証し、D1へ1件だけ追加します。
+3. WorkerがQueue `devday-judge-20261018` へ審査ID・イベント・区分・試行番号を送り、consumerが条件付き更新で取得して指定モデルの利用権限を確認します。batch 1、最大同時4件、自動再試行0です。
+4. 認証なしの公開Git smart HTTP refs広告を全体検証し、処理開始時点のdefault branchとHEAD SHAを固定します。
+5. SHAを指定したrecursive treeをRESTで1回取得し、同じSHAのraw contentから上限付きのテキスト証拠を作ります。GitHub token、clone、リンクの巡回、対象コードの実行は使いません。
+6. 費用をD1へ予約した後、Decisions APIが4観点の補助点と審査向け攻撃の確率を返します。
+7. 別の費用予約後、Solが信頼済みの基準で最終点と短い理由を生成します。本番はhigh、検証はlowが既定です。モデルへツールは渡しません。
+8. usageを精算し、consumerが内部関数で結果をD1へ反映します。外部callback endpointやローカルspoolはありません。
+9. Queueメッセージを終了し、残りの審査を処理します。会場のMacBook Airはブラウザだけで操作でき、画面を閉じてもキュー処理が続きます。Mac Studioや常駐するローカルプロセスは不要です。
 
-静的 frontend と public API、Runner 用 internal API を配信します。`SUBMISSIONS_OPEN` を fail-closed で判定し、受付停止中は submission を Durable Object へ渡しません。
+## Rubric
 
-### JudgeState Durable Object
+[単一のルーブリック定義](../src/shared/rubric.ts) を画面、Decisions API、最終採点プロンプトで共有します。版は `2026-10-18-v1`、各観点は `0 / 2 / 4 / 6 / 8 / 10` の6段階、合計40点です。
 
-submission、queue、callback token、IP cooldown、Runner heartbeat、最新 completed result を SQLite-backed storage に保存します。queue は normalized repository 名から決まる 10 bucket で構成します。
+段階の条件をすべて満たす最高点を選びます。8点には6点の全条件、10点には8点の全条件が必要です。各理由は根拠と次の段階に不足する条件を示し、10点では最高段階を満たした根拠を示します。提示されなかったファイルを理由に、リポジトリ全体の機能不在を断定しません。操作性はソースから読み取れる範囲で評価します。
 
-`JUDGE_STATE` binding は `global` JudgeState instance を参照します。JudgeState は、成功した `storage.put` と `storage.delete` の key 数を metadata と同じ transaction で UTC 日ごとに記録します。no-op または拒否された処理は counter を更新しません。
+## Trust boundary
 
-日次書き込み件数が 25,000 行に達すると、JudgeState は構造化 warning を 1 回記録します。50,000 行の hard limit を超える保存は拒否します。`GET /internal/runner/write-budget` は Runner bearer token で認証した read-only endpoint で、counter、warning 記録状態、停止状態を返します。
+リポジトリ名、パス、README、コード、refs広告とtreeの内容は信頼しない入力です。最終採点の開発者メッセージへリポジトリ本文を埋め込みません。公式の観点とDevDay参照情報はアプリ側から与えます。
 
-### Runner
+Decisionsも補助情報です。攻撃判定が低くてもリポジトリ内の指示へ従いません。攻撃判定の失敗、refusal、不正な応答、未知の観点、分布の不整合は審査失敗にします。
 
-Worker を polling し、最大 10 slot で job を処理します。GitHub API の認証には環境変数 `GITHUB_TOKEN` を使い、未設定時は `gh auth token` を実行します。
+観点と合計の整合性、許可した段階点、証拠パス、commit SHA、具体的なモデル名をアプリ側で検証します。攻撃スコアと費用情報をモデルへ生成させません。攻撃確率80%以上の結果だけ「攻撃 XX点」を表示し、合計点と順位には加えません。
 
-Runner は callback 前に結果を local spool へ保存します。callback が完了するまで exponential backoff で再送し、process 再起動時にも spool を replay します。
+APIキーは既存1Password Environmentから取得したイベント専用キーをWorker secretとして扱い、ブラウザへ返しません。Cloudflare認証にはWranglerの既存OAuthセッションだけを使います。
 
-Runner は Worker または JudgeState から HTTP `507` を受けると停止します。hard limit により callback が拒否された場合、Runner は未送信結果を local spool に残します。
+## Storage and recovery
 
-### Evidence collector
+既存の共有D1 `wordplay-arcade-budget` に、専用の `devday_judge_` 接頭辞を付けたテーブルで審査状態、結果、区分別費用台帳、API予約を保存します。既存サービスのテーブルとデータは変更しません。新規D1の作成は不要です。旧Durable Objectのmigrationと拒否用classだけを履歴として残し、bindingや旧namespaceへの呼び出しを置きません。
 
-default branch と現在の commit SHA を GitHub REST API で解決します。tree から評価に有用な text file を優先順位付きで選び、raw content API から取得します。
+条件付きclaimとメッセージの試行番号で重複配信を拒否します。登録済みリポジトリの再登録、完了結果の取得、処理済みメッセージの重複配信は書き込み0件です。新規登録は本番40件・検証20件、各審査は最大3試行で、Queue送信はイベント全体で最大180回です。
 
-以下は行いません。
+失敗した採点を自動でキューへ戻しません。主催者は失敗した審査や30分以上進まない審査を確認して再試行します。検証区分のlow完了結果だけはhighで再検証できます。過去のAPI費用精算と未確定の予約は再試行後も保持し、本番$90・検証$20の上限へ含めます。
 
-- `git clone`
-- commit history の取得
-- archive の download または展開
-- repository code の実行
-- README 内リンクの追跡
+`JUDGING_ENABLED: false` は新しい採点開始とAPI予約を拒否し、実行済みの精算・結果保存を許可します。`SUBMISSIONS_OPEN: false` は新規登録を停止します。APIへ送信済みの要求が停止フラグだけで取り消されるとは扱いません。
 
-### Codex scorer
+イベント後は書き出しを保管し、D1の保存期間は90日を目安とします。削除対象と影響を別途確認し、共有D1や旧Durable Objectを自動削除しません。
 
-証拠 snapshot だけを read-only workspace に保存します。Codex SDK thread は `approvalPolicy: never`、`sandboxMode: read-only`、network disabled、web search disabled で開始し、strict JSON schema の結果だけを受け付けます。
-
-## Data flow
-
-```text
-Browser
-  -> Cloudflare Worker
-  -> JudgeState Durable Object
-  <- Mac or Linux Runner
-  -> GitHub API
-  -> Codex SDK
-  -> per-job callback
-  -> JudgeState Durable Object
-  -> public ranking
-```
-
-## Trust boundaries
-
-- Browser input は untrusted です。GitHub URL 以外を拒否し、request body を 2 KB に制限します。
-- GitHub repository content は untrusted です。実行せず、prompt instruction として扱わないよう system prompt で境界を示します。
-- Runner endpoint は shared bearer token で保護します。
-- callback は job 固有 token で保護し、public response には含めません。
-- Codex authentication と GitHub authentication は Runner host にだけ保持します。
-
-## Persistence
-
-Durable Object は metadata と job records を分けて保存します。ranking は normalized repository ごとの最新 completed submission から都度生成します。古い job record は履歴として残るため、長期運用では retention policy の追加が必要です。
-
-日次書き込み counter は `global` JudgeState instance から実行した put / delete の key 数です。Cloudflare 請求書の Durable Objects Rows Written そのものではなく、別の Durable Object namespace、Cloudflare 内部処理、Requests、Duration を含みません。
-
-## Failure behavior
-
-- Runner offline: submission 作成を `503` で拒否
-- 受付停止: submission 作成を `403` で拒否
-- 同一 repository が処理中: `409`
-- IP cooldown: `429`
-- GitHub で評価材料なし: 0 点で completed
-- scoring failure: failed として確定
-- callback failure: local spool から再送
-- 日次 warning 到達: 構造化 warning を 1 回記録し、処理を継続
-- 日次 hard limit 到達: finalize を含む追加保存を `507` で拒否し、Runner は未送信結果を local spool に保持
+10位同点が境界をまたぐ場合は全員を確認候補にします。表示順で勝者を確定しません。

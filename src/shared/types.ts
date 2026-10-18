@@ -1,12 +1,14 @@
 export type CriterionKey = "technical" | "ux" | "impact" | "idea";
 export type SubmissionStatus = "queued" | "processing" | "completed" | "failed";
-export type RepoAssessmentKind =
-  | "scored"
-  | "empty_repository"
-  | "missing_or_private"
-  | "no_default_branch"
-  | "retryable_failure"
-  | "unjudgeable";
+export type SubmissionMode = "production" | "validation";
+export interface ScoringQueueMessage {
+  eventId: string;
+  submissionId: string;
+  mode: SubmissionMode;
+  attempt: number;
+  dispatch: number;
+}
+export type RepoAssessmentKind = "scored" | "empty_repository" | "missing_or_private" | "no_default_branch" | "retryable_failure" | "unjudgeable";
 
 export interface NormalizedRepo {
   owner: string;
@@ -23,6 +25,19 @@ export interface ScoreItem {
   evidencePaths: string[];
 }
 
+export interface ScoreUsage {
+  model: string;
+  effort: "low" | "high";
+  decisionsModel: string;
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  decisionsScores: Record<string, number>;
+  requestIds: string[];
+  referenceVersion?: string;
+  rubricVersion?: string | undefined;
+}
+
 export interface PublicScoreResult {
   summary: string;
   publicReason: string;
@@ -30,28 +45,10 @@ export interface PublicScoreResult {
   pinnedSha: string | null;
   criteria: ScoreItem[];
   total: number;
-  nukoScore: number | null;
+  attackScore: number | null;
+  attackProbability?: number | undefined;
+  usage?: ScoreUsage | undefined;
 }
-
-export interface SubmissionRecord {
-  id: string;
-  repoUrl: string;
-  repo: NormalizedRepo;
-  bucket: number;
-  status: SubmissionStatus;
-  callbackToken: string;
-  resolution: RepoResolution;
-  attempts: number;
-  createdAt: string;
-  updatedAt: string;
-  startedAt: string | null;
-  completedAt: string | null;
-  ipHash: string;
-  failureMessage: string | null;
-  result: PublicScoreResult | null;
-}
-
-export type PublicSubmissionRecord = Omit<SubmissionRecord, "callbackToken" | "ipHash">;
 
 export interface RepoResolution {
   assessment: Exclude<RepoAssessmentKind, "retryable_failure">;
@@ -60,127 +57,68 @@ export interface RepoResolution {
   summary: string;
 }
 
-export interface AppStateSnapshot {
-  acceptedSubmissions: number;
-  jobs: Record<string, SubmissionRecord>;
-  recentIds: string[];
-  repoInflight: Record<string, string>;
-  repoLatestCompleted: Record<string, string>;
-  ipCooldowns: Record<string, string>;
-  bucketQueues: Record<string, string[]>;
-  bucketActive: Record<string, boolean>;
-  runnerLastSeenAt: string | null;
-  writeBudget?: StateWriteBudget;
+export interface PublicSubmissionRecord {
+  id: string;
+  eventId: string;
+  repoUrl: string;
+  repo: NormalizedRepo;
+  teamName: string;
+  mode: SubmissionMode;
+  effort: "low" | "high";
+  status: SubmissionStatus;
+  attempts: number;
+  dispatches: number;
+  createdAt: string;
+  updatedAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+  failureMessage: string | null;
+  result: PublicScoreResult | null;
 }
 
-export interface StateWriteBudget {
-  utcDate: string;
-  rowsWritten: number;
-  warningEmitted: boolean;
-  exhausted: boolean;
-  exhaustedAt: string | null;
-}
-
-export interface StateWriteBudgetStatus extends StateWriteBudget {
-  warningRows: number;
-  hardLimitRows: number;
-  remainingRows: number;
-}
-
-export interface WriteBudgetExceededResult {
-  ok: false;
-  code: "write_budget_exhausted";
-  message: string;
-  writeBudget: StateWriteBudgetStatus;
+export interface SubmissionRecord extends PublicSubmissionRecord {
+  callbackToken: string | null;
+  outcomeJson: string | null;
 }
 
 export interface LeaseJob {
   submissionId: string;
   repoUrl: string;
   repo: NormalizedRepo;
-  bucket: number;
+  teamName: string;
+  mode: SubmissionMode;
+  effort: "low" | "high";
+  startedAt: string;
   callbackToken: string;
-  callbackUrl: string;
-  attempt: number;
   pinnedSha: string | null;
   defaultBranch: string | null;
   summary: string;
 }
 
-export interface SubmitJobInput {
-  repoUrl: string;
-  ipHash: string;
-  callbackBaseUrl: string;
-  nowIso: string;
-  maxAcceptedSubmissions?: number;
-  resolution: RepoResolution;
-}
-
-export interface SubmitJobSuccess {
-  ok: true;
-  submission: PublicSubmissionRecord;
-}
-
-export interface SubmitJobError {
-  ok: false;
-  code: "cooldown" | "duplicate_inflight" | "invalid_repo" | "submission_limit";
-  message: string;
-  retryAfterMs?: number;
-}
-
-export type SubmitJobResult = SubmitJobSuccess | SubmitJobError;
-
 export interface FinalizePayload {
   submissionId: string;
   callbackToken: string;
-  bucket: number;
-  callbackBaseUrl: string;
-  nowIso: string;
   outcome:
-    | {
-        kind: "completed";
-        result: PublicScoreResult;
-      }
-    | {
-        kind: "retryable_failure";
-        message: string;
-      }
-    | {
-        kind: "failed";
-        message: string;
-      };
-}
-
-export interface FinalizeResult {
-  ok: boolean;
-  submission?: SubmissionRecord;
-  nextJob?: LeaseJob;
-  message?: string;
+    | { kind: "completed"; result: PublicScoreResult }
+    | { kind: "retryable_failure"; message: string }
+    | { kind: "failed"; message: string };
 }
 
 export interface RankingEntry {
   submissionId: string;
   repo: string;
   repoUrl: string;
+  teamName: string;
+  mode: SubmissionMode;
   pinnedSha: string | null;
   total: number;
   criteria: ScoreItem[];
   completedAt: string | null;
   summary: string;
-  nukoScore: number | null;
-  ranked: boolean;
-}
-
-export interface SubmissionListItem {
-  id: string;
-  repo: string;
-  repoUrl: string;
-  status: SubmissionStatus;
-  total: number | null;
-  summary: string | null;
-  createdAt: string;
-  completedAt: string | null;
-  pinnedSha: string | null;
+  attackScore: number | null;
+  rank: number;
+  finalist: boolean;
+  tiedAtCutoff: boolean;
 }
 
 export interface RepoEvidenceFile {
@@ -198,3 +136,26 @@ export interface RepoEvidenceSnapshot {
   assessment: Exclude<RepoAssessmentKind, "retryable_failure" | "unjudgeable">;
   files: RepoEvidenceFile[];
 }
+
+export interface BudgetReservationInput {
+  kind: "decisions" | "responses";
+  model: string;
+  maxInputTokens: number;
+  maxOutputTokens: number;
+  reservedUsd: number;
+}
+
+export interface BudgetUsage {
+  kind: "decisions" | "responses";
+  model: string;
+  reservationId?: string;
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens?: number;
+  costUsd: number;
+  requestId?: string | null;
+}
+
+export type ApiReservation = BudgetReservationInput;
+export type ApiUsage = BudgetUsage;

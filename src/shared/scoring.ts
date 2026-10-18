@@ -22,6 +22,6 @@ export function buildZeroScoreResult(input: {
       evidencePaths: []
     })),
     total: 0,
-    nukoScore: null
+    attackScore: null
   };
 }

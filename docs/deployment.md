@@ -1,128 +1,77 @@
-# Deployment
+# Deployment and event operation
 
-## 1. Cloudflare configuration
+## Cloudflare
 
-`wrangler.jsonc` の次の値を自分の環境へ変更します。
-
-- `name`: Worker 名
-- `routes`: custom domain
-- `CALLBACKS_ENABLED`: 初回は `false`
-- `JUDGE_STATE_ROWS_WRITTEN_DAILY_LIMIT`: UTC 日次 hard limit。既定値は `50000`
-- `JUDGE_STATE_ROWS_WRITTEN_DAILY_WARNING`: UTC 日次 warning。既定値は `25000`
-- `MAX_ACCEPTED_SUBMISSIONS`: event 全体の投稿上限
-- `RUNNER_ENABLED`: 初回は `false`
-- `SUBMISSIONS_OPEN`: 初回は `false` を推奨
-- `UNRANKED_OWNERS`: 主催者の GitHub owner。不要なら空文字
-
-既存の `migrations` は Durable Object の履歴なので削除しないでください。
-
-clone、依存関係の導入、test、build だけでは Cloudflare への deploy や課金は発生しません。以降の deploy を実行すると、自分の Cloudflare account で Worker と Durable Objects の利用量が計測されます。
-
-Cloudflare dashboard の Manage Account > Billing > Billable Usage で、account 全体の従量課金額に `$1` と `$10` の Budget Alert を設定します。Budget Alert は日次集計による遅延がある通知機能です。Budget Alert は Worker、Durable Object、従量課金を自動停止しません。
-
-## 2. Runner token
-
-Runner と Worker の間で使う random token を作成します。
+公開はmise管理のWranglerと既存OAuth認証を使います。Cloudflare API token、1Password経由のCloudflare認証、Pagesは使いません。自動公開のworkflowはありません。
 
 ```bash
-mkdir -p "$HOME/Library/Application Support/Hackathon Judge"
-openssl rand -hex 32 > "$HOME/Library/Application Support/Hackathon Judge/runner-token"
-chmod 600 "$HOME/Library/Application Support/Hackathon Judge/runner-token"
-wrangler secret put RUNNER_TOKEN < "$HOME/Library/Application Support/Hackathon Judge/runner-token"
-```
-
-Linux では repository 外の任意の absolute path を使い、`RUNNER_TOKEN_FILE` と `RUNNER_SPOOL_DIR` を明示してください。
-
-## 3. Deploy Worker
-
-Wrangler の OAuth session を確認し、build と deploy を実行します。
-
-```bash
+mise up npm:wrangler
 wrangler whoami
-npm run build
-wrangler deploy
 ```
 
-## 4. Authenticate Runner host
+`wrangler.jsonc` の `JUDGE_DB` は既存の共有D1 `wordplay-arcade-budget`、`SCORING_QUEUE` は作成済みのQueue `devday-judge-20261018` を参照します。新規D1やQueueの再作成は不要です。D1は `devday_judge_` 専用テーブルと `devday_judge_migrations` だけを使い、既存サービスのテーブルとデータを削除・変更しません。
 
-GitHub と Codex へ sign in します。
+Queue consumerの設定はbatch 1、同時4件、自動再試行0です。各審査の試行と送信は最大3回、本番40件・検証20件の合計で最大180回に制限します。
 
 ```bash
-gh auth login
-codex login
-```
-
-Runner は `gh auth token` を process memory に読み込みます。Codex SDK は Runner host の Codex authentication を利用します。
-
-## 5. Enable and start Runner
-
-投稿受付を閉じたまま `CALLBACKS_ENABLED` と `RUNNER_ENABLED` を `true` にして deploy します。
-
-```json
-"CALLBACKS_ENABLED": "true",
-"RUNNER_ENABLED": "true",
-"SUBMISSIONS_OPEN": "false"
-```
-
-```bash
-npm run build
-wrangler deploy
-```
-
-`RUNNER_BASE_URL` は必須です。公開中の別環境へ接続する既定値はありません。
-
-```bash
-RUNNER_BASE_URL=https://judge.example.com \
-RUNNER_TOKEN_FILE="$HOME/Library/Application Support/Hackathon Judge/runner-token" \
-RUNNER_CONCURRENCY=10 \
-npm run runner:start
-```
-
-production では launchd、systemd、または同等の process supervisor を使用してください。Runner 起動時に中断 job の recovery が走るため、同じ Worker に対して複数の独立 Runner process を同時起動しないでください。並列処理は 1 process 内の slot で行います。
-
-## 6. Verify
-
-Runner 起動後に public endpoint を確認します。
-
-```bash
-curl https://judge.example.com/api/runner-status
-curl https://judge.example.com/api/submission-status
-curl https://judge.example.com/api/ranking
-RUNNER_TOKEN="$(<"$HOME/Library/Application Support/Hackathon Judge/runner-token")"
-curl -H "Authorization: Bearer $RUNNER_TOKEN" \
-  https://judge.example.com/internal/runner/write-budget
-```
-
-## 7. Open submissions
-
-Runner が online であることを確認してから、`wrangler.jsonc` の `SUBMISSIONS_OPEN` を `true` に変更し、再度 deploy します。
-
-```bash
-npm run build
-wrangler deploy
-```
-
-イベント終了時は、最初に `SUBMISSIONS_OPEN` と `RUNNER_ENABLED` を `false`、`CALLBACKS_ENABLED` を `true` にして deploy します。新しい job の取得を止めた状態で処理中 callback の完了を確認し、`CALLBACKS_ENABLED` も `false` にして再度 deploy します。その後、process supervisor から Runner を停止します。既存ランキングは残ります。
-
-課金や障害への緊急対応では、`CALLBACKS_ENABLED`、`RUNNER_ENABLED`、`SUBMISSIONS_OPEN` を同時に `false` にして deploy し、Runner process を停止します。無効化後の投稿、claim、heartbeat、recover、callback は Durable Object へ到達しません。
-
-状態保存は差分方式です。待機中の claim、拒否された submission と callback、変更のない recover は 0 write です。job の更新は保存済み履歴件数に比例せず、event 全体の投稿総数にも上限があります。
-
-日次書き込みガードは、`JUDGE_STATE` binding が参照する `global` JudgeState instance で成功した `storage.put` と `storage.delete` の key 数を UTC 日ごとに記録します。25,000 行に達すると構造化 warning を 1 回記録します。50,000 行の hard limit を超える保存は拒否します。Runner は HTTP `507` を受けると停止し、未送信結果を spool directory に残します。
-
-`GET /internal/runner/write-budget` は Runner bearer token で認証した read-only endpoint です。UTC 日付、成功した put / delete の key 数、warning、hard limit、停止状態を返し、Durable Object Storage を更新しません。
-
-日次書き込みガードの計測値は、Cloudflare 請求書に記載される Durable Objects Rows Written そのものではありません。別の Durable Object namespace、Cloudflare 内部処理、Requests、Duration は日次書き込みガードの計測対象外です。
-
-## Update procedure
-
-```bash
-git pull --ff-only
-npm install
+wrangler d1 migrations apply JUDGE_DB --remote
 npm run typecheck
 npm test
 npm run build
 wrangler deploy
 ```
 
-Runner code を更新した場合は、build 後に supervisor から Runner process を再起動してください。
+旧Durable Objectのmigrationに `deleted_classes` を追加しません。旧namespaceを保持し、現在のWorkerにbindingを置きません。
+
+## Authentication
+
+主催者UIは既存のWorker secret `RUNNER_TOKEN` で登録と再試行を認証します。会場ではMacBook Airのブラウザにトークンだけを入力します。Mac Studio、ローカルサーバー、採点用CLIは不要です。主催者へのトークンの受け渡しは未完了です。トークンをURL、リポジトリ、公開ログへ出しません。
+
+採点は既存1Password Environmentの `OPENAI_API_KEY_20261018_HACKATHON` をWorker secretとして使います。APIキーをブラウザへ入力・送信しません。指定キーだけを非表示のプロセス間pipeで `wrangler secret put` の標準入力へ渡し、保存ファイルを作らずに設定します。Wranglerのプロセス環境からOP関連変数とAPIキーを除き、既存OAuthセッションで設定する手順を確認済みです。
+
+1Passwordを使うのはアプリ用キーの取得だけです。Environment対応beta版 `op`、既存サービスアカウント、`OP_ENVIRONMENT_ID` を使い、`op whoami` のtypeが `SERVICE_ACCOUNT` であることを先に確認します。Cloudflareの認証・公開・管理に `op`、1PasswordのCloudflare credential、`CLOUDFLARE_API_TOKEN` は使いません。Wranglerは既存OAuthセッションで実行します。
+
+```bash
+op --version
+op environment --help
+op run --help
+op whoami --format json
+op run --environment "$OP_ENVIRONMENT_ID" -- node -e 'console.log(Boolean(process.env.OPENAI_API_KEY_20261018_HACKATHON))'
+```
+
+## Venue operation
+
+1. [審査画面](https://hackathon.nukoevi.app/) をMacBook Airのブラウザで開き、主催者メニューにトークンを入力します。
+2. チーム名と公開GitHub URLを本番または検証区分へ登録します。一括登録は最大30行です。
+3. Queueが最大4件を並列採点します。画面を閉じても開始済みの採点と残りのキュー処理は継続します。
+4. 完了結果の根拠と不足条件、上位10チームの境界、同点を確認し、CSV・JSONを書き出します。
+
+本番は `gpt-6.1-sol` のhigh、検証はlowが既定です。検証区分だけはhighで登録でき、low完了結果を主催者メニューからhighで再検証できます。Decisions APIの補助評価と攻撃判定には `gpt-6-luna` を使います。各試行の開始前に指定モデルの利用権限をAPIで確認します。
+
+画面、Decisions API、最終採点は [同じルーブリック](../src/shared/rubric.ts) を使います。版は `2026-10-18-v1`、各観点は `0 / 2 / 4 / 6 / 8 / 10`、合計40点です。各段階の全条件に照らし、根拠と次の段階に不足する条件を確認します。
+
+GitHubの公開refs広告からdefault branchとSHAを固定し、treeのREST取得は1試行につき1回です。GitHub tokenや、会場端末のGitHub CLI認証は使いません。RESTのrate limitに達した場合は失敗を確認し、制限解除後に主催者が再試行します。
+
+空のQueueで採点処理は起動しません。常駐ポーリング、定期heartbeat、定期再採点はありません。
+
+## Budget and stop
+
+本番$90、検証$20を独立管理します。使用済みと未精算予約を合わせて制限し、usage不明の予約を解放しません。再試行しても過去の精算と予約を保持します。台帳を消したりリセットしたりして再開しないでください。
+
+受付停止は `SUBMISSIONS_OPEN: false`、新しい採点開始とAPI費用予約の停止は `JUDGING_ENABLED: false` にして正規の `wrangler deploy` で反映します。実行済みAPIの精算と結果保存は許可します。停止フラグだけで送信済みのOpenAI要求が取り消されたとは扱いません。
+
+イベント運用中は両方trueです。受付と再試行には主催者トークンが必要です。停止時は両方falseへ変更して公開します。
+
+失敗結果と30分以上進まない審査は主催者が状態と費用を確認して再試行します。自動再試行はありません。初回と再試行を合わせて最大3回です。ローカルspoolや外部callbackの再送操作はありません。
+
+## Verify publication
+
+```bash
+curl -fsS https://hackathon.nukoevi.app/api/dashboard
+```
+
+日付、段階別ルーブリック、検証区分、本番予算、Queueの実API結果、攻撃表示の80%閾値、デスクトップ・短い画面・モバイルの表示を確認します。公開URLが変更後の結果を返すことと、Mac Studio側のプロセスに依存しないことを完了条件とします。
+
+## Event data
+
+受付は本番40件・検証20件で制限します。イベント後は受付と採点を停止し、CSV・JSONを書き出します。D1の保存期間はイベント後90日を目安とし、削除する専用テーブルと影響は別途確認します。無期限保存や自動削除を前提にしません。共有D1そのものや旧Durable Objectは削除しません。

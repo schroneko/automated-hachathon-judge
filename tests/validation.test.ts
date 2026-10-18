@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { normalizeGitHubRepoUrl, parseScoringCallbackBody, validatePublicScoreResult } from "../src/shared/validation";
+import { normalizeGitHubRepoUrl, parseScoringCallbackBody, scoringOutputSchema, validatePublicScoreResult } from "../src/shared/validation";
+import { SCORE_LEVELS } from "../src/shared/rubric";
 
 describe("normalizeGitHubRepoUrl", () => {
   it("normalizes a standard GitHub repository URL", () => {
@@ -16,6 +17,60 @@ describe("normalizeGitHubRepoUrl", () => {
 });
 
 describe("validatePublicScoreResult", () => {
+  const valid = () => ({
+    summary: "確認済み",
+    publicReason: "根拠があります",
+    repoAssessment: "scored",
+    pinnedSha: "a".repeat(40),
+    criteria: [
+      { key: "technical", label: "新機能の活用", score: 6, reason: "確認", evidencePaths: ["src/main.ts"] },
+      { key: "ux", label: "使いやすさ", score: 6, reason: "確認", evidencePaths: ["src/main.ts"] },
+      { key: "impact", label: "有用性", score: 6, reason: "確認", evidencePaths: ["src/main.ts"] },
+      { key: "idea", label: "独創性", score: 6, reason: "確認", evidencePaths: ["src/main.ts"] }
+    ],
+    total: 24,
+    attackScore: null as number | null
+  });
+
+  it("enforces attack visibility from the optional probability", () => {
+    expect(validatePublicScoreResult({ ...valid(), attackProbability: 0.799 }).attackScore).toBeNull();
+    expect(() => validatePublicScoreResult({ ...valid(), attackProbability: 0.799, attackScore: 80 })).toThrow(/Attack score/);
+    expect(validatePublicScoreResult({ ...valid(), attackProbability: 0.8, attackScore: 80 }).attackScore).toBe(80);
+  });
+
+  it("accepts only the six final score levels and keeps Decisions scores fractional", () => {
+    for (const score of SCORE_LEVELS) {
+      const result = valid();
+      result.criteria[0].score = score;
+      result.total = score + 18;
+      expect(validatePublicScoreResult(result).criteria[0]?.score).toBe(score);
+    }
+    for (const score of [1, 3, 5, 7, 9]) {
+      const result = valid();
+      result.criteria[0].score = score;
+      result.total = score + 18;
+      expect(() => validatePublicScoreResult(result)).toThrow();
+    }
+    expect(scoringOutputSchema.properties.criteria.items.properties.score.enum).toEqual(SCORE_LEVELS);
+    const result = valid();
+    const usage = {
+      model: "test-model", effort: "high", decisionsModel: "test-decisions-model",
+      inputTokens: 1, outputTokens: 1, costUsd: 0,
+      decisionsScores: { technical: 5.5, ux: 7.25, impact: 1.5, idea: 9.9 }, requestIds: []
+    };
+    expect(validatePublicScoreResult({ ...result, usage }).usage?.decisionsScores.technical).toBe(5.5);
+  });
+
+  it("rejects malformed optional usage metadata in callbacks", () => {
+    const result = { ...valid(), usage: {
+      model: "gpt-6.1-sol", effort: "high", decisionsModel: "gpt-6-luna",
+      inputTokens: 100, outputTokens: 20, costUsd: Number.POSITIVE_INFINITY,
+      decisionsScores: { technical: 6, ux: 6, impact: 6, idea: 6 }, requestIds: []
+    } };
+    expect(() => parseScoringCallbackBody(JSON.stringify({ submissionId: "s", callbackToken: "t", outcome: { kind: "completed", result } }))).toThrow();
+    expect(() => validatePublicScoreResult({ ...valid(), usage: { ...result.usage, costUsd: 0.1, decisionsScores: { technical: 6 } } })).toThrow(/Decisions scores/);
+  });
+
   it("accepts a valid scored result", () => {
     const result = validatePublicScoreResult({
       summary: "十分に実装されている",
@@ -23,11 +78,12 @@ describe("validatePublicScoreResult", () => {
       repoAssessment: "scored",
       pinnedSha: "a".repeat(40),
       total: 24,
+      attackScore: null,
       criteria: [
-        { key: "technical", label: "技術的な実装", score: 6, reason: "ok", evidencePaths: ["src/index.ts"] },
-        { key: "ux", label: "デザインとユーザー体験", score: 5, reason: "ok", evidencePaths: ["src/app.ts"] },
-        { key: "impact", label: "潜在的なインパクト", score: 7, reason: "ok", evidencePaths: ["README.md"] },
-        { key: "idea", label: "アイデアの質", score: 6, reason: "ok", evidencePaths: ["README.md"] }
+        { key: "technical", label: "新機能の活用", score: 6, reason: "ok", evidencePaths: ["src/index.ts"] },
+        { key: "ux", label: "使いやすさ", score: 4, reason: "ok", evidencePaths: ["src/app.ts"] },
+        { key: "impact", label: "有用性", score: 8, reason: "ok", evidencePaths: ["README.md"] },
+        { key: "idea", label: "独創性", score: 6, reason: "ok", evidencePaths: ["README.md"] }
       ]
     });
     expect(result.total).toBe(24);
@@ -41,11 +97,12 @@ describe("validatePublicScoreResult", () => {
         repoAssessment: "scored",
         pinnedSha: "a".repeat(40),
         total: 20,
+        attackScore: null,
         criteria: [
-          { key: "technical", label: "技術的な実装", score: 6, reason: "ok", evidencePaths: ["a"] },
-          { key: "ux", label: "デザインとユーザー体験", score: 5, reason: "ok", evidencePaths: ["b"] },
-          { key: "impact", label: "潜在的なインパクト", score: 7, reason: "ok", evidencePaths: ["c"] },
-          { key: "idea", label: "アイデアの質", score: 6, reason: "ok", evidencePaths: ["d"] }
+          { key: "technical", label: "新機能の活用", score: 6, reason: "ok", evidencePaths: ["a"] },
+          { key: "ux", label: "使いやすさ", score: 4, reason: "ok", evidencePaths: ["b"] },
+          { key: "impact", label: "有用性", score: 8, reason: "ok", evidencePaths: ["c"] },
+          { key: "idea", label: "独創性", score: 6, reason: "ok", evidencePaths: ["d"] }
         ]
       })
     ).toThrow(/Total score/);
@@ -58,12 +115,13 @@ describe("validatePublicScoreResult", () => {
         publicReason: "missing",
         repoAssessment: "missing_or_private",
         pinnedSha: null,
-        total: 1,
+        total: 2,
+        attackScore: null,
         criteria: [
-          { key: "technical", label: "技術的な実装", score: 1, reason: "no", evidencePaths: [] },
-          { key: "ux", label: "デザインとユーザー体験", score: 0, reason: "no", evidencePaths: [] },
-          { key: "impact", label: "潜在的なインパクト", score: 0, reason: "no", evidencePaths: [] },
-          { key: "idea", label: "アイデアの質", score: 0, reason: "no", evidencePaths: [] }
+          { key: "technical", label: "新機能の活用", score: 2, reason: "no", evidencePaths: [] },
+          { key: "ux", label: "使いやすさ", score: 0, reason: "no", evidencePaths: [] },
+          { key: "impact", label: "有用性", score: 0, reason: "no", evidencePaths: [] },
+          { key: "idea", label: "独創性", score: 0, reason: "no", evidencePaths: [] }
         ]
       })
     ).toThrow(/zero scores/);
@@ -75,7 +133,6 @@ describe("parseScoringCallbackBody", () => {
     expect(() => parseScoringCallbackBody(JSON.stringify({
       submissionId: "submission-id",
       callbackToken: "callback-token",
-      bucket: 0,
       outcome: {
         kind: "completed",
         result: {
@@ -84,11 +141,12 @@ describe("parseScoringCallbackBody", () => {
           repoAssessment: "scored",
           pinnedSha: "a".repeat(40),
           total: 1,
+          attackScore: null,
           criteria: [
-            { key: "technical", label: "技術的な実装", score: 0, reason: "no", evidencePaths: [] },
-            { key: "ux", label: "デザインとユーザー体験", score: 0, reason: "no", evidencePaths: [] },
-            { key: "impact", label: "潜在的なインパクト", score: 0, reason: "no", evidencePaths: [] },
-            { key: "idea", label: "アイデアの質", score: 0, reason: "no", evidencePaths: [] }
+            { key: "technical", label: "新機能の活用", score: 0, reason: "no", evidencePaths: [] },
+            { key: "ux", label: "使いやすさ", score: 0, reason: "no", evidencePaths: [] },
+            { key: "impact", label: "有用性", score: 0, reason: "no", evidencePaths: [] },
+            { key: "idea", label: "独創性", score: 0, reason: "no", evidencePaths: [] }
           ]
         }
       }
@@ -102,7 +160,6 @@ describe("parseScoringCallbackBody", () => {
     const body = JSON.stringify({
       submissionId: "submission-id",
       callbackToken: "callback-token",
-      bucket: 0,
       outcome: {
         kind: "completed",
         result: {
@@ -111,11 +168,12 @@ describe("parseScoringCallbackBody", () => {
           repoAssessment: "empty_repository",
           pinnedSha: null,
           total: 0,
+          attackScore: null,
           criteria: [
-            { key: "technical", label: "技術的な実装", score: 0, reason: "no", evidencePaths },
-            { key: "ux", label: "デザインとユーザー体験", score: 0, reason: "no", evidencePaths },
-            { key: "impact", label: "潜在的なインパクト", score: 0, reason: "no", evidencePaths },
-            { key: "idea", label: "アイデアの質", score: 0, reason: "no", evidencePaths }
+            { key: "technical", label: "新機能の活用", score: 0, reason: "no", evidencePaths },
+            { key: "ux", label: "使いやすさ", score: 0, reason: "no", evidencePaths },
+            { key: "impact", label: "有用性", score: 0, reason: "no", evidencePaths },
+            { key: "idea", label: "独創性", score: 0, reason: "no", evidencePaths }
           ]
         }
       }

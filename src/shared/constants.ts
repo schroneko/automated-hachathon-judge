@@ -1,41 +1,20 @@
 export const API_BODY_LIMIT_BYTES = 2048;
 export const CALLBACK_BODY_LIMIT_BYTES = 131_072;
-export const DEFAULT_MAX_ACCEPTED_SUBMISSIONS = 500;
-export const DEFAULT_JUDGE_STATE_ROWS_WRITTEN_DAILY_WARNING = 25_000;
-export const DEFAULT_JUDGE_STATE_ROWS_WRITTEN_DAILY_LIMIT = 50_000;
-export const IP_SUBMISSION_COOLDOWN_MS = 1_000;
-export const MAX_RECENT_SUBMISSIONS = 50;
-export const MAX_RECOVERED_JOBS_PER_REQUEST = 10;
-export const SCORER_BUCKET_COUNT = 10;
+export const EVENT_ID = "devday-20261018";
+export const EVENT_NAME = "OpenAI DevDay 2026 Community Hackathon Tokyo";
+export const EVENT_DATE = "2026-10-18";
+export const TARGET_TEAMS = 30;
+export const FINALIST_COUNT = 10;
+export const PRODUCTION_SUBMISSION_LIMIT = 40;
+export const VALIDATION_SUBMISSION_LIMIT = 20;
 export const MAX_EVIDENCE_FILES = 24;
 export const MAX_EVIDENCE_TOTAL_BYTES = 120_000;
 export const MAX_EVIDENCE_FILE_BYTES = 12_000;
-export const CODEX_TIMEOUT_MS = 180_000;
-export const RUNNER_ONLINE_WINDOW_MS = 30_000;
-export const CALLBACK_PATH_PREFIX = "/internal/scoring-callback";
-export const STATE_OBJECT_NAME = "global";
+export const RUNNER_ONLINE_WINDOW_MS = 30 * 60 * 1000;
 
 export const CRITERIA = [
-  {
-    key: "technical",
-    label: "技術的な実装",
-    focus: "completeness, architecture, robustness, security"
-  },
-  {
-    key: "ux",
-    label: "デザインとユーザー体験",
-    focus: "UI structure, flow, consistency, accessibility, based only on repository evidence"
-  },
-  {
-    key: "impact",
-    label: "潜在的なインパクト",
-    focus: "importance, audience, practicality, growth potential"
-  },
-  {
-    key: "idea",
-    label: "アイデアの質",
-    focus: "originality, problem-solution fit, insight"
-  }
+  { key: "technical", label: "新機能の活用", focus: "DevDay 2026で発表された機能を、目的に合った形で活用しているか？" },
+  { key: "ux", label: "使いやすさ", focus: "他の人にとって使いやすいものになっているか？" },
+  { key: "impact", label: "有用性", focus: "他の人にとって今後どれだけ役に立つ可能性があるか？" },
+  { key: "idea", label: "独創性", focus: "着眼点や解決方法にオリジナリティがあるか？" }
 ] as const;
-
-export const SCORE_ANCHORS = "0 means no evaluable evidence; 1-2 very early/minimal; 3-4 partially works with major gaps; 5-6 meets baseline; 7-8 clearly strong; 9-10 exceptional for a hackathon.";

@@ -1,18 +1,35 @@
 import { z } from "zod";
-import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, CRITERIA, SCORE_ANCHORS, SCORER_BUCKET_COUNT } from "./constants";
-import type { CriterionKey, FinalizePayload, NormalizedRepo, PublicScoreResult } from "./types";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, CRITERIA } from "./constants";
+import { visibleAttackScore } from "./attack-score";
+import { MAX_CRITERION_SCORE, MAX_TOTAL_SCORE, SCORE_LEVELS, rubricText } from "./rubric";
+import type { CriterionKey, FinalizePayload, NormalizedRepo, PublicScoreResult, SubmissionMode } from "./types";
 
 const submissionBodySchema = z.object({
-  repoUrl: z.string().min(1).max(512)
-});
+  repoUrl: z.string().min(1).max(512),
+  teamName: z.string().trim().max(100).optional(),
+  mode: z.enum(["production", "validation"])
+}).strict();
+
+const usageSchema = z.object({
+  model: z.string().min(1),
+  effort: z.enum(["low", "high"]),
+  decisionsModel: z.string().min(1),
+  referenceVersion: z.string().min(1).max(100).optional(),
+  rubricVersion: z.string().min(1).max(100).optional(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  costUsd: z.number().finite().nonnegative(),
+  decisionsScores: z.record(z.string(), z.number().finite().min(0).max(MAX_CRITERION_SCORE)),
+  requestIds: z.array(z.string().min(1)).max(2)
+}).strict();
 
 const criterionSchema = z.object({
   key: z.enum(["technical", "ux", "impact", "idea"]),
   label: z.string().min(1),
-  score: z.number().int().min(0).max(10),
+  score: z.union(SCORE_LEVELS.map((score) => z.literal(score))),
   reason: z.string().min(1).max(280),
   evidencePaths: z.array(z.string().min(1).max(300)).max(24)
-});
+}).strict();
 
 export const publicScoreResultSchema = z.object({
   summary: z.string().min(1).max(400),
@@ -27,14 +44,21 @@ export const publicScoreResultSchema = z.object({
   ]),
   pinnedSha: z.string().regex(/^[0-9a-f]{40}$/).nullable(),
   criteria: z.array(criterionSchema).length(4),
-  total: z.number().int().min(0).max(40),
-  nukoScore: z.number().int().min(80).max(100).nullable().default(null)
-});
+  total: z.number().int().min(0).max(MAX_TOTAL_SCORE),
+  attackScore: z.number().int().min(80).max(100).nullable(),
+  attackProbability: z.number().finite().min(0).max(1).optional(),
+  usage: usageSchema.optional()
+}).strict();
+
+export const scoringModelResultSchema = publicScoreResultSchema.omit({
+  attackScore: true,
+  attackProbability: true,
+  usage: true
+}).strict();
 
 const scoringCallbackBodySchema = z.object({
   submissionId: z.string().min(1).max(100),
   callbackToken: z.string().min(1).max(100),
-  bucket: z.number().int().min(0).max(SCORER_BUCKET_COUNT - 1),
   outcome: z.discriminatedUnion("kind", [
     z.object({
       kind: z.literal("completed"),
@@ -51,7 +75,7 @@ const scoringCallbackBodySchema = z.object({
   ])
 }).strict();
 
-export const codexOutputSchema = {
+export const scoringOutputSchema = {
   type: "object",
   additionalProperties: false,
   required: ["summary", "publicReason", "repoAssessment", "pinnedSha", "criteria", "total"],
@@ -64,14 +88,12 @@ export const codexOutputSchema = {
     },
     pinnedSha: {
       anyOf: [
-        { type: "string", pattern: "^[0-9a-f]{40}$" },
+        { type: "string" },
         { type: "null" }
       ]
     },
     criteria: {
       type: "array",
-      minItems: 4,
-      maxItems: 4,
       items: {
         type: "object",
         additionalProperties: false,
@@ -79,31 +101,35 @@ export const codexOutputSchema = {
         properties: {
           key: { type: "string", enum: ["technical", "ux", "impact", "idea"] },
           label: { type: "string" },
-          score: { type: "integer", minimum: 0, maximum: 10 },
+          score: { type: "integer", enum: SCORE_LEVELS },
           reason: { type: "string" },
           evidencePaths: {
             type: "array",
-            maxItems: 24,
             items: { type: "string" }
           }
         }
       }
     },
-    total: { type: "integer", minimum: 0, maximum: 40 }
+    total: { type: "integer" }
   }
 } as const;
 
-export function parseSubmissionBody(input: string): { repoUrl: string } {
+export function parseSubmissionBody(input: string): { repoUrl: string; teamName?: string; mode: SubmissionMode } {
   if (new TextEncoder().encode(input).length > API_BODY_LIMIT_BYTES) {
     throw new Error("Request body too large");
   }
   const parsed = JSON.parse(input);
-  return submissionBodySchema.parse(parsed);
+  const value = submissionBodySchema.parse(parsed);
+  return {
+    repoUrl: value.repoUrl,
+    mode: value.mode,
+    ...(value.teamName === undefined ? {} : { teamName: value.teamName })
+  };
 }
 
 export function parseScoringCallbackBody(
   input: string
-): Omit<FinalizePayload, "callbackBaseUrl" | "nowIso"> {
+): FinalizePayload {
   if (new TextEncoder().encode(input).length > CALLBACK_BODY_LIMIT_BYTES) {
     throw new Error("Request body too large");
   }
@@ -117,7 +143,7 @@ export function parseScoringCallbackBody(
       }
     };
   }
-  return parsed;
+  return { submissionId: parsed.submissionId, callbackToken: parsed.callbackToken, outcome: parsed.outcome };
 }
 
 export function normalizeGitHubRepoUrl(input: string): NormalizedRepo {
@@ -155,25 +181,14 @@ export function normalizeGitHubRepoUrl(input: string): NormalizedRepo {
   };
 }
 
-export function repoBucket(normalizedRepo: string): number {
-  let hash = 2166136261;
-  for (const char of normalizedRepo) {
-    hash ^= char.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return Math.abs(hash >>> 0) % SCORER_BUCKET_COUNT;
-}
-
-export function hashIp(ip: string): string {
-  let hash = 0;
-  for (const char of ip) {
-    hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
-  }
-  return hash.toString(16).padStart(8, "0");
-}
-
 export function validatePublicScoreResult(input: unknown, allowedEvidencePaths?: ReadonlySet<string>): PublicScoreResult {
   const parsed = publicScoreResultSchema.parse(input);
+  if (parsed.attackProbability !== undefined && visibleAttackScore(parsed.attackProbability) !== parsed.attackScore) {
+    throw new Error("Attack score does not match probability visibility");
+  }
+  if (parsed.usage && Object.keys(parsed.usage.decisionsScores).sort().join(",") !== "idea,impact,technical,ux") {
+    throw new Error("Usage Decisions scores must contain exactly four criteria");
+  }
   const seen = new Set<CriterionKey>();
   for (const criterion of parsed.criteria) {
     seen.add(criterion.key);
@@ -200,11 +215,14 @@ export function validatePublicScoreResult(input: unknown, allowedEvidencePaths?:
   if (parsed.repoAssessment === "scored" && parsed.pinnedSha === null) {
     throw new Error("Scored repositories must include a pinned SHA");
   }
-  return parsed;
+  const { usage, ...result } = parsed;
+  if (!usage) return result;
+  const { referenceVersion, ...audit } = usage;
+  return { ...result, usage: { ...audit, ...(referenceVersion === undefined ? {} : { referenceVersion }) } };
 }
 
 export function scoreAnchorsText(): string {
-  return SCORE_ANCHORS;
+  return rubricText();
 }
 
 export function criteriaLabels(): Record<CriterionKey, string> {
