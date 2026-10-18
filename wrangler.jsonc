@@ -1,16 +1,17 @@
 {
   "name": "hackathon-nukoevi-app",
   "main": "src/worker/index.ts",
+  "workers_dev": false,
+  "preview_urls": false,
   "compatibility_date": "2026-07-17",
   "compatibility_flags": [
     "nodejs_compat"
   ],
   "assets": {
-    "directory": "./dist/client",
+    "directory": "./public/closed",
     "binding": "ASSETS",
-    "run_worker_first": [
-      "/api/*"
-    ]
+    "run_worker_first": false,
+    "not_found_handling": "single-page-application"
   },
   "d1_databases": [
     {
@@ -48,7 +49,7 @@
     }
   ],
   "vars": {
-    "JUDGING_ENABLED": "true",
-    "SUBMISSIONS_OPEN": "true"
+    "JUDGING_ENABLED": "false",
+    "SUBMISSIONS_OPEN": "false"
   }
 }

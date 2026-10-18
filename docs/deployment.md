@@ -76,7 +76,19 @@ GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分�
 
 課金前の実行環境停止は別に復旧できます。開始後5分以上経過した未採点処理で、API予約履歴・証拠保存が両方0件なら「課金前の停止を復旧」から同じSHAと試行を1回続行します。APIが最終条件を検査し、過去の予約があれば拒否します。callback世代と専用の復旧送信回数を更新し、試行・通常送信・費用履歴を消しません。
 
+## Post-event shutdown on 2026-10-18
+
+イベント終了後は両停止フラグをfalseにし、`./public/closed` の静的な終了ページを配信します。`run_worker_first: false` と `not_found_handling: single-page-application` を使い、`workers_dev` と `preview_urls` もfalseにします。両方の稼働フラグがtrueでない場合、Workerは全API・internal要求をD1アクセス前に遮断します。受付状態はclosed、実行状態はofflineを返し、それ以外は410です。QueueハンドラもD1へ接続せず全メッセージをackします。採点・理由生成の両QueueはOAuth認証のWranglerで配送を停止済みです。
+
+停止時はWorker secretの `OPENAI_API_KEY_20261018_HACKATHON` も削除し、1Password Environmentの値は保持します。共有D1と審査結果・証拠・費用台帳は削除しません。停止確認時のdashboard取得は失敗し、Wranglerの読み取りはD1 Freeの日次行読み取り上限超過（code 7500）を返しました。最終費用や実行中件数0は確認できていません。有料プランへの変更は行いません。
+
+終了ページは無料の静的アセット配信です。D1 Freeの上限超過は有料利用へ自動切替せず、停止前に発生した利用料は取り消されません。アカウントの契約プランは変更しません。
+
+再開には明示的な運用判断が必要です。アセットを `./dist/client` に戻し、`run_worker_first` を `/api/*` に戻し、両稼働フラグ・Worker secretを復元して公開したうえで、両Queueの配送を再開します。停止処理ではこれらの再開操作を行いません。
+
 ## Verify publication
+
+終了後は終了ページ、受付closed、実行offline、変更APIの拒否を確認します。以下は稼働中の確認手順です。
 
 ```bash
 curl -fsS https://hackathon.nukoevi.app/api/dashboard
