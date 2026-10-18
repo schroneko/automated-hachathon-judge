@@ -80,7 +80,7 @@ wrangler dev --ip 127.0.0.1 --port 8787 --var RUNNER_TOKEN:local-preview --var S
 
 イベント後は受付と採点を停止してCSV・JSONを書き出します。データの保存期間はイベント後90日を目安とし、削除する対象と影響は別途確認します。
 
-詳細: [構成](docs/architecture.md)、[公開と運用](docs/deployment.md)、[クラウド実行の上限と停止](docs/cloud-execution.md)、[Security Policy](SECURITY.md)。
+詳細: [構成](docs/architecture.md)、[公開と運用](docs/deployment.md)、[クラウド実行の上限と停止](docs/cloud-execution.md)、[クラウド実 API 検証記録](docs/validation-cloud-20261018.json)、[Security Policy](SECURITY.md)。
 
 ## License
 
