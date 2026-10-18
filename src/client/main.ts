@@ -18,6 +18,8 @@ type ExplanationState = "pending" | "processing" | "completed" | "failed";
 type Submission = PublicSubmissionRecord;
 type Batch = PublicBatchRecord;
 type Dashboard = {
+  readOnly?: boolean;
+  archivedAt?: string;
   batches?: Batch[];
   event: {
     id: string;
@@ -28,7 +30,7 @@ type Dashboard = {
   };
   open: boolean;
   counts: Record<Status, number> & { total: number };
-  budget: {
+  budget?: {
     limitUsd: number;
     spentUsd: number;
     reservedUsd: number;
@@ -37,7 +39,7 @@ type Dashboard = {
   items: Submission[];
   ranking: Rank[];
   cutoff: { score: number | null; tied: boolean; tiedCount: number };
-  runner: { online: boolean; lastSeenAt: string | null };
+  runner?: { online: boolean; lastSeenAt: string | null };
 };
 const axes = CRITERIA;
 const rubricMarkup = axes
@@ -142,14 +144,14 @@ root.innerHTML = `
         <div><p class="kicker">OVERVIEW</p><h2 id="overview-title">審査状況</h2></div>
         <div class="refresh">
           <span id="updated"></span>
-          <button id="refresh" class="subtle" type="button">手動更新</button>
-          <label><input id="auto" type="checkbox"> 自動更新</label>
+          <button id="refresh" class="subtle" type="button" hidden disabled>手動更新</button>
+          <label hidden><input id="auto" type="checkbox" disabled> 自動更新</label>
         </div>
       </div>
       <div id="stats" class="stats"><p class="empty">読み込み中です。</p></div>
       <div id="progress"></div>
     </section>
-    <details class="organizer">
+    <details class="organizer" hidden>
       <summary>まとめて審査する</summary>
       <div class="organizer-body">
         <div class="section-head">
@@ -157,7 +159,7 @@ root.innerHTML = `
           <p id="runner"></p>
         </div>
         <div id="budget" class="budget"></div>
-        <fieldset id="controls">
+        <fieldset id="controls" disabled>
           <legend class="sr-only">審査キューへの登録</legend>
           <div class="section-head">
             <div><h3>一括審査</h3><p>内容を確認して一括開始すると、全件のコミット固定後に採点します。貼り付けやプレビューでは審査費用は発生しません。開始後はタブを閉じても継続します。</p></div>
@@ -180,7 +182,7 @@ root.innerHTML = `
             </label>
             <p class="note">最大30回答。提出日時・チーム名・GitHub リポジトリURL・デモURLを取り込み、メールや不要な列はブラウザ内で破棄します。GitHubの公開状態はサーバーで確認します。</p><p class="note">本番の提出締切: 10/18 17:15:59 日本時間（締切時刻を含む）。開始: 17:30 日本時間。全件のソース版を保存後、最大8並列で審査します。検証は今すぐ開始できます。</p><button id="import-review" type="button" class="subtle">2. 内容を確認</button>
             <div id="preview"></div>
-            <button id="batch-submit" type="button" class="dark">3. 対象の回答を一括審査</button>
+            <button id="batch-submit" type="button" class="dark" disabled>3. 対象の回答を一括審査</button>
             <div id="batch-results" role="status" aria-live="polite"></div>
           </div>
         </fieldset>
@@ -191,11 +193,11 @@ root.innerHTML = `
         <div><p class="kicker">RESULTS</p><h2 id="results-title">審査結果</h2></div>
         <p id="cutoff"></p>
       </div>
-      <div class="presentation-launch"><div><button id="presentation-real" type="button" class="dark" disabled aria-describedby="presentation-readiness">発表モード</button><button id="presentation-demo" type="button" class="subtle">演出プレビュー</button></div><p id="presentation-readiness" role="status">本番結果を読み込んでいます。</p></div>
+      <div class="presentation-launch"><div><button id="presentation-real" type="button" class="dark" disabled aria-describedby="presentation-readiness">発表モード</button><button id="presentation-demo" type="button" class="subtle" hidden disabled>演出プレビュー</button></div><p id="presentation-readiness" role="status">本番結果を読み込んでいます。</p></div>
       <div class="toolbar">
         <div class="tabs" role="tablist" aria-label="審査モード">
           <button id="tab-production" role="tab" aria-selected="true" aria-controls="panel" type="button">本番審査 <span id="production-count"></span></button>
-          <button id="tab-validation" role="tab" aria-selected="false" aria-controls="panel" type="button">検証 <span id="validation-count"></span></button>
+          <button id="tab-validation" role="tab" aria-selected="false" aria-controls="panel" type="button" hidden disabled>検証 <span id="validation-count"></span></button>
         </div>
         <div class="tools">
           <label><span class="sr-only">チーム名またはリポジトリを検索</span><input id="search" type="search" placeholder="チーム・リポジトリを検索"></label>
@@ -242,17 +244,22 @@ el<HTMLButtonElement>("presentation-real").addEventListener("click", (event) => 
   const snapshot = capturePresentation(data.items);
   if (snapshot.ready) openPresentation(snapshot, event.currentTarget as HTMLElement);
 });
-el<HTMLButtonElement>("presentation-demo").addEventListener("click", (event) => openPresentation(demoPresentation(), event.currentTarget as HTMLElement));
+el<HTMLButtonElement>("presentation-demo").addEventListener("click", (event) => {
+  if (!data || data.readOnly) return;
+  openPresentation(demoPresentation(), event.currentTarget as HTMLElement);
+});
 
 el<HTMLButtonElement>("refresh").addEventListener(
   "click",
   () => void refresh(),
 );
 el<HTMLInputElement>("auto").addEventListener("change", (event) => {
+  if (!data || data.readOnly) return;
   automatic = (event.currentTarget as HTMLInputElement).checked;
   schedule();
 });
 document.addEventListener("visibilitychange", () => {
+  if (data?.readOnly) return;
   preview();
   if (!document.hidden && (!data || automatic || active())) void refresh();
   else schedule();
@@ -260,6 +267,7 @@ document.addEventListener("visibilitychange", () => {
 for (const value of ["production", "validation"] as const) {
   const tab = el<HTMLButtonElement>(`tab-${value}`);
   tab.addEventListener("click", () => {
+    if (data?.readOnly && value === "validation") return;
     mode = value;
     selected = null;
     renderResults();
@@ -267,6 +275,7 @@ for (const value of ["production", "validation"] as const) {
   tab.addEventListener("keydown", (event) => {
     if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
     event.preventDefault();
+    if (data?.readOnly) return;
     mode =
       event.key === "Home"
         ? "production"
@@ -282,18 +291,22 @@ for (const value of ["production", "validation"] as const) {
 }
 el<HTMLInputElement>("search").addEventListener("input", renderResults);
 el<HTMLSelectElement>("mode").addEventListener("change", () => {
+  if (!data || data.readOnly) return;
   updateSubmissionOptions();
   preview();
 });
 el<HTMLSelectElement>("effort").addEventListener("change", () => {
+  if (!data || data.readOnly) return;
   updateSubmissionOptions();
   preview();
 });
 el<HTMLTextAreaElement>("batch").addEventListener("input", () => {
+  if (!data || data.readOnly) return;
   preview();
 });
 el<HTMLButtonElement>("import-review").addEventListener("click", sanitizeInput);
 el<HTMLTextAreaElement>("batch").addEventListener("paste", (event) => {
+  if (!data || data.readOnly) { event.preventDefault(); return; }
   if (!event.clipboardData) return;
   event.preventDefault();
   const field = el<HTMLTextAreaElement>("batch");
@@ -326,6 +339,7 @@ function selectedSubmissionOptions(): { mode: Mode; effort: Effort } {
   };
 }
 function updateSubmissionOptions(): void {
+  if (!data || data.readOnly) return;
   const selection = selectedSubmissionOptions();
   el<HTMLElement>("effort-field").hidden = selection.mode === "production";
   el<HTMLElement>("mode-note").textContent =
@@ -352,6 +366,7 @@ function status(value: Status): string {
   }[value];
 }
 function needsOrganizerReview(item: Submission): boolean {
+  if (data?.readOnly) return false;
   const timestamp =
     item.status === "processing"
       ? item.startedAt
@@ -366,6 +381,8 @@ function statusLabel(item: Submission): string {
   if (item.result?.eligibility === "no_implementation") return "実装ファイルなし・選考対象外";
   if (item.result && item.result.repoAssessment !== "scored") return "選考対象外";
   const stage = explanationState(item);
+  if (data?.readOnly && !item.result) return item.status === "failed" ? "未採点・審査失敗" : "未採点・審査停止";
+  if (data?.readOnly && (stage === "pending" || stage === "processing")) return "採点済み・理由未完了";
   if (explanationStale(item)) return "採点済み・理由待ちが長期化";
   if (stage) return { pending: "採点済み・理由待ち", processing: "採点済み・理由生成中", completed: "採点済み・理由完了", failed: "採点済み・理由生成失敗" }[stage];
   return needsOrganizerReview(item) ? "主催者確認" : status(item.status);
@@ -378,6 +395,7 @@ function explanationState(item: Submission): ExplanationState | null {
   return item.status === "processing" ? "processing" : "pending";
 }
 function explanationStale(item: Submission): boolean {
+  if (data?.readOnly) return false;
   const stage = explanationState(item);
   if (stage !== "pending" && stage !== "processing") return false;
   const updatedAt = Date.parse(item.updatedAt);
@@ -433,6 +451,7 @@ function attack(value: number | null | undefined): string {
     : "";
 }
 function active(): boolean {
+  if (data?.readOnly) return false;
   return !!data?.batches?.some((batch) => ["queued", "freezing", "scoring"].includes(batch.status)) || !!data?.items.some(
     (item) => item.status === "queued" || item.status === "processing",
   );
@@ -440,6 +459,7 @@ function active(): boolean {
 function schedule(): void {
   if (timer !== null) clearTimeout(timer);
   timer = null;
+  if (!data || data.readOnly) return;
   if (!document.hidden && (automatic || active()))
     timer = window.setTimeout(() => void refresh(), 5000);
 }
@@ -447,20 +467,24 @@ function isDashboard(value: unknown): value is Dashboard {
   if (!value || typeof value !== "object") return false;
   const snapshot = value as Partial<Dashboard>;
   return (
+    (snapshot.readOnly === undefined || typeof snapshot.readOnly === "boolean") &&
+    (snapshot.archivedAt === undefined || typeof snapshot.archivedAt === "string") &&
     typeof snapshot.open === "boolean" &&
     !!snapshot.event &&
     typeof snapshot.event.name === "string" &&
     Number.isFinite(snapshot.event.targetTeams) &&
     Number.isFinite(snapshot.event.finalistCount) &&
-    !!snapshot.budget &&
-    [
-      snapshot.budget.limitUsd,
-      snapshot.budget.spentUsd,
-      snapshot.budget.reservedUsd,
-      snapshot.budget.remainingUsd,
-    ].every(Number.isFinite) &&
-    !!snapshot.runner &&
-    typeof snapshot.runner.online === "boolean" &&
+    (snapshot.readOnly === true || (
+      !!snapshot.budget &&
+      [
+        snapshot.budget.limitUsd,
+        snapshot.budget.spentUsd,
+        snapshot.budget.reservedUsd,
+        snapshot.budget.remainingUsd,
+      ].every(Number.isFinite) &&
+      !!snapshot.runner &&
+      typeof snapshot.runner.online === "boolean"
+    )) &&
     !!snapshot.cutoff &&
     typeof snapshot.cutoff.tied === "boolean" &&
     Array.isArray(snapshot.items) &&
@@ -499,7 +523,7 @@ function isDashboard(value: unknown): value is Dashboard {
   );
 }
 async function refresh(): Promise<void> {
-  if (refreshing || document.hidden) return;
+  if (data?.readOnly || refreshing || (data && document.hidden)) return;
   refreshing = true;
   el<HTMLButtonElement>("refresh").disabled = true;
   el<HTMLElement>("live").textContent = data
@@ -521,22 +545,35 @@ async function refresh(): Promise<void> {
     }
     if (!isDashboard(body)) throw new Error("応答形式が正しくありません。");
     data = body;
-    el<HTMLElement>("live").textContent = "最新の審査状況を表示しています。";
+    if (data.readOnly) {
+      mode = "production";
+      automatic = false;
+      el<HTMLInputElement>("auto").checked = false;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      if (startTimer !== null) clearTimeout(startTimer);
+      startTimer = null;
+    }
+    el<HTMLElement>("live").textContent = data.readOnly
+      ? "保存された公開結果を表示しています（閲覧専用）。"
+      : "最新の審査状況を表示しています。";
     el<HTMLElement>("updated").textContent =
-      `最終更新 ${new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date())}`;
+      data.readOnly ? (data.archivedAt ? `結果保存 ${formatTimestampJst(data.archivedAt)}` : "保存済みの審査結果") : `最終更新 ${new Intl.DateTimeFormat("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date())}`;
     render();
   } catch (error) {
     el<HTMLElement>("live").textContent =
       `${data ? "前回取得した結果を表示中です。" : "結果を取得できませんでした。"} 手動更新で再試行できます。${error instanceof Error ? ` ${error.message}` : ""}`;
   } finally {
     refreshing = false;
-    el<HTMLButtonElement>("refresh").disabled = false;
+    el<HTMLButtonElement>("refresh").hidden = data?.readOnly === true;
+    el<HTMLButtonElement>("refresh").disabled = data?.readOnly === true;
     schedule();
   }
 }
 function render(): void {
   stats();
   organizer();
+  updateSubmissionOptions();
   preview();
   renderResults();
 }
@@ -545,12 +582,20 @@ function stats(): void {
   const items = data.items.filter((item) => item.mode === "production");
   const stages = stageCounts(items);
   const done = stages.scored, total = items.length;
+  if (data.readOnly) {
+    el<HTMLElement>("stats").innerHTML = `<div><span>提出チーム</span><strong>${total}</strong></div><div><span>採点済み</span><strong>${done}</strong></div><div><span>未採点</span><strong>${total - done}</strong></div><div><span>理由完了</span><strong>${stages.completed}</strong></div>`;
+    el<HTMLElement>("progress").innerHTML = "";
+    el<HTMLElement>("progress").hidden = true;
+    return;
+  }
+  el<HTMLElement>("progress").hidden = false;
   el<HTMLElement>("stats").innerHTML =
     `<div><span>本番登録</span><strong>${total}<small> / ${data.event.targetTeams}</small></strong></div><div><span>採点済み</span><strong>${done}</strong></div><div><span>未採点</span><strong>${total - done}</strong></div><div><span>理由完了</span><strong>${stages.completed}</strong></div>`;
   el<HTMLElement>("progress").innerHTML =
     `<div class="progress-label"><span>本番の採点進捗</span><span>${total ? Math.round((done / total) * 100) : 0}%</span></div><progress max="${Math.max(total, 1)}" value="${done}">${done} / ${total}</progress><p>本番 ${done} / ${total} 件を採点済み · 理由完了 ${stages.completed} / ${total} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由生成失敗 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}</p>${renderBatches()}`;
 }
 function renderBatches(): string {
+  if (data?.readOnly) return "";
   const labels = { queued: "待機中", freezing: "ソース版を固定中", scoring: "審査中", completed: "完了", failed: "失敗" };
   const markup = (data?.batches || []).map((batch) => {
     const items = (data?.items || []).filter((item) => (item as Submission & { batchId?: string }).batchId === batch.id);
@@ -568,6 +613,7 @@ function renderBatches(): string {
   return markup;
 }
 function needsFreezeRetry(batch: Batch): boolean {
+  if (data?.readOnly) return false;
   if (batch.frozenAt !== null) return false;
   if (batch.status === "failed") return true;
   const timestamp = batch.status === "queued" ? batch.freezeRequestedAt : batch.status === "freezing" ? batch.startedAt : null;
@@ -576,9 +622,11 @@ function needsFreezeRetry(batch: Batch): boolean {
   return Number.isFinite(time) && Date.now() - time >= 30 * 60 * 1000;
 }
 function canFreezeRetry(batch: Batch): boolean {
+  if (data?.readOnly) return false;
   return needsFreezeRetry(batch) && (batch.freezeDispatches ?? 1) < (batch.maxFreezeDispatches ?? 3) && (batch.mode !== "production" || Date.now() >= Date.parse(JUDGING_START_ISO));
 }
 el<HTMLElement>("progress").addEventListener("click", (event) => {
+  if (!data || data.readOnly) return;
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
   if (!button || posting) return;
   if (button.dataset.freezeCancel) { freezeReviewId = null; stats(); return; }
@@ -589,6 +637,7 @@ el<HTMLElement>("progress").addEventListener("click", (event) => {
   else if (freezeReviewId === batch.id) void retryFreeze(batch.id);
 });
 async function retryFreeze(id: string): Promise<void> {
+  if (!data || data.readOnly) return;
   const batch = data?.batches?.find((item) => item.id === id);
   if (posting || freezeReviewId !== id || !batch || !canFreezeRetry(batch)) return;
   posting = true;
@@ -618,8 +667,34 @@ async function retryFreeze(id: string): Promise<void> {
   }
 }
 function organizer(): void {
-  el<HTMLFieldSetElement>("controls").disabled = posting || data?.open === false;
-  if (data) {
+  const hidden = !data || data.readOnly === true;
+  root!.querySelector<HTMLDetailsElement>(".organizer")!.hidden = hidden;
+  el<HTMLFieldSetElement>("controls").hidden = hidden;
+  el<HTMLFieldSetElement>("controls").disabled = hidden || posting || data?.open === false;
+  el<HTMLButtonElement>("refresh").hidden = hidden;
+  el<HTMLButtonElement>("refresh").disabled = hidden || refreshing;
+  el<HTMLInputElement>("auto").closest("label")!.hidden = hidden;
+  el<HTMLInputElement>("auto").disabled = hidden;
+  for (const id of ["tab-validation", "presentation-demo"]) {
+    el<HTMLButtonElement>(id).hidden = hidden;
+    el<HTMLButtonElement>(id).disabled = hidden;
+  }
+  if (hidden) {
+    el<HTMLElement>("budget").textContent = "";
+    el<HTMLElement>("runner").textContent = "";
+    if (data?.readOnly) {
+      const total = data.items.filter((item) => item.mode === "production").length;
+      root!.querySelector<HTMLElement>(".overline")!.textContent = "公開結果 / 2026.10.18 / TOKYO";
+      root!.querySelector<HTMLElement>(".hero h1")!.innerHTML = "審査結果<br><span>次のステージへ。</span>";
+      root!.querySelector<HTMLElement>(".hero-copy")!.textContent = `公開 GitHub ソースをもとに審査した${total}チームの結果です。原則上位${data.event.finalistCount}チームを選出し、10位と同点のチームは全員通過します。`;
+      root!.querySelector<HTMLElement>(".hero-link.secondary")!.firstChild!.textContent = "結果概要 ";
+      root!.querySelector<HTMLElement>(".hero-facts strong")!.innerHTML = `${total}<small> チーム</small>`;
+      el<HTMLElement>("overview-title").textContent = "結果概要";
+      el<HTMLElement>("tab-production").firstChild!.textContent = "公開結果 ";
+    }
+    return;
+  }
+  if (data?.budget && data.runner) {
     const budget = data.budget;
     el<HTMLElement>("budget").innerHTML =
       `<div><span>使用済み</span><strong>${money(budget.spentUsd)}</strong></div><div><span>予約済み</span><strong>${money(budget.reservedUsd)}</strong></div><div><span>残額</span><strong>${money(budget.remainingUsd)}</strong></div><div><span>上限</span><strong>${money(budget.limitUsd)}</strong></div><p>概算 USD</p>`;
@@ -659,9 +734,12 @@ function entries(): Array<{ item: Submission; position: number | null }> {
 }
 function renderResults(): void {
   if (!data) return;
+  if (data.readOnly) mode = "production";
   const presentation = capturePresentation(data.items);
   el<HTMLButtonElement>("presentation-real").disabled = !presentation.ready;
-  el<HTMLElement>("presentation-readiness").textContent = presentation.message;
+  el<HTMLElement>("presentation-readiness").textContent = data.readOnly && !presentation.ready
+    ? "保存結果に未採点または発表条件を満たさない提出があるため、発表モードは利用できません。"
+    : presentation.message;
   const all = entries();
   const query = el<HTMLInputElement>("search").value.trim().toLocaleLowerCase();
   const visible = all.filter(({ item }) =>
@@ -682,12 +760,8 @@ function renderResults(): void {
   }
   el<HTMLElement>("panel").setAttribute("aria-labelledby", `tab-${mode}`);
   const production = data.items.filter((item) => item.mode === "production");
-  const provisional =
-    production.filter((item) => !!item.result).length <
-      data.event.targetTeams ||
-    production.some(
-      (item) => !item.result,
-    );
+  const provisional = production.some((item) => !item.result) ||
+    (!data.readOnly && production.filter((item) => !!item.result).length < data.event.targetTeams);
   el<HTMLElement>("cutoff").textContent =
     mode === "validation"
       ? "検証結果は決勝選考に含まれません。"
@@ -756,7 +830,7 @@ function detail(
   const result = item.result;
   const explanation = explanationState(item);
   const reasonsComplete = explanation === "completed";
-  const reasonText = explanationStale(item) ? "理由の処理が30分以上更新されていません" : explanation === "failed" ? "理由の生成に失敗しました。再試行は任意です" : "理由を生成中です";
+  const reasonText = data?.readOnly ? explanation === "failed" ? "理由の生成に失敗した状態で保存されています" : "保存時点で理由は未完了です" : explanationStale(item) ? "理由の処理が30分以上更新されていません" : explanation === "failed" ? "理由の生成に失敗しました。再試行は任意です" : "理由を生成中です";
   const qualification =
     mode === "production" &&
     position !== null &&
@@ -781,9 +855,9 @@ function detail(
     unjudgeable: "評価対象外",
   };
   el<HTMLElement>("detail").innerHTML =
-    `<div class="detail-head"><p class="kicker">SUBMISSION DETAIL</p><span class="status ${item.status}">${statusLabel(item)}</span></div><h3>${esc(item.teamName || "チーム名未設定")}</h3><p class="detail-repo">${safe ? `<a href="${esc(safe.url)}" target="_blank" rel="noopener noreferrer">${esc(item.repo.normalized)}</a>` : esc(item.repo.normalized)}</p><p class="detail-demo">${demoLink(item.demoUrl)}</p><div id="metadata-editor-host"></div>${qualification ? `<p class="qualification">${qualification}</p>` : ""}<dl class="metadata"><div><dt>審査区分</dt><dd>${item.mode === "production" ? "本番審査" : "検証"}</dd></div><div><dt>理由生成の推論強度</dt><dd>${esc(recordedEffort(item) || "--")}</dd></div><div><dt>登録</dt><dd>${date(item.createdAt)}</dd></div><div><dt>理由完了</dt><dd>${date(item.completedAt)}</dd></div><div><dt>評価した版</dt><dd class="sha">${pinned ? `<a href="${esc(pinned)}" target="_blank" rel="noopener noreferrer">${esc(result!.pinnedSha!.slice(0, 12))}</a>` : "--"}</dd></div></dl>${
+    `<div class="detail-head"><p class="kicker">SUBMISSION DETAIL</p><span class="status ${item.status}">${statusLabel(item)}</span></div><h3>${esc(item.teamName || "チーム名未設定")}</h3><p class="detail-repo">${safe ? `<a href="${esc(safe.url)}" target="_blank" rel="noopener noreferrer">${esc(item.repo.normalized)}</a>` : esc(item.repo.normalized)}</p><p class="detail-demo">${demoLink(item.demoUrl)}</p><div id="metadata-editor-host"></div>${qualification ? `<p class="qualification">${qualification}</p>` : ""}<dl class="metadata">${data?.readOnly ? "" : `<div><dt>審査区分</dt><dd>${item.mode === "production" ? "本番審査" : "検証"}</dd></div><div><dt>理由生成の推論強度</dt><dd>${esc(recordedEffort(item) || "--")}</dd></div>`}<div><dt>登録</dt><dd>${date(item.createdAt)}</dd></div><div><dt>理由完了</dt><dd>${date(item.completedAt)}</dd></div><div><dt>評価した版</dt><dd class="sha">${pinned ? `<a href="${esc(pinned)}" target="_blank" rel="noopener noreferrer">${esc(result!.pinnedSha!.slice(0, 12))}</a>` : "--"}</dd></div></dl>${
       result
-        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}${reviewRequired(item) ? `<p class="review-badge">確認メモ</p><p class="note">根拠や生成理由に不足・不確かさがあります。操作は不要です。Decisionsの確定点・順位・通過判定を維持します。</p>` : ""}${reasonsComplete ? `<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p>` : `<div class="explanation-stage" role="status"><h4>${esc(statusLabel(item))}</h4><p>${reasonText}。この採点結果は確定済みです。理由の生成で点数は変わりません。</p>${explanation === "failed" && item.failureMessage ? `<p>${esc(item.failureMessage)}</p>` : ""}</div>`}<p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
+        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}${reviewRequired(item) ? `<p class="review-badge">確認メモ</p><p class="note">根拠や生成理由に不足・不確かさがあります。操作は不要です。Decisionsの確定点・順位・通過判定を維持します。</p>` : ""}${reasonsComplete ? `<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p>` : `<div class="explanation-stage" role="status"><h4>${esc(statusLabel(item))}</h4><p>${reasonText}。この採点結果は確定済みです。理由の生成で点数は変わりません。</p>${!data?.readOnly && explanation === "failed" && item.failureMessage ? `<p>${esc(item.failureMessage)}</p>` : ""}</div>`}<p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
             .map((axis) => {
               const criterion = result.criteria.find(
                 (value) => value.key === axis.key,
@@ -791,7 +865,7 @@ function detail(
               const checks = result.usage?.decisionsConditions;
               const conditions = checks ? `<details class="condition-checks" data-criterion="${axis.key}"${expandedConditions.has(axis.key) ? " open" : ""}><summary>段階条件の判定を見る</summary><p class="note">下位から連続して確認できた最高段階が得点です。${esc(SOURCE_EVIDENCE)}</p><ul>${DECISION_CONDITIONS.filter((condition) => condition.key === axis.key).map((condition) => `<li><strong>${condition.level}点条件: ${checks[condition.name] === true ? "確認済み" : "未達・根拠未確認"}</strong><p>${esc(condition.description.slice(SOURCE_EVIDENCE.length))}</p></li>`).join("")}</ul></details>` : "";
               return `<section><div class="criterion-head"><h5>${esc(axis.label)}</h5><strong>${criterion ? esc(criterion.score) : "--"}<small> / 10</small></strong></div><p>${reasonsComplete ? esc(criterion?.reason || "評価理由はありません。") : reasonText}</p>${conditions}<div class="evidence"><span>根拠ファイル</span>${
-                !reasonsComplete ? "<p>理由と根拠は生成後に表示します</p>" : criterion?.evidencePaths.length
+                !reasonsComplete ? data?.readOnly ? "<p>保存時点で理由と根拠は未記載です</p>" : "<p>理由と根拠は生成後に表示します</p>" : criterion?.evidencePaths.length
                   ? `<ul>${criterion.evidencePaths
                       .map((path) => {
                         const url = source(
@@ -806,7 +880,9 @@ function detail(
               }</div></section>`;
             })
             .join("")}</div>`
-        : needsOrganizerReview(item)
+        : data?.readOnly
+          ? `<div class="pending"><h4>${esc(statusLabel(item))}</h4><p>保存された公開結果には、この提出の採点結果がありません。審査処理は停止しています。</p></div>`
+          : needsOrganizerReview(item)
           ? `<div class="pending" role="status"><h4>主催者確認</h4><p>${item.status === "queued" ? "クラウド実行待ちのまま30分以上経過しています。原因はまだ確定していません。自動で再審査しません。" : "クラウド審査中のまま30分以上経過しています。原因はまだ確定していません。自動で再審査しません。"}</p></div>`
           : `<div class="pending"><h4>${item.status === "failed" ? "審査できませんでした" : item.status === "processing" ? "クラウド審査中です" : "クラウド実行待ちです"}</h4><p>${esc(item.failureMessage || (item.status === "queued" ? "クラウド審査キューに登録済みです。タブを閉じてもサーバー上の実行は継続します。" : "結果が届くまでお待ちください。"))}</p></div>`
     }`;
@@ -840,6 +916,7 @@ function demoLink(value?: string | null, missing = "デモ未設定"): string {
 }
 
 function renderMetadataEditor(item: Submission, previous: HTMLElement | null): void {
+  if (!data || data.readOnly) return;
   const host = el<HTMLElement>("metadata-editor-host");
   const draft = metadataDrafts.get(item.id);
   if (draft && previous?.dataset.recordId === item.id && previous.querySelector("form")) {
@@ -853,6 +930,7 @@ function renderMetadataEditor(item: Submission, previous: HTMLElement | null): v
   section.innerHTML = draft ? `<form novalidate><label>チーム名<textarea name="teamName" maxlength="100" rows="2" required>${esc(draft.teamName)}</textarea></label><label>デモURL<input name="demoUrl" maxlength="2048" value="${esc(draft.demoUrl)}" inputmode="url"></label><p class="note">表示情報だけを変更します。再審査やAPI費用は発生しません。</p><p class="metadata-error" role="alert"></p><div class="metadata-actions"><button type="submit" class="subtle">表示情報を保存</button><button type="button" class="subtle" data-cancel>キャンセル</button></div></form>` : `<button type="button" class="subtle" data-edit>表示情報を編集</button><p role="status">${esc(metadataFeedback.get(item.id) || "")}</p>`;
   host.append(section);
   section.querySelector("[data-edit]")?.addEventListener("click", () => {
+    if (!data || data.readOnly) return;
     metadataDrafts.set(item.id, { teamName: item.teamName || "", demoUrl: item.demoUrl || "", saving: false, error: "" });
     metadataFeedback.delete(item.id);
     renderResults();
@@ -860,23 +938,31 @@ function renderMetadataEditor(item: Submission, previous: HTMLElement | null): v
   if (!draft) return;
   updateMetadataEditor(section, draft);
   section.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea").forEach((input) => input.addEventListener("input", () => {
+    if (!data || data.readOnly) return;
     if (input.name === "teamName") draft.teamName = input.value;
     else draft.demoUrl = input.value;
     draft.error = "";
     updateMetadataEditor(section, draft);
   }));
   section.querySelector("[data-cancel]")?.addEventListener("click", () => {
+    if (!data || data.readOnly) return;
     if (draft.saving) return;
     metadataDrafts.delete(item.id);
     renderResults();
   });
   section.querySelector("form")!.addEventListener("submit", (event) => {
     event.preventDefault();
+    if (!data || data.readOnly) return;
     void saveMetadata(item.id, draft, section);
   });
 }
 
 function updateMetadataEditor(section: HTMLElement, draft: MetadataDraft): void {
+  if (!data || data.readOnly) {
+    section.hidden = true;
+    section.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement>("button, input, textarea").forEach((control) => { control.disabled = true; });
+    return;
+  }
   section.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement>("button, input, textarea").forEach((control) => { control.disabled = draft.saving; });
   const alert = section.querySelector<HTMLElement>(".metadata-error");
   if (alert) alert.textContent = draft.error;
@@ -885,6 +971,7 @@ function updateMetadataEditor(section: HTMLElement, draft: MetadataDraft): void 
 }
 
 async function saveMetadata(id: string, draft: MetadataDraft, section: HTMLElement): Promise<void> {
+  if (!data || data.readOnly) return;
   if (draft.saving) return;
   const teamName = draft.teamName.trim();
   const demoUrl = normalizeDemoUrl(draft.demoUrl);
@@ -920,6 +1007,7 @@ async function saveMetadata(id: string, draft: MetadataDraft, section: HTMLEleme
 let presentationOpen = false;
 
 function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): void {
+  if (data?.readOnly && snapshot.mode === "demo") return;
   if (presentationOpen) return;
   presentationOpen = true;
   const dialog = document.createElement("section");
@@ -1104,6 +1192,7 @@ function retryLimitMessage(item: Submission): string {
   return "";
 }
 function canRetry(item: Submission): boolean {
+  if (data?.readOnly) return false;
   return (
     (item.status === "failed" || needsOrganizerReview(item)) &&
     retryAttempts(item) < 3 &&
@@ -1119,10 +1208,12 @@ function unfrozenBatch(item: Submission): Batch | undefined {
   return data?.batches?.find((batch) => batch.id === (item as Submission & { batchId?: string }).batchId && !batch.frozenAt);
 }
 function retryAllowed(item: Submission): boolean {
+  if (data?.readOnly) return false;
   if (unfrozenBatch(item) || (item.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO))) return false;
   return item.result ? (explanationState(item) === "failed" || explanationStale(item)) && (item.explanationDispatches ?? 0) > 0 && (item.explanationDispatches ?? 0) < 3 : canRetry(item);
 }
 function renderRetryControls(item: Submission): void {
+  if (!data || data.readOnly) return;
   if (recoveryCandidate(item)) {
     renderRecoveryControls(item);
     return;
@@ -1142,18 +1233,21 @@ function renderRetryControls(item: Submission): void {
   section.innerHTML = `<h4>${reasonRetry ? "評価理由を再生成" : "主催者による再審査"}</h4>${feedback ? `<p role="${feedback.failed ? "alert" : "status"}">${esc(feedback.message)}</p>` : ""}${frozen ? "<p>この提出は一括審査のコミット固定待ちです。進行状況からコミット固定を再試行してください。</p>" : beforeStart ? "<p>本番審査は10/18 17:30 日本時間から再試行できます。</p>" : eligible ? retryReviewId === item.id ? `${reasonRetry && item.mode === "validation" ? `<label class="field"><span>理由生成の推論強度</span><select id="retry-effort"${posting ? " disabled" : ""}><option value=""${retryRequestedEffort === null ? " selected" : ""}>記録済みの強度を維持</option><option value="medium"${retryRequestedEffort === "medium" ? " selected" : ""}>medium</option><option value="high"${retryRequestedEffort === "high" ? " selected" : ""}>high</option></select></label>` : ""}<p>${reasonRetry ? "点数・順位は変えず、理由だけを生成します。追加API費用が発生します" : "記録済みの理由生成の推論強度で、新しいクラウド審査をキューへ追加します。未確定の費用予約は保持され、追加のAPI費用が発生します。"}${reasonRetry && item.mode === "production" ? "。理由生成の推論強度は medium 固定です。" : ""}</p><div class="retry-actions"><button id="retry-confirm" type="button" class="dark"${disabled ? " disabled" : ""}>${posting ? "登録中です" : reasonRetry ? "費用を確認して評価理由を再生成" : "費用を確認して再審査"}</button><button id="retry-cancel" type="button" class="subtle"${posting ? " disabled" : ""}>キャンセル</button></div>` : `<p>${reasonRetry ? `理由生成の登録・再送 ${item.explanationDispatches ?? 0} / 3回` : `審査実行 ${retryAttempts(item)} / 3回、登録・再送 ${retryDispatches(item)} / 3回`}</p><button id="retry-prepare" type="button" class="dark"${disabled ? " disabled" : ""}>${reasonRetry ? "評価理由を再生成" : "再審査を準備"}</button>` : `<p>${esc(limit)}</p>`}`;
   el<HTMLElement>("detail").append(section);
   section.querySelector<HTMLButtonElement>("#retry-prepare")?.addEventListener("click", () => {
+    if (!data || data.readOnly) return;
     if (posting || !retryAllowed(item)) return;
     retryReviewId = item.id;
     retryRequestedEffort = null;
     renderResults();
   });
   section.querySelector<HTMLSelectElement>("#retry-effort")?.addEventListener("change", (event) => {
+    if (!data || data.readOnly) return;
     if (posting) return;
     const value = (event.currentTarget as HTMLSelectElement).value;
     retryRequestedEffort = value === "high" ? "high" : value === "medium" ? "medium" : null;
     renderResults();
   });
   section.querySelector<HTMLButtonElement>("#retry-cancel")?.addEventListener("click", () => {
+    if (!data || data.readOnly) return;
     retryReviewId = null;
     retryRequestedEffort = null;
     renderResults();
@@ -1161,11 +1255,13 @@ function renderRetryControls(item: Submission): void {
   section.querySelector<HTMLButtonElement>("#retry-confirm")?.addEventListener("click", () => void retrySubmission(item.id));
 }
 function recoveryCandidate(item: Submission): boolean {
+  if (data?.readOnly) return false;
   const started = Date.parse(item.startedAt || "");
   return item.status === "processing" && !item.result && (item.recoveryDispatches ?? 0) === 0
     && Number.isFinite(started) && Date.now() - started >= 5 * 60 * 1000;
 }
 function renderRecoveryControls(item: Submission): void {
+  if (!data || data.readOnly) return;
   const section = document.createElement("section");
   section.className = "retry-controls";
   const feedback = retryFeedback?.id === item.id ? retryFeedback : null;
@@ -1174,6 +1270,7 @@ function renderRecoveryControls(item: Submission): void {
   el<HTMLElement>("detail").append(section);
 }
 async function recoverSubmission(item: Submission): Promise<void> {
+  if (!data || data.readOnly) return;
   if (posting || !recoveryCandidate(item)) return;
   posting = true;
   retryFeedback = null;
@@ -1200,6 +1297,7 @@ function preservesScores(previous: Submission, next: Submission): boolean {
   return !!previous.result && !!next.result && previous.result.total === next.result.total && previous.result.criteria.every((criterion) => next.result?.criteria.some((value) => value.key === criterion.key && value.score === criterion.score)) && previous.result.criteria.length === next.result.criteria.length;
 }
 async function retrySubmission(id: string): Promise<void> {
+  if (!data || data.readOnly) return;
   const current = data?.items.find((item) => item.id === id);
   const effortRecheck = retryRequestedEffort;
   if (
@@ -1283,12 +1381,21 @@ function parseInput(input = el<HTMLTextAreaElement>("batch").value): ImportResul
   return restorePendingImport(input, selection, existingKeys, pendingBatch);
 }
 function sanitizeInput(): void {
+  if (!data || data.readOnly) return;
   const parsed = parseInput();
   el<HTMLTextAreaElement>("batch").value = parsed.sanitized;
   importResult = parsed;
   preview(false);
 }
 function preview(reparse = true): void {
+  if (startTimer !== null) clearTimeout(startTimer);
+  startTimer = null;
+  if (!data || data.readOnly) {
+    el<HTMLButtonElement>("batch-submit").disabled = true;
+    el<HTMLElement>("preview").textContent = "";
+    el<HTMLElement>("batch-results").textContent = "";
+    return;
+  }
   if (reparse || !importResult) importResult = parseInput();
   const parsed = importResult;
   const selection = selectedSubmissionOptions();
@@ -1299,11 +1406,10 @@ function preview(reparse = true): void {
   el<HTMLElement>("preview").innerHTML = `<h3>2. 対象を確認</h3><p>対象 ${parsed.items.length} 件 / 除外 ${parsed.rows.length - parsed.items.length} 件 · 理由生成の推論強度 ${esc(selection.effort)}</p>${parsed.error ? `<p role="alert">${esc(parsed.error)}</p>` : ""}<ol>${parsed.rows.map((row) => `<li><span class="preview-${row.reason === "ready" ? "ready" : "invalid"}">${esc(reasons[row.reason])}</span><span>${esc(row.teamName || "名称未入力")}<br>${esc(row.repoUrl)}<br>${row.reason === "invalid_demo" ? "デモURLを修正してください（対象外）" : demoLink(row.demoUrl)}</span><small>${row.submittedAt ? esc(formatTimestampJst(row.submittedAt)) : row.timestamp ? "提出日時を修正してください" : "提出日時なし"}</small></li>`).join("")}</ol><p>${acknowledged ? "この内容は受付済みです。進行状況を確認してください。" : beforeStart ? "本番審査は10/18 17:30 日本時間から開始できます。" : parsed.items.length ? "対象の回答だけを送信します。除外理由を確認して開始してください。" : "入力と除外理由を確認してください。"}</p>`;
   el<HTMLButtonElement>("batch-submit").disabled = posting || data?.open === false || !!parsed.error || !parsed.items.length || beforeStart || !!acknowledged;
   el<HTMLElement>("batch-results").textContent = batchMessage;
-  if (startTimer !== null) clearTimeout(startTimer);
   startTimer = beforeStart ? window.setTimeout(() => preview(), Math.min(2147483647, Math.max(1, Date.parse(JUDGING_START_ISO) - Date.now()))) : null;
 }
 async function submitBatch(): Promise<void> {
-  if (posting || data?.open === false) return;
+  if (!data || data.readOnly || posting || data.open === false) return;
   sanitizeInput();
   const selection = selectedSubmissionOptions();
   const items = importResult!.items.map((item) => ({ ...item }));

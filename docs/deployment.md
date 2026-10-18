@@ -78,23 +78,29 @@ GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分�
 
 ## Post-event shutdown on 2026-10-18
 
-イベント終了後は両停止フラグをfalseにし、`./public/closed` の静的な終了ページを配信します。`run_worker_first: false` と `not_found_handling: single-page-application` を使い、`workers_dev` と `preview_urls` もfalseにします。両方の稼働フラグがtrueでない場合、Workerは全API・internal要求をD1アクセス前に遮断します。受付状態はclosed、実行状態はofflineを返し、それ以外は410です。QueueハンドラもD1へ接続せず全メッセージをackします。採点・理由生成の両QueueはOAuth認証のWranglerで配送を停止済みです。
+イベント終了後は両停止フラグをfalseにしたまま、最終保存結果を閲覧できる読み取り専用の審査画面を公開します。入力・送信・編集・再審査の操作を隠して無効化し、順位、採点理由、検索、CSV・JSON書き出し、デモへのリンクは保持します。画面は `readOnly: true` と `archivedAt` を受け取り、自動ポーリングしません。
 
-停止時はWorker secretの `OPENAI_API_KEY_20261018_HACKATHON` も削除し、1Password Environmentの値は保持します。共有D1と審査結果・証拠・費用台帳は削除しません。停止確認時のdashboard取得は失敗し、Wranglerの読み取りはD1 Freeの日次行読み取り上限超過（code 7500）を返しました。最終費用や実行中件数0は確認できていません。有料プランへの変更は行いません。
+静的アセットの配信先は `./dist/client` です。`run_worker_first: false` と `not_found_handling: single-page-application` を使い、`workers_dev` と `preview_urls` はfalseのままにします。保存済みのdashboard、ranking、recent、個別結果、受付・実行状態は静的JSONのGETで返します。変更APIはWorkerの停止ガードがD1アクセス前に410で拒否します。QueueハンドラもD1へ接続せず全メッセージをackし、採点・理由生成の両Queueは配送停止を維持します。
 
-終了ページは無料の静的アセット配信です。D1 Freeの上限超過は有料利用へ自動切替せず、停止前に発生した利用料は取り消されません。アカウントの契約プランは変更しません。
+停止時はWorker secretの `OPENAI_API_KEY_20261018_HACKATHON` も削除し、1Password Environmentの値は保持します。共有D1と審査結果・証拠・費用台帳は削除しません。最初の停止確認ではdashboard取得が失敗し、D1 Freeの日次行読み取り上限超過（code 7500）を確認しました。その後、OAuth認証の `wrangler d1 export` で提出・batch・費用台帳の専用テーブルを取得し、保存結果の静的配信を復旧しました。有料プランへの変更や費用予約のリセットは行いません。
 
-再開には明示的な運用判断が必要です。アセットを `./dist/client` に戻し、`run_worker_first` を `/api/*` に戻し、両稼働フラグ・Worker secretを復元して公開したうえで、両Queueの配送を再開します。停止処理ではこれらの再開操作を行いません。
+`scripts/build-public-archive.mjs` は取得したSQLをローカルSQLiteへ読み込み、ネットワーク要求を禁止した環境で既存APIの公開用変換を実行します。本番区分の22件だけを収録し、固定SHAと保存済み `result_json` が変わっていないことを検証します。2026-10-18T13:16:59.901Zの生成では20件に採点結果があり、採点理由は19件完了・1件失敗、未採点は失敗1件・processingの保存状態1件です。点数・理由の再生成は行わず、この保存状態をそのまま公開します。元SQLのSHA-256は `cd7b490184a1c41f6b2101d555f279e5680da58ae530e9cbd8dc10ee94f27668` です。
+
+生のSQL exportは非公開のローカルファイルとして扱い、公開先へ置きません。アップロードするのは既存の公開用変換を通した本番結果のフィールドだけで、ソース全文、credential、検証区分の結果は含めません。
+
+閲覧は無料の静的アセット配信で、審査モデルの呼び出しやD1アクセスを行いません。停止前に発生した利用料は取り消されず、D1 Freeの上限超過が有料利用へ自動切替されることもありません。アカウントの契約プランは変更しません。
+
+審査の再開には明示的な運用判断が必要です。公開用の静的APIファイルを配信対象から外し、`run_worker_first` を `/api/*` に戻し、両稼働フラグ・Worker secretを復元して公開したうえで、両Queueの配送を再開します。結果閲覧の復旧ではこれらの再開操作を行いません。
 
 ## Verify publication
 
-終了後は終了ページ、受付closed、実行offline、変更APIの拒否を確認します。以下は稼働中の確認手順です。
+終了後は結果画面、静的JSONのGETが200、受付closed、実行offline、変更APIが410で拒否されることを確認します。入力・編集・再審査が表示されず、採点済みの順位と理由を閲覧でき、継続的なAPI取得が発生しないことも確認します。以下はdashboardの確認手順です。
 
 ```bash
 curl -fsS https://hackathon.nukoevi.app/api/dashboard
 ```
 
-日付、段階別ルーブリック、検証区分、本番予算、Queueの実API結果、攻撃表示の80%閾値、デスクトップ・短い画面・モバイルの表示を確認します。公開URLが変更後の結果を返すことと、Mac Studio側のプロセスに依存しないことを完了条件とします。
+イベント稼働中は日付、段階別ルーブリック、検証区分、本番予算、Queueの実API結果、攻撃表示の80%閾値、デスクトップ・短い画面・モバイルの表示を確認します。終了後の公開アーカイブには本番結果だけを含めます。公開URLが変更後の結果を返すことと、Mac Studio側のプロセスに依存しないことを完了条件とします。
 
 ## Event data
 
