@@ -48,7 +48,7 @@ op run --environment "$OP_ENVIRONMENT_ID" -- node -e 'console.log(Boolean(proces
 
 点数と攻撃判定はDecisions APIの `gpt-6-luna`、理由生成はResponses APIの `gpt-6.1-sol` です。理由の推論強度は本番medium、検証lowが既定です。検証区分ではmediumとhighも選べます。各段階で必要なモデルの利用権限を確認します。理由生成は点数を変更できません。
 
-画面、Decisions API、理由生成は [同じルーブリック](../src/shared/rubric.ts) を使います。版は `2026-10-18-v2`、各観点は `0 / 2 / 4 / 6 / 8 / 10`、合計40点です。各段階の全条件に照らし、実装の根拠と次の段階に不足する条件を確認します。実装ファイルのない提出は選考対象外です。
+画面、Decisions API、理由生成は [同じルーブリック](../src/shared/rubric.ts) を使います。新しい採点の版は `2026-10-18-v3`、各観点は `0 / 2 / 4 / 6 / 8 / 10`、合計40点です。各段階の全条件に照らし、実装の根拠と次の段階に不足する条件を確認します。実装ファイルのない提出は選考対象外です。過去のv2結果は保持し、理由再生成にも当時の基準を使います。
 
 GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分取得](https://git-scm.com/docs/gitprotocol-capabilities)で不要物を除いた対象テキストを全文読みます。参加者のGit属性や除外設定で実装を隠せないよう、アーカイブを使わず元のblobを取得します。匿名REST APIのIP共有クォータに依存せず、GitHub tokenや、会場端末のGitHub CLI認証は使いません。両APIに同じ全文を渡し、公式トークン計数で容量を検証します。取得の失敗やサイズ上限は未実装の0点と混同せず、要確認で停止します。修復後の再試行も同じSHAと全文hashを保持します。
 

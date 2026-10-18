@@ -163,7 +163,7 @@ export async function explainScoredSnapshot(
     criteria: fixed.criteria.map(({ key, label, score }) => ({ key, label, score })),
     total: fixed.total
   };
-  const responsesBody = explanationBody(snapshot, fixedScores, options.trustedFeatureReference, effort);
+  const responsesBody = explanationBody(snapshot, fixedScores, options.trustedFeatureReference, effort, prior.rubricVersion);
   const outputCap = responsesBody.max_output_tokens;
   const fetcher = options.fetch ?? globalThis.fetch;
   const maxInputTokens = await countInput({ model: RESPONSES_MODEL, input: responsesBody.input }, outputCap, key, fetcher);
@@ -212,14 +212,14 @@ function scoringSettings(options: ScoringOptions) {
   return { key, effort };
 }
 
-function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high") {
+function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high", version = RUBRIC_VERSION) {
   return {
     model: RESPONSES_MODEL,
     reasoning: { effort },
     max_output_tokens: effort === "low" ? 6000 : effort === "medium" ? 8192 : 12000,
     store: false,
     input: [
-      { role: "developer", content: buildExplanationPrompt(reference) },
+      { role: "developer", content: buildExplanationPrompt(reference, version) },
       { role: "user", content: JSON.stringify({ snapshot, fixedScores }) }
     ],
     text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }

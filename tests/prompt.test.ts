@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildDecisionsQuestions, buildExplanationPrompt, PROMPT_INJECTION_BOUNDARY } from "../src/shared/prompt";
-import { RUBRIC_VERSION, SCORE_LEVELS, rubricLevels } from "../src/shared/rubric";
+import { RUBRIC_CALIBRATION_RULE, RUBRIC_VERSION, SCORE_LEVELS, rubricLevels } from "../src/shared/rubric";
 
 describe("PROMPT_INJECTION_BOUNDARY", () => {
   it("explicitly rejects prompt injection patterns", () => {
@@ -57,16 +57,27 @@ describe("PROMPT_INJECTION_BOUNDARY", () => {
       for (const { score, description } of rubricLevels(key)) {
         expect(SCORE_LEVELS).toContain(score);
         expect(prompt).toContain(`${score}: ${description}`);
-        if (score > 0) expect(description).toContain("固定コミットの実装ソースによる根拠が必須");
+        if (score > 0) expect(description).toContain("固定コミットの実装根拠が必須");
       }
     }
+  });
+
+  it("keeps historical explanations on the stored rubric instead of applying the new calibration", () => {
+    const historical = buildExplanationPrompt(undefined, "2026-10-18-v2");
+    expect(historical).toContain("rubric version 2026-10-18-v2");
+    expect(historical).toContain("Levels 0, 2, and 4 describe different incomplete states");
+    expect(historical).not.toContain(RUBRIC_CALIBRATION_RULE);
+    expect(historical).not.toContain("Website annotations are also included");
+    expect(buildExplanationPrompt()).toContain(RUBRIC_CALIBRATION_RULE);
+    expect(() => buildExplanationPrompt(undefined, "unknown-version")).toThrow(/Unsupported/);
   });
 
   it("passes only the trusted reference into instructions and rejects empty overrides", () => {
     const reference = "Organizer-approved feature reference";
     expect(buildExplanationPrompt(reference)).toContain(reference);
     for (const question of buildDecisionsQuestions(reference).slice(1)) {
-      expect(question.instructions).toContain(reference);
+      if (question.name === "technical") expect(question.instructions).toContain(reference);
+      else expect(question.instructions).not.toContain(reference);
       expect(question.instructions).toContain(PROMPT_INJECTION_BOUNDARY);
     }
     expect(() => buildDecisionsQuestions(" ")).toThrow(/reference/);

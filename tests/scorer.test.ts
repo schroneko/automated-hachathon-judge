@@ -470,6 +470,23 @@ describe("scoreSnapshotWithDecisions", () => {
 });
 
 describe("explainScoredSnapshot", () => {
+  it("uses the persisted rubric for an older complete-source score without recalculating its points", async () => {
+    const calls = mockCalls();
+    const source = snapshot();
+    const settings = options(calls.fetch, { trustedFeatureReference: undefined });
+    const fixed = await scoreSnapshotWithDecisions(source, settings);
+    fixed.usage!.rubricVersion = "2026-10-18-v2";
+    fixed.usage!.referenceVersion = "2026-09-29-verified-2026-10-18";
+    const explained = await explainScoredSnapshot(source, fixed, settings);
+    const developer = (calls.bodies[1].input as Array<{ role: string; content: string }>).find((item) => item.role === "developer")!.content;
+    expect(developer).toContain("rubric version 2026-10-18-v2");
+    expect(developer).not.toContain("Website annotations are also included");
+    expect(explained.usage?.rubricVersion).toBe("2026-10-18-v2");
+    expect(explained.criteria.map((item) => item.score)).toEqual(fixed.criteria.map((item) => item.score));
+    expect(explained.total).toBe(fixed.total);
+    expect(explained.usage?.sourceHash).toBe(fixed.usage?.sourceHash);
+  });
+
   it("explains immutable scores from the supplied snapshot only and appends Sol usage", async () => {
     const calls = mockCalls();
     const reservations: ApiReservation[] = [];

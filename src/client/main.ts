@@ -768,6 +768,11 @@ function detail(
   const stages = document.createElement("dl");
   stages.className = "metadata";
   stages.innerHTML = `<div><dt>採点確定日時</dt><dd>${date(item.scoredAt ?? null)}</dd></div><div><dt>採点モデル</dt><dd>${esc(result?.usage?.decisionsModel || result?.usage?.model || "gpt-6-luna")}</dd></div><div><dt>理由生成</dt><dd>${explanation ? esc(statusLabel(item)) : "採点後に開始"}（GPT-6.1 Sol）</dd></div>`;
+  if (result?.usage?.rubricVersion) {
+    const version = document.createElement("div");
+    version.innerHTML = `<dt>採点基準の版</dt><dd>${esc(result.usage.rubricVersion)}</dd>`;
+    stages.append(version);
+  }
   if (result?.usage?.fullSource) {
     const coverage = document.createElement("div");
     coverage.innerHTML = `<dt>評価したソース</dt><dd>対象テキスト全文・${esc(result.usage.sourceFiles ?? 0)}ファイル・${esc(((result.usage.sourceBytes ?? 0) / 1024).toFixed(1))}KB</dd>`;

@@ -19,6 +19,7 @@
     "dev:client": "vite",
     "test": "vitest run",
     "test:worker": "node scripts/verify-worker-concurrency.mjs",
+    "test:calibration": "node scripts/verify-scoring-calibration.mjs",
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "engines": {

@@ -1,0 +1,61 @@
+export const RUBRIC_VERSION = "2026-10-18-v2";
+export const SCORE_LEVELS = [0, 2, 4, 6, 8, 10] as const;
+export const MAX_CRITERION_SCORE = 10;
+export const MAX_TOTAL_SCORE = 40;
+
+export const RUBRIC = {
+  technical: {
+    0: "固定コミットの全対象ソースに対象の新機能を使う実装根拠がない。README、設定、ドキュメントの主張や開発時のCodex利用だけでは足りない。収集対象外やバイナリ内の不存在は断定しない。",
+    2: "対象の新機能を使うスタブやテスト呼び出しなどの処理を実装ソースで確認できるが、利用目的につながる処理の流れを追えない。設定だけでは足りない。",
+    4: "対象機能の実呼び出しと利用目的は追えるが、主導線での入力から呼び出し、呼び出しから結果のいずれかの接続を確認できない。",
+    6: "ソース上で対象機能への利用者入力、関連処理、有用な結果への接続を主導線で追え、その機能が目的に合う役割を担っている。",
+    8: "6点の全条件に加え、タイムアウト、クォータ、無効な出力、再試行など、その機能に関係する制約や失敗への対処を具体的なコードで確認できる。",
+    10: "8点の全条件に加え、単純な方法との比較例または再現可能な検証例で、その新機能の能力に由来する作業改善を確認できる。1つの新機能でも到達でき、機能の数だけでは加点しない。"
+  },
+  ux: {
+    0: "固定コミットの全対象ソースで利用開始の入口や主要操作の実装根拠を確認できない。READMEや画面構想だけでは足りない。収集対象外やバイナリ内の不存在は断定しない。",
+    2: "利用開始の入口と一部の操作を実装ソースで確認できるが、必須の準備や手順を利用者が推測する必要がある。",
+    4: "開始方法、基本入力、結果を確認できるが、必須の説明または主導線での操作への反応が欠けている。",
+    6: "前提条件と開始方法が記載され、主要な入力から結果までを追え、操作と結果の表示および必須入力の説明がある。",
+    8: "6点の全条件に加え、対象の操作に必要な入力検証、進行または結果の状態表示、利用者が対処できるエラー説明と復旧経路をコードで確認できる。",
+    10: "8点の全条件に加え、代表的な初回利用と失敗からの復旧の各手順を実装済みのUIまたはCLI出力へ対応づけられ、説明のない手作業がない。ライブラリには相当する利用経路を評価し、GUIを必須にしない。"
+  },
+  impact: {
+    0: "固定コミットの全対象ソースに具体的な作業を助ける処理の実装根拠がない。READMEの課題や便益の主張だけでは足りない。収集対象外やバイナリ内の不存在は断定しない。",
+    2: "対象の課題とその作業を助ける最小限の処理を実装ソースで確認できるが、便益を生む主要な処理は未完成である。",
+    4: "具体的な作業の一部を解く処理は実装されているが、利用者に有用な最終出力までの接続を確認できない。",
+    6: "特定の利用者と作業に対し、入力から有用な出力までが実装され、減らせる時間、労力、判断負担のいずれかを具体的に説明できる。",
+    8: "6点の全条件に加え、代表的な入力と出力の例または検証例があり、反復利用時に生じる具体的な制約への対処を確認できる。",
+    10: "8点の全条件に加え、比較、計測、確認可能な作業前後の例で大きな便益を裏づけ、適用できる範囲と限界を示す。導入実績、利用者数、収益化は必須にしない。"
+  },
+  idea: {
+    0: "提示範囲では採用した解決方法や設計判断を特定できず、独自性を評価する根拠がない。盗用やリポジトリ全体での不存在を推定しない。",
+    2: "実装された解決方法は特定できるが、文脈に応じた変更は名称や見た目などの表層にとどまり、処理上の工夫を確認できない。",
+    4: "対象の利用場面に合わせた処理上の調整は実装されているが、中核の仕組みを変える独自の工夫は確認できない。",
+    6: "独自の着眼点、仕組み、組み合わせのいずれかを中核コードで確認でき、その採用理由を利用者の便益に結びつけて説明できる。",
+    8: "6点の全条件に加え、より単純な方法の具体的な限界を、その設計上の選択でどう解くか説明でき、選択した仕組みがコードで実現されている。",
+    10: "8点の全条件に加え、代表例または検証例で、その独自の仕組みが原因となって生まれる便益を確認できる。世界初や他に存在しないことは、提示範囲だけで断定しない。"
+  }
+} as const;
+
+export type RubricCriterion = keyof typeof RUBRIC;
+
+export function rubricLevels(key: RubricCriterion) {
+  return SCORE_LEVELS.map((score) => ({
+    score,
+    description: score === 0 ? RUBRIC[key][score] : `固定コミットの実装ソースによる根拠が必須。README、設定、ドキュメントの主張だけでは加点しない。${RUBRIC[key][score]}`
+  }));
+}
+
+export function rubricText(): string {
+  return (Object.keys(RUBRIC) as RubricCriterion[])
+    .map((key) => `${key}: ${rubricLevels(key).map(({ score, description }) => `${score}: ${description}`).join("\n")}`)
+    .join("\n\n");
+}
+
+export const DEVDAY_REFERENCE_VERSION = "2026-09-29-verified-2026-10-18";
+
+export const DEVDAY_FEATURE_REFERENCE = `Trusted organizer reference for DevDay 2026, held September 29, 2026.
+Sources: https://openai.com/index/devday-2026-recap/ and https://developers.openai.com/api/docs/changelog
+Relevant announcements include GPT-6.1 Sol; Responses multi-agent beta; Decisions API with finite predicate, choice, and score questions; Agents API computer use; Ultrafast; Private Intelligence; cloud Codex; refreshed Codex CLI; Code Review; Codex Security Cloud; Bedrock Managed Agents; plugin extensions and viewers; plugin creation and discovery; Sites hosting plugins; MCP Events; ChatGPT Space and Pages; collaborative slides; teams and shared tasks; ChatGPT in Slack and Teams; Meetings plugin; shareable profiles; Sign in with ChatGPT; Pro 500; OpenAI Marketplace.
+Evaluate purposeful, concrete integration supported by repository evidence. Using Codex to build the submission alone does not establish product integration. An older Responses or MCP integration alone does not demonstrate a new DevDay feature. GPT-6 Luna launched September 22; its name alone is not a September 29 feature. Quality and fitness matter more than feature count. Do not invent APIs or award a self-reported integration without source evidence. A feature not covered here needs explicit organizer verification rather than assumed eligibility. Assess the other three criteria independently.`;
