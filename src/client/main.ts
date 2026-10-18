@@ -10,8 +10,9 @@ import type {
 } from "../shared/types";
 import { importSourceSignature, restorePendingImport, normalizeRepository, normalizeDemoUrl, formatTimestampJst, type ImportResult } from "./submission-import";
 import { CRITERIA, EVENT_NAME, JUDGING_START_ISO } from "../shared/constants";
+import { DEVDAY_REFERENCE_VERSION } from "../shared/devday-reference";
 import { RUBRIC_VERSION, rubricLevels } from "../shared/rubric";
-import { DECISION_CONDITIONS, SOURCE_EVIDENCE } from "../shared/decision-conditions";
+import { CONDITION_PROBABILITY_THRESHOLD, DECISION_CONDITIONS, SOURCE_EVIDENCE } from "../shared/decision-conditions";
 type Effort = "low" | "medium" | "high";
 type ExplanationState = "pending" | "processing" | "completed" | "failed";
 type Submission = PublicSubmissionRecord;
@@ -89,6 +90,50 @@ root.innerHTML = `
       </div>
       <div class="rubric-grid">
         ${rubricMarkup}
+      </div>
+    </details>
+    <details class="rubric">
+      <summary>審査の仕組み</summary>
+      <div class="rubric-intro">
+        <p>固定ルーブリック ${esc(RUBRIC_VERSION)} に沿って点数を先に確定し、別のモデルが根拠に基づく理由を書きます。</p>
+      </div>
+      <div class="rubric-grid">
+        <section class="rubric-axis">
+          <h3>01 固定した全対象ソース</h3>
+          <p class="rubric-focus">最初に GitHub のコミットを固定します。</p>
+          <p>生成物、依存ライブラリ・ロックファイル、SVG を含む画像・メディア・バイナリを除外し、残る対象テキスト・ソース全件を採点と理由生成の両方に渡します。個々のファイルを黙って切り詰めません。</p>
+          <p>設定されたソース容量・コンテキスト上限を超えた場合は、部分採点せず停止して確認対象にします。</p>
+          <p>使いやすさもソースから推定します。リポジトリやテストは実行せず、審査中の Web 検索、実機・ブラウザや外部デモの操作は行いません。</p>
+        </section>
+        <section class="rubric-axis">
+          <h3>02 新機能と製品のつながり</h3>
+          <p class="rubric-focus">主催者が確認した有限の DevDay 2026 機能一覧と照合します。参照版: ${esc(DEVDAY_REFERENCE_VERSION)}</p>
+          <p><a href="https://openai.com/index/devday-2026-recap/" target="_blank" rel="noreferrer noopener">公式発表</a>と<a href="https://learn.chatgpt.com/docs/whats-new/devday-2026" target="_blank" rel="noreferrer noopener">DevDay の案内</a>に基づく一覧です。全発表の完全な網羅は保証せず、掲載外の機能を自動で認定しません。</p>
+          <p>例: GPT-6.1 Sol、Decisions API、Responses multi-agent、Plugins、Website annotations。対象はこの5つに限りません。</p>
+          <p>設定・呼び出し・宣言的メタデータが製品の動作にどうつながるかを読みます。名称・依存関係・README の自己申告や、開発だけの Codex 利用では加点しません。</p>
+          <p>目的との適合と統合の質を見ます。機能数だけでは点を付けません。</p>
+        </section>
+        <section class="rubric-axis">
+          <h3>03 点数は Decisions で確定</h3>
+          <p class="rubric-focus">Decisions API の対応採点モデル gpt-6-luna が判定します。</p>
+          <p>4観点に各5段階、計20条件の成立確率を API の predicate 確率として直接返します。確率が ${esc(CONDITION_PROBABILITY_THRESHOLD * 100)}% 以上なら成立です。</p>
+          <p>80% は条件に対するモデルの推定値の閾値で、採点精度80%の保証ではありません。</p>
+          <p>アプリが低い段階から連続して成立した最高段階を得点にします。各観点は0・2・4・6・8・10点、合計40点です。自由採点・平均・数値の丸めではありません。</p>
+          <p>下位が未成立で上位だけ成立しても、その下位条件の手前で得点を止め、不確かさを記録します。採点の判定元は Decisions だけです。</p>
+        </section>
+        <section class="rubric-axis">
+          <h3>04 理由は GPT-6.1 Sol</h3>
+          <p class="rubric-focus">本番は GPT-6.1 Sol medium が採点後に理由を書きます。</p>
+          <p>アプリがコミット SHA・ソースハッシュの一致を確認した全対象ソースと、Decisions の確定点・条件別の判定・確率を受け取り、実装根拠に基づいて説明します。</p>
+          <p>点数・順位・通過判定や固定ルーブリックを変更する権限はありません。</p>
+          <p>「確認メモ」は不足や不確かさを伝える情報です。運営の操作は不要で、確定点・順位・通過判定は維持されます。</p>
+        </section>
+        <section class="rubric-axis">
+          <h3>05 審査指示の改変を検知</h3>
+          <p class="rubric-focus">リポジトリの内容を信頼しない証拠として渡し、審査への指示と区別するようモデルに指示します。</p>
+          <p>独立した Decisions の攻撃判定で、審査指示を改変しようとする内容の確率を調べます。80% 以上のときだけ「攻撃〇〇点」を表示し、通常は非表示です。攻撃の成功を示すものではありません。</p>
+          <p>この指標はぬこぬこ賞だけの判断材料で、40点満点の総合点・順位・通過判定には一切含めません。</p>
+        </section>
       </div>
     </details>
     <p id="live" role="status" aria-live="polite" class="live">審査状況を読み込んでいます。</p>
