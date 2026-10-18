@@ -53,7 +53,7 @@ export function capturePresentation(items: readonly PresentationSource[], mode: 
   const cutoff = ready ? entries[FINALIST_COUNT - 1]!.total : null;
   const automatic = cutoff === null ? [] : entries.filter((entry) => entry.total >= cutoff);
   if (ready) message = `${automatic.length}チームの発表を準備できます。${automatic.length > FINALIST_COUNT ? "通過ラインの同点チームは全員通過です。" : ""}`;
-  const warnings = entries.some((entry) => entry.reviewRequired) ? ["根拠不足・要確認の提出があります。主催者が確認してください。点数・順位や発表対象からの除外は自動変更しません。"] : [];
+  const warnings = entries.some((entry) => entry.reviewRequired) ? ["採点理由に確認メモがある提出を含みます。操作は不要です。Decisionsの確定点・順位・通過判定を維持します。"] : [];
   return Object.freeze({ mode, entries, ready, message, warnings: Object.freeze(warnings), cutoff,
     automatic: Object.freeze(automatic) });
 }

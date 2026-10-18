@@ -79,7 +79,7 @@ root.innerHTML = `
         <div><span>評価</span><strong>4<small> 観点 / 40点</small></strong></div>
       </div>
     </section>
-    <p class="source-note">公開ソースを評価。実機の操作性やデモの完成度は主催者が確認。</p>
+    <p class="source-note">公開ソースを評価します。実機操作や外部デモの動作は自動評価の対象外です。</p>
     <details class="rubric">
       <summary>4つの評価観点を見る<span>各10点 / 合計40点</span></summary>
       <div class="rubric-intro">
@@ -321,8 +321,8 @@ function statusLabel(item: Submission): string {
   if (item.result?.eligibility === "no_implementation") return "実装ファイルなし・選考対象外";
   if (item.result && item.result.repoAssessment !== "scored") return "選考対象外";
   const stage = explanationState(item);
-  if (explanationStale(item)) return "採点済み・理由を要確認";
-  if (stage) return { pending: "採点済み・理由待ち", processing: "採点済み・理由生成中", completed: "採点済み・理由完了", failed: "理由を要確認" }[stage];
+  if (explanationStale(item)) return "採点済み・理由待ちが長期化";
+  if (stage) return { pending: "採点済み・理由待ち", processing: "採点済み・理由生成中", completed: "採点済み・理由完了", failed: "採点済み・理由生成失敗" }[stage];
   return needsOrganizerReview(item) ? "主催者確認" : status(item.status);
 }
 function explanationState(item: Submission): ExplanationState | null {
@@ -503,7 +503,7 @@ function stats(): void {
   el<HTMLElement>("stats").innerHTML =
     `<div><span>本番登録</span><strong>${total}<small> / ${data.event.targetTeams}</small></strong></div><div><span>採点済み</span><strong>${done}</strong></div><div><span>未採点</span><strong>${total - done}</strong></div><div><span>理由完了</span><strong>${stages.completed}</strong></div>`;
   el<HTMLElement>("progress").innerHTML =
-    `<div class="progress-label"><span>本番の採点進捗</span><span>${total ? Math.round((done / total) * 100) : 0}%</span></div><progress max="${Math.max(total, 1)}" value="${done}">${done} / ${total}</progress><p>本番 ${done} / ${total} 件を採点済み · 理由完了 ${stages.completed} / ${total} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由要確認 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}</p>${renderBatches()}`;
+    `<div class="progress-label"><span>本番の採点進捗</span><span>${total ? Math.round((done / total) * 100) : 0}%</span></div><progress max="${Math.max(total, 1)}" value="${done}">${done} / ${total}</progress><p>本番 ${done} / ${total} 件を採点済み · 理由完了 ${stages.completed} / ${total} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由生成失敗 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}</p>${renderBatches()}`;
 }
 function renderBatches(): string {
   const labels = { queued: "待機中", freezing: "ソース版を固定中", scoring: "審査中", completed: "完了", failed: "失敗" };
@@ -511,7 +511,7 @@ function renderBatches(): string {
     const items = (data?.items || []).filter((item) => (item as Submission & { batchId?: string }).batchId === batch.id);
     const stages = stageCounts(items);
     const scored = batch.scoredCount ?? stages.scored;
-    const stageSummary = `採点済み ${scored} / ${batch.counts.total} · 採点中 ${items.filter((item) => !item.result && item.status === "processing").length} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由完了 ${stages.completed} · 理由要確認 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}`;
+    const stageSummary = `採点済み ${scored} / ${batch.counts.total} · 採点中 ${items.filter((item) => !item.result && item.status === "processing").length} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由完了 ${stages.completed} · 理由生成失敗 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}`;
     const dispatches = batch.freezeDispatches ?? 1;
     const limit = batch.maxFreezeDispatches ?? 3;
     const recoverable = needsFreezeRetry(batch);
@@ -679,7 +679,7 @@ function renderResults(): void {
               `<span class="axis-score"><span class="axis-label">${esc(axis.label)}</span>${esc(item.result?.criteria.find((value) => value.key === axis.key)?.score ?? "--")}</span>`,
           )
           .join("");
-        return `<div class="result-entry"><button type="button" class="result-row${selected === item.id ? " selected" : ""}${atCutoff ? " cutoff-row" : ""}" data-id="${esc(item.id)}" aria-pressed="${selected === item.id}" aria-controls="detail"><span class="row-primary"><span class="rank">${position === null ? "--" : String(position).padStart(2, "0")}</span><span class="team-block"><strong>${esc(item.teamName || "チーム名未設定")}</strong><small>${esc(item.repo.normalized)}</small></span></span>${scores}<span class="total">${item.result ? `${esc(item.result.total)}<small>/40</small>` : "--"}${attack(item.result?.attackScore)}</span><span class="status ${item.status}">${esc(statusLabel(item))}${reviewRequired(item) ? `<small class="review-badge">根拠不足・要確認</small>` : ""}</span></button><div class="result-demo">${demoLink(item.demoUrl)}</div></div>`;
+        return `<div class="result-entry"><button type="button" class="result-row${selected === item.id ? " selected" : ""}${atCutoff ? " cutoff-row" : ""}" data-id="${esc(item.id)}" aria-pressed="${selected === item.id}" aria-controls="detail"><span class="row-primary"><span class="rank">${position === null ? "--" : String(position).padStart(2, "0")}</span><span class="team-block"><strong>${esc(item.teamName || "チーム名未設定")}</strong><small>${esc(item.repo.normalized)}</small></span></span>${scores}<span class="total">${item.result ? `${esc(item.result.total)}<small>/40</small>` : "--"}${attack(item.result?.attackScore)}</span><span class="status ${item.status}">${esc(statusLabel(item))}${reviewRequired(item) ? `<small class="review-badge">確認メモ</small>` : ""}</span></button><div class="result-demo">${demoLink(item.demoUrl)}</div></div>`;
       })
       .join("");
   el<HTMLElement>("list")
@@ -711,7 +711,7 @@ function detail(
   const result = item.result;
   const explanation = explanationState(item);
   const reasonsComplete = explanation === "completed";
-  const reasonText = explanationStale(item) ? "理由の処理が30分以上更新されていません" : explanation === "failed" ? "理由を確認してください" : "理由を生成中です";
+  const reasonText = explanationStale(item) ? "理由の処理が30分以上更新されていません" : explanation === "failed" ? "理由の生成に失敗しました。再試行は任意です" : "理由を生成中です";
   const qualification =
     mode === "production" &&
     position !== null &&
@@ -738,7 +738,7 @@ function detail(
   el<HTMLElement>("detail").innerHTML =
     `<div class="detail-head"><p class="kicker">SUBMISSION DETAIL</p><span class="status ${item.status}">${statusLabel(item)}</span></div><h3>${esc(item.teamName || "チーム名未設定")}</h3><p class="detail-repo">${safe ? `<a href="${esc(safe.url)}" target="_blank" rel="noopener noreferrer">${esc(item.repo.normalized)}</a>` : esc(item.repo.normalized)}</p><p class="detail-demo">${demoLink(item.demoUrl)}</p><div id="metadata-editor-host"></div>${qualification ? `<p class="qualification">${qualification}</p>` : ""}<dl class="metadata"><div><dt>審査区分</dt><dd>${item.mode === "production" ? "本番審査" : "検証"}</dd></div><div><dt>理由生成の推論強度</dt><dd>${esc(recordedEffort(item) || "--")}</dd></div><div><dt>登録</dt><dd>${date(item.createdAt)}</dd></div><div><dt>理由完了</dt><dd>${date(item.completedAt)}</dd></div><div><dt>評価した版</dt><dd class="sha">${pinned ? `<a href="${esc(pinned)}" target="_blank" rel="noopener noreferrer">${esc(result!.pinnedSha!.slice(0, 12))}</a>` : "--"}</dd></div></dl>${
       result
-        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}${reviewRequired(item) ? `<p class="review-badge">根拠不足・要確認</p><p class="note">根拠が不足しているため、主催者による確認が必要です。この表示によって点数・順位は変わりません。</p>` : ""}${reasonsComplete ? `<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p>` : `<div class="explanation-stage" role="status"><h4>${esc(statusLabel(item))}</h4><p>${reasonText}。この採点結果は確定済みです。理由の生成で点数は変わりません。</p>${explanation === "failed" && item.failureMessage ? `<p>${esc(item.failureMessage)}</p>` : ""}</div>`}<p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
+        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}${reviewRequired(item) ? `<p class="review-badge">確認メモ</p><p class="note">根拠や生成理由に不足・不確かさがあります。操作は不要です。Decisionsの確定点・順位・通過判定を維持します。</p>` : ""}${reasonsComplete ? `<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p>` : `<div class="explanation-stage" role="status"><h4>${esc(statusLabel(item))}</h4><p>${reasonText}。この採点結果は確定済みです。理由の生成で点数は変わりません。</p>${explanation === "failed" && item.failureMessage ? `<p>${esc(item.failureMessage)}</p>` : ""}</div>`}<p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
             .map((axis) => {
               const criterion = result.criteria.find(
                 (value) => value.key === axis.key,
