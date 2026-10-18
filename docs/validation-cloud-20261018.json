@@ -3,6 +3,15 @@
   "scope": "Cloudflare Queue execution with the 2026-10-18-v1 stepped rubric. All submissions used validation mode and are excluded from finalist rankings.",
   "publicUrl": "https://hackathon.nukoevi.app/",
   "runtimeVersion": "b1a0d350-4722-45c5-9549-b614e3bf40b4",
+  "publication": {
+    "version": "d34795ca-a911-4404-b060-9d4b9d554441",
+    "commit": "6efc664",
+    "clientScript": "index-D3U7YVB4.js",
+    "clientStyle": "index-B1mbER9h.css",
+    "publicBrowserVerified": true,
+    "productionRankings": 0,
+    "completedValidationSubmissions": 2
+  },
   "rubricVersion": "2026-10-18-v1",
   "cloudResults": [
     {
@@ -257,10 +266,11 @@
     "publicGitHubTokenRequired": false,
     "browserFixtureTeams": 30,
     "browserFixturePersisted": false,
-    "browserWidths": [
-      320,
-      1280
-    ],
+    "browserWidths": [320, 390, 1280],
+    "productionDependencyVulnerabilities": 0,
+    "developmentDependencyAlerts": [1, 3, 4, 6, 7, 8],
+    "developmentDependencyAlertsTrackedBy": "GitHub Dependabot",
+    "developmentDependenciesIncludedInProductionBundles": false,
     "horizontalOverflow": false,
     "rubricConditionsDisplayed": 24,
     "validatedBrowserFlows": [
