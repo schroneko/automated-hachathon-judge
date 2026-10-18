@@ -70,6 +70,10 @@ GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分�
 
 失敗結果と30分以上進まない審査は主催者が状態と費用を確認して再試行します。自動再試行はありません。初回と再試行を合わせて最大3回です。ローカルspoolや外部callbackの再送操作はありません。
 
+主催者が採点範囲の変更に伴う再採点を明示した場合は、`POST /api/submissions/:id/rescore` に `{"confirm":true,"requestId":"新しいUUID"}` を送信します。同じ操作の再送には同じUUIDを使います。完了・失敗状態だけを受け付け、未精算予約がある提出は拒否します。通常の `retry` は採点済みの点数を変えず、理由生成だけを再試行します。
+
+再採点は旧提出行を `devday_judge_scoring_history` に保存し、固定SHA・試行回数・送信回数・費用台帳を維持します。旧証拠は元のテーブルに保持し、新しい全文は `devday_judge_rescore_evidence_manifests` と `devday_judge_rescore_evidence_chunks` に世代別で保存します。追加の採点も既存予算と最大3回の上限を消費します。導入には追加migration `0011_scoring_revisions.sql` の適用が必要です。
+
 課金前の実行環境停止は別に復旧できます。開始後5分以上経過した未採点処理で、API予約履歴・証拠保存が両方0件なら「課金前の停止を復旧」から同じSHAと試行を1回続行します。APIが最終条件を検査し、過去の予約があれば拒否します。callback世代と専用の復旧送信回数を更新し、試行・通常送信・費用履歴を消しません。
 
 ## Verify publication

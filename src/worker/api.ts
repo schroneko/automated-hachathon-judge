@@ -1,4 +1,4 @@
-import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, MAX_MEMORY_DEFERRALS, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, JUDGING_START_ISO, MAX_MEMORY_DEFERRALS, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import { calculateUsageCost, quoteReservation } from "../shared/pricing";
 import { validatePublicScoreResult } from "../shared/validation";
@@ -8,6 +8,8 @@ import { normalizeDemoUrl, SUBMISSION_METADATA_BODY_LIMIT_BYTES } from "./submis
 import type { BudgetReservationInput, BudgetUsage, FinalizePayload, LeaseJob, PublicScoreResult, PublicSubmissionRecord, RankingEntry, RecoveryQueueMessage, ScoringQueueMessage, SubmissionMode } from "../shared/types";
 
 export interface SubmissionRow {
+  rescore_request_id?: string | null;
+  rescore_requested_at?: string | null;
   explanation_status: "pending" | "processing" | "completed" | "failed" | null;
   evidence_snapshot_json: string | null;
   decisions_result_json: string | null;
@@ -96,6 +98,9 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
   }
   if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/retry$/.test(path)) {
     return retrySubmission(request, path.split("/")[3]!, env);
+  }
+  if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/rescore$/.test(path)) {
+    return rescoreSubmission(request, path.split("/")[3]!, env);
   }
   if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/recover$/.test(path)) {
     return recoverSubmission(request, path.split("/")[3]!, env);
@@ -192,12 +197,72 @@ async function retrySubmission(request: Request, id: string, env: Env): Promise<
     : jsonResponse({ error: "Retry is unavailable for this submission", code: "retry_unavailable" }, { status: 409 });
 }
 
+async function rescoreSubmission(request: Request, id: string, env: Env): Promise<Response> {
+  let requestId: string;
+  try {
+    const body = await readJson(request, API_BODY_LIMIT_BYTES);
+    if (!object(body) || Object.keys(body).some((key) => !["confirm", "requestId"].includes(key)) || body.confirm !== true
+      || typeof body.requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.requestId)) throw new Error("Invalid rescore confirmation");
+    requestId = body.requestId.toLowerCase();
+  } catch (error) {
+    return invalid(error);
+  }
+  if (!workEnabled(env)) return disabled();
+  const current = await getRow(id, env);
+  if (!current) return jsonResponse({ error: "Not found" }, { status: 404 });
+  const replayed = () => env.JUDGE_DB.prepare("SELECT request_id FROM devday_judge_scoring_history WHERE submission_id = ? AND event_id = ? AND request_id = ?").bind(id, EVENT_ID, requestId).first();
+  if (await replayed()) {
+    const latest = await getRow(id, env);
+    return latest ? jsonResponse({ submission: toPublic(latest) }) : jsonResponse({ error: "Not found" }, { status: 404 });
+  }
+  const now = new Date().toISOString();
+  if (current.mode === "production" && now < JUDGING_START_ISO) return jsonResponse({ error: "Production judging has not started", code: "judging_not_started" }, { status: 403 });
+  if (!await frozenBarrier(current, env)) return jsonResponse({ error: "Retry the batch to finish freezing", code: "freeze_incomplete", batchId: current.batch_id }, { status: 409 });
+  const unavailable = () => jsonResponse({ error: "Rescore is unavailable for this submission", code: "rescore_unavailable" }, { status: 409 });
+  if (current.status !== "completed" && current.status !== "failed") return unavailable();
+  if (current.attempts >= 3 || current.dispatch_count >= 3) return jsonResponse({ error: "Rescore limit reached", code: "retry_limit" }, { status: 409 });
+  const unsettled = await env.JUDGE_DB.prepare("SELECT id FROM devday_judge_budget_reservations WHERE submission_id = ? AND status = 'reserved' LIMIT 1").bind(id).first();
+  if (unsettled) return jsonResponse({ error: "Settle outstanding reservations before rescoring", code: "rescore_unsettled_reservations" }, { status: 409 });
+  const fields = [
+    "id", "event_id", "repo_url", "repo_normalized", "repo_owner", "repo_name", "team_name", "demo_url", "mode", "effort", "scoring_effort", "status", "attempts", "dispatch_count",
+    "recovery_dispatch_count", "recovery_requested_at", "recovery_previous_started_at", "recovery_previous_updated_at", "callback_token", "created_at", "updated_at", "started_at", "completed_at", "pinned_sha", "failure_message", "result_json", "outcome_json",
+    "batch_id", "submitted_at", "default_branch", "frozen_at", "frozen_resolution_json", "explanation_status", "evidence_snapshot_json", "decisions_result_json", "scored_at", "explanation_dispatches", "explanation_requested_at", "explanation_started_at", "rescore_request_id", "rescore_requested_at"
+  ] as const satisfies readonly (keyof SubmissionRow)[];
+  const predicate = `id = ? AND event_id = ? AND mode = ? AND status = ? AND status IN ('completed', 'failed')
+    AND attempts = ? AND attempts < 3 AND dispatch_count = ? AND dispatch_count < 3 AND updated_at = ? AND callback_token IS ? AND rescore_request_id IS ?
+    AND NOT EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE submission_id = devday_judge_submissions.id AND status = 'reserved')`;
+  const values = [id, EVENT_ID, current.mode, current.status, current.attempts, current.dispatch_count, current.updated_at, current.callback_token, current.rescore_request_id ?? null];
+  const results = await env.JUDGE_DB.batch<SubmissionRow>([
+    env.JUDGE_DB.prepare(`INSERT INTO devday_judge_scoring_history (submission_id, event_id, request_id, requested_at, submission_json)
+      SELECT id, event_id, ?, ?, json_object(${fields.map((field) => `'${field}', ${field}`).join(", ")}) FROM devday_judge_submissions
+      WHERE ${predicate} AND NOT EXISTS (SELECT 1 FROM devday_judge_scoring_history WHERE submission_id = ? AND event_id = ? AND request_id = ?) ON CONFLICT DO NOTHING`)
+      .bind(requestId, now, ...values, id, EVENT_ID, requestId),
+    env.JUDGE_DB.prepare(`UPDATE devday_judge_submissions SET status = 'queued', dispatch_count = dispatch_count + 1, rescore_request_id = ?, rescore_requested_at = ?, updated_at = ?,
+      result_json = NULL, decisions_result_json = NULL, evidence_snapshot_json = NULL, outcome_json = NULL, failure_message = NULL, completed_at = NULL, scored_at = NULL, started_at = NULL, callback_token = NULL,
+      explanation_status = NULL, explanation_dispatches = 0, explanation_requested_at = NULL, explanation_started_at = NULL
+      WHERE changes() = 1 AND ${predicate} AND EXISTS (SELECT 1 FROM devday_judge_scoring_history WHERE submission_id = ? AND event_id = ? AND request_id = ?) RETURNING *`)
+      .bind(requestId, now, now, ...values, id, EVENT_ID, requestId)
+  ]);
+  const updated = results[1]?.results[0];
+  if (updated) {
+    if (!await sendQueueMessage(env, updated)) return jsonResponse({ error: "Scoring queue send failed", code: "queue_send_failed" }, { status: 503 });
+    return jsonResponse({ submission: toPublic(updated) }, { status: 202 });
+  }
+  if (await replayed()) {
+    const latest = await getRow(id, env);
+    if (latest) return jsonResponse({ submission: toPublic(latest) });
+  }
+  return unavailable();
+}
+
 const recoverySafety = `result_json IS NULL AND decisions_result_json IS NULL
   AND attempts BETWEEN 1 AND 3 AND callback_token IS NOT NULL AND length(callback_token) > 0
   AND evidence_snapshot_json IS NULL
   AND NOT EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE submission_id = devday_judge_submissions.id)
   AND NOT EXISTS (SELECT 1 FROM devday_judge_evidence_manifests WHERE submission_id = devday_judge_submissions.id)
   AND NOT EXISTS (SELECT 1 FROM devday_judge_evidence_chunks WHERE submission_id = devday_judge_submissions.id)
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_rescore_evidence_manifests WHERE submission_id = devday_judge_submissions.id)
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_rescore_evidence_chunks WHERE submission_id = devday_judge_submissions.id)
   AND frozen_at IS NOT NULL AND frozen_resolution_json IS NOT NULL
   AND EXISTS (SELECT 1 FROM devday_judge_batches AS batch WHERE batch.id = devday_judge_submissions.batch_id AND batch.event_id = devday_judge_submissions.event_id AND batch.mode = devday_judge_submissions.mode AND batch.status = 'scoring' AND batch.frozen_at IS NOT NULL)
   AND NOT EXISTS (SELECT 1 FROM devday_judge_submissions AS sibling WHERE sibling.batch_id = devday_judge_submissions.batch_id AND (sibling.frozen_at IS NULL OR sibling.frozen_resolution_json IS NULL))`;

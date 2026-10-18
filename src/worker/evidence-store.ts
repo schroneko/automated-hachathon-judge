@@ -60,9 +60,17 @@ async function digest(bytes: Uint8Array): Promise<string> {
   return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>)), (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+function evidenceTables(row: SubmissionRow) {
+  return row.rescore_request_id
+    ? { manifests: "devday_judge_rescore_evidence_manifests", chunks: "devday_judge_rescore_evidence_chunks" } as const
+    : { manifests: "devday_judge_evidence_manifests", chunks: "devday_judge_evidence_chunks" } as const;
+}
+
 async function manifestFor(row: SubmissionRow, env: Env): Promise<Manifest | null> {
-  identity(row);
-  return env.JUDGE_DB.prepare("SELECT submission_id, event_id, attempt, callback_token, pinned_sha, sha256, byte_count, chunk_count, complete FROM devday_judge_evidence_manifests WHERE submission_id = ? AND event_id = ?").bind(row.id, row.event_id).first<Manifest>();
+  const key = identity(row);
+  const { manifests } = evidenceTables(row);
+  return env.JUDGE_DB.prepare(`SELECT submission_id, event_id, attempt, callback_token, pinned_sha, sha256, byte_count, chunk_count, complete FROM ${manifests} WHERE ${row.rescore_request_id ? generation : "submission_id = ? AND event_id = ?"}`)
+    .bind(...(row.rescore_request_id ? key : [row.id, row.event_id])).first<Manifest>();
 }
 
 async function readStored(row: SubmissionRow, manifest: Manifest, env: Env): Promise<RepoEvidenceSnapshot> {
@@ -100,19 +108,21 @@ async function acquireRestoration(): Promise<() => void> {
 
 async function restoreStored(row: SubmissionRow, manifest: Manifest, env: Env): Promise<RepoEvidenceSnapshot> {
   const current = identity(row);
+  const { chunks } = evidenceTables(row);
   const key = [manifest.submission_id, manifest.event_id, manifest.attempt, manifest.callback_token];
   if (manifest.submission_id !== current[0] || manifest.event_id !== current[1]
+    || (row.rescore_request_id && (manifest.attempt !== current[2] || manifest.callback_token !== current[3]))
     || !Number.isSafeInteger(manifest.attempt) || manifest.attempt < 1 || manifest.attempt > 3 || !manifest.callback_token
     || manifest.pinned_sha !== row.pinned_sha || manifest.complete !== 1 || !/^[a-f0-9]{64}$/.test(manifest.sha256)
     || !Number.isSafeInteger(manifest.byte_count) || manifest.byte_count < 1 || manifest.byte_count > MAX_SNAPSHOT_SERIALIZED_BYTES
     || !Number.isSafeInteger(manifest.chunk_count) || manifest.chunk_count < 1 || manifest.chunk_count > MAX_CHUNKS
     || manifest.chunk_count !== Math.ceil(manifest.byte_count / CHUNK_BYTES)) throw new Error("Invalid evidence manifest");
-  const extent = await env.JUDGE_DB.prepare(`SELECT COUNT(*) AS chunk_count, SUM(length(content)) AS byte_count FROM devday_judge_evidence_chunks WHERE ${generation}`).bind(...key).first<{ chunk_count: number; byte_count: number | null }>();
+  const extent = await env.JUDGE_DB.prepare(`SELECT COUNT(*) AS chunk_count, SUM(length(content)) AS byte_count FROM ${chunks} WHERE ${generation}`).bind(...key).first<{ chunk_count: number; byte_count: number | null }>();
   if (extent?.chunk_count !== manifest.chunk_count || extent.byte_count !== manifest.byte_count) throw new Error("Missing evidence chunks or invalid byte count");
   const bytes = new Uint8Array(manifest.byte_count);
   let offset = 0;
   for (let index = 0; index < manifest.chunk_count; index++) {
-    const chunk = await env.JUDGE_DB.prepare(`SELECT chunk_index, content FROM devday_judge_evidence_chunks WHERE ${generation} AND chunk_index = ?`).bind(...key, index).first<{ chunk_index: number; content: ArrayBuffer | Uint8Array | number[] }>();
+    const chunk = await env.JUDGE_DB.prepare(`SELECT chunk_index, content FROM ${chunks} WHERE ${generation} AND chunk_index = ?`).bind(...key, index).first<{ chunk_index: number; content: ArrayBuffer | Uint8Array | number[] }>();
     if (!chunk || chunk.chunk_index !== index || !(chunk.content instanceof ArrayBuffer || chunk.content instanceof Uint8Array || Array.isArray(chunk.content))) throw new Error("Invalid evidence chunk order");
     if (Array.isArray(chunk.content) && chunk.content.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) throw new Error("Invalid evidence chunk bytes");
     const content = chunk.content instanceof Uint8Array ? chunk.content : new Uint8Array(chunk.content);
@@ -133,6 +143,7 @@ export async function loadEvidenceSnapshot(row: SubmissionRow, env: Env): Promis
   if (row.event_id !== EVENT_ID) throw new Error("Invalid evidence event");
   const manifest = row.callback_token && row.attempts > 0 ? await manifestFor(row, env) : null;
   if (manifest) return readStored(row, manifest, env);
+  if (row.rescore_request_id) return null;
   if (!row.evidence_snapshot_json) return null;
   const snapshot = { ...JSON.parse(row.evidence_snapshot_json) } as RepoEvidenceSnapshot;
   delete snapshot.fullSource;
@@ -158,6 +169,7 @@ export async function requireStoredEvidenceSnapshot(snapshot: RepoEvidenceSnapsh
 
 export async function persistEvidenceSnapshot(snapshot: RepoEvidenceSnapshot, row: SubmissionRow, env: Env): Promise<void> {
   const key = identity(row);
+  const { manifests, chunks } = evidenceTables(row);
   validateSnapshot(snapshot, row);
   const bytes = new TextEncoder().encode((await prepareFullSourceSnapshot(snapshot)).serialized);
   const hash = await digest(bytes);
@@ -171,12 +183,12 @@ export async function persistEvidenceSnapshot(snapshot: RepoEvidenceSnapshot, ro
   }
   const count = Math.ceil(bytes.byteLength / CHUNK_BYTES);
   if (count < 1 || count > MAX_CHUNKS) throw new Error("Evidence snapshot exceeds limits");
-  const statements = [env.JUDGE_DB.prepare(`INSERT INTO devday_judge_evidence_manifests (submission_id, event_id, attempt, callback_token, pinned_sha, sha256, byte_count, chunk_count, complete) SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0 WHERE ${lease} ON CONFLICT DO NOTHING`).bind(...key, row.pinned_sha, hash, bytes.byteLength, count, ...key, row.pinned_sha)];
+  const statements = [env.JUDGE_DB.prepare(`INSERT INTO ${manifests} (submission_id, event_id, attempt, callback_token, pinned_sha, sha256, byte_count, chunk_count, complete) SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0 WHERE ${lease} ON CONFLICT DO NOTHING`).bind(...key, row.pinned_sha, hash, bytes.byteLength, count, ...key, row.pinned_sha)];
   for (let index = 0; index < count; index++) {
     const content = bytes.slice(index * CHUNK_BYTES, (index + 1) * CHUNK_BYTES);
-    statements.push(env.JUDGE_DB.prepare(`INSERT INTO devday_judge_evidence_chunks (submission_id, event_id, attempt, callback_token, chunk_index, content) SELECT ?, ?, ?, ?, ?, ? WHERE ${lease} AND EXISTS (SELECT 1 FROM devday_judge_evidence_manifests WHERE ${generation} AND sha256 = ? AND complete = 0) ON CONFLICT DO NOTHING`).bind(...key, index, content, ...key, row.pinned_sha, ...key, hash));
+    statements.push(env.JUDGE_DB.prepare(`INSERT INTO ${chunks} (submission_id, event_id, attempt, callback_token, chunk_index, content) SELECT ?, ?, ?, ?, ?, ? WHERE ${lease} AND EXISTS (SELECT 1 FROM ${manifests} WHERE ${generation} AND sha256 = ? AND complete = 0) ON CONFLICT DO NOTHING`).bind(...key, index, content, ...key, row.pinned_sha, ...key, hash));
   }
-  statements.push(env.JUDGE_DB.prepare(`UPDATE devday_judge_evidence_manifests SET complete = 1 WHERE ${generation} AND sha256 = ? AND complete = 0 AND ${lease} AND (SELECT COUNT(*) FROM devday_judge_evidence_chunks WHERE ${generation}) = chunk_count AND (SELECT SUM(length(content)) FROM devday_judge_evidence_chunks WHERE ${generation}) = byte_count`).bind(...key, hash, ...key, row.pinned_sha, ...key, ...key));
+  statements.push(env.JUDGE_DB.prepare(`UPDATE ${manifests} SET complete = 1 WHERE ${generation} AND sha256 = ? AND complete = 0 AND ${lease} AND (SELECT COUNT(*) FROM ${chunks} WHERE ${generation}) = chunk_count AND (SELECT SUM(length(content)) FROM ${chunks} WHERE ${generation}) = byte_count`).bind(...key, hash, ...key, row.pinned_sha, ...key, ...key));
   await env.JUDGE_DB.batch(statements);
   await requireStoredEvidenceSnapshot(snapshot, row, env);
 }
