@@ -6,7 +6,8 @@
       "WebWorker"
     ],
     "types": [
-      "@cloudflare/workers-types"
+      "@cloudflare/workers-types",
+      "node"
     ],
     "rootDir": "src",
     "outDir": "build/worker"

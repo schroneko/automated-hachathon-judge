@@ -1,8 +1,11 @@
-import { EVENT_ID, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_FILES, MAX_EVIDENCE_TOTAL_BYTES, MAX_SNAPSHOT_SERIALIZED_BYTES } from "../shared/constants";
+import { EVENT_ID } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import type { ExplanationQueueMessage, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot } from "../shared/types";
-import { validatePublicScoreResult } from "../shared/validation";
+import { implementationEligibility, prepareFullSourceSnapshot, validatePublicScoreResult } from "../shared/validation";
 import { effectiveEffort, getRow, toPublic, workEnabled, type SubmissionRow } from "./api";
+import { hasStoredEvidenceSnapshot, requireStoredEvidenceSnapshot, validateSnapshot } from "./evidence-store";
+
+export { validateSnapshot } from "./evidence-store";
 
 export function matchesFrozenResolution(row: SubmissionRow, result: PublicScoreResult): boolean {
   if (!row.frozen_resolution_json) return true;
@@ -11,46 +14,25 @@ export function matchesFrozenResolution(row: SubmissionRow, result: PublicScoreR
     || (resolution.assessment === "scored" && result.repoAssessment === "empty_repository"));
 }
 
-export function validateSnapshot(snapshot: RepoEvidenceSnapshot, row: SubmissionRow): string {
-  if (!snapshot || snapshot.repo?.normalized !== row.repo_normalized || snapshot.repo.owner !== row.repo_owner
-    || snapshot.repo.repo !== row.repo_name || snapshot.repo.canonicalUrl !== row.repo_url
-    || snapshot.pinnedSha !== row.pinned_sha || snapshot.defaultBranch !== row.default_branch
-    || typeof snapshot.summary !== "string" || snapshot.summary.length > 4000
-    || !Array.isArray(snapshot.files) || snapshot.files.length > MAX_EVIDENCE_FILES
-    || !["scored", "empty_repository", "missing_or_private", "no_default_branch"].includes(snapshot.assessment)
-    || (snapshot.defaultBranch !== null && (typeof snapshot.defaultBranch !== "string" || snapshot.defaultBranch.length > 255))) throw new Error("Invalid evidence snapshot");
-  const encoder = new TextEncoder();
-  let bytes = 0;
-  const paths = new Set<string>();
-  for (const file of snapshot.files) {
-    if (!file || typeof file.path !== "string" || !file.path || file.path.length > 1024 || paths.has(file.path)
-      || typeof file.content !== "string" || !Number.isSafeInteger(file.size) || file.size < 0
-      || typeof file.truncated !== "boolean") throw new Error("Invalid evidence file");
-    paths.add(file.path);
-    const size = encoder.encode(file.content).byteLength;
-    if (size === 0 || size > MAX_EVIDENCE_FILE_BYTES || file.size !== size) throw new Error("Invalid evidence file size");
-    bytes += size;
-  }
-  if (bytes > MAX_EVIDENCE_TOTAL_BYTES || (snapshot.assessment !== "scored" && snapshot.files.length > 0)
-    || (snapshot.assessment === "scored" && snapshot.files.length === 0)) throw new Error("Evidence snapshot exceeds limits");
-  const serialized = JSON.stringify({ repo: { owner: snapshot.repo.owner, repo: snapshot.repo.repo, normalized: snapshot.repo.normalized, canonicalUrl: snapshot.repo.canonicalUrl }, pinnedSha: snapshot.pinnedSha, defaultBranch: snapshot.defaultBranch, summary: snapshot.summary, assessment: snapshot.assessment, files: snapshot.files.map(({ path, size, content, truncated }) => ({ path, size, content, truncated })) });
-  if (encoder.encode(serialized).byteLength > MAX_SNAPSHOT_SERIALIZED_BYTES) throw new Error("Evidence snapshot exceeds limits");
-  return serialized;
-}
-
 export async function persistDecisions(job: LeaseJob, result: PublicScoreResult, snapshot: RepoEvidenceSnapshot, env: Env): Promise<SubmissionRow | null> {
   const row = await getRow(job.submissionId, env);
   if (!row || row.callback_token !== job.callbackToken || row.status !== "processing" || row.result_json) return null;
-  const snapshotJson = validateSnapshot(snapshot, row);
+  validateSnapshot(snapshot, row);
+  await requireStoredEvidenceSnapshot(snapshot, row, env);
   const fixed = validatePublicScoreResult(result, new Set(snapshot.files.map((file) => file.path)));
   if (!matchesFrozenResolution(row, fixed) || fixed.pinnedSha !== snapshot.pinnedSha || fixed.repoAssessment !== snapshot.assessment) throw new Error("Result does not match frozen repository");
+  if (fixed.eligibility !== implementationEligibility(snapshot)) throw new Error("Invalid implementation eligibility");
   const explain = fixed.repoAssessment === "scored";
-  if (explain && (fixed.usage?.model !== "gpt-6-luna" || fixed.usage.decisionsModel !== "gpt-6-luna" || fixed.usage.explanationModel !== undefined
+  if (explain && (fixed.usage?.fullSource !== true || fixed.usage.model !== "gpt-6-luna" || fixed.usage.decisionsModel !== "gpt-6-luna" || fixed.usage.explanationModel !== undefined
     || fixed.usage.outputTokens !== 0 || fixed.criteria.some((item) => fixed.usage!.decisionsScores[item.key] !== item.score))) throw new Error("Invalid Decisions authority");
+  if (fixed.usage?.fullSource) {
+    const { metadata } = await prepareFullSourceSnapshot(snapshot);
+    if (fixed.usage.sourceHash !== metadata.sourceHash || fixed.usage.sourceFiles !== metadata.sourceFiles || fixed.usage.sourceBytes !== metadata.sourceBytes) throw new Error("Invalid Decisions source authority");
+  }
   const now = new Date().toISOString();
   const resultJson = JSON.stringify(fixed);
-  return env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET result_json = ?, decisions_result_json = ?, evidence_snapshot_json = ?, scored_at = ?, updated_at = ?, explanation_status = ?, explanation_dispatches = explanation_dispatches + ?, explanation_requested_at = ?, explanation_started_at = NULL, status = ?, completed_at = ?, failure_message = NULL, outcome_json = ? WHERE id = ? AND event_id = ? AND status = 'processing' AND callback_token = ? AND result_json IS NULL AND (? = 0 OR explanation_dispatches < 3) RETURNING *")
-    .bind(resultJson, resultJson, snapshotJson, now, now, explain ? "pending" : "completed", Number(explain), explain ? now : null, explain ? "processing" : "completed", explain ? null : now, explain ? null : JSON.stringify({ kind: "completed", result: fixed }), row.id, EVENT_ID, job.callbackToken, Number(explain)).first<SubmissionRow>();
+  return env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET result_json = ?, decisions_result_json = ?, scored_at = ?, updated_at = ?, explanation_status = ?, explanation_dispatches = explanation_dispatches + ?, explanation_requested_at = ?, explanation_started_at = NULL, status = ?, completed_at = ?, failure_message = NULL, outcome_json = ? WHERE id = ? AND event_id = ? AND status = 'processing' AND callback_token = ? AND attempts = ? AND result_json IS NULL AND (? = 0 OR explanation_dispatches < 3) RETURNING *")
+    .bind(resultJson, resultJson, now, now, explain ? "pending" : "completed", Number(explain), explain ? now : null, explain ? "processing" : "completed", explain ? null : now, explain ? null : JSON.stringify({ kind: "completed", result: fixed }), row.id, EVENT_ID, job.callbackToken, row.attempts, Number(explain)).first<SubmissionRow>();
 }
 
 export function validExplanationMessage(value: unknown): value is ExplanationQueueMessage {
@@ -81,7 +63,7 @@ export async function sendExplanation(row: SubmissionRow, env: Env): Promise<boo
 
 export async function retryExplanation(row: SubmissionRow, effort: "medium" | "high" | undefined, env: Env): Promise<Response> {
   if (!workEnabled(env)) return jsonResponse({ error: "Judging is disabled", code: "judging_disabled" }, { status: 410 });
-  if (!row.evidence_snapshot_json || !row.decisions_result_json || !row.callback_token) return jsonResponse({ error: "This historical score has no saved Decisions snapshot. Its score is preserved and explanation regeneration is unavailable.", code: "explanation_snapshot_missing" }, { status: 409 });
+  if (!row.decisions_result_json || !row.callback_token || !await hasStoredEvidenceSnapshot(row, env)) return jsonResponse({ error: "This historical score has no saved Decisions snapshot. Its score is preserved and explanation regeneration is unavailable.", code: "explanation_snapshot_missing" }, { status: 409 });
   if (row.explanation_dispatches >= 3) return jsonResponse({ error: "Explanation dispatch limit reached", code: "retry_limit" }, { status: 409 });
   const fixed = JSON.parse(row.decisions_result_json) as PublicScoreResult;
   if (fixed.repoAssessment !== "scored") return jsonResponse({ error: "This zero result needs no explanation", code: "retry_unavailable" }, { status: 409 });
@@ -116,9 +98,12 @@ export async function completeExplanation(row: SubmissionRow, value: PublicScore
   const fixed = JSON.parse(row.result_json!) as PublicScoreResult;
   if (result.pinnedSha !== fixed.pinnedSha || result.pinnedSha !== snapshot.pinnedSha || !matchesFrozenResolution(row, result)
     || result.repoAssessment !== fixed.repoAssessment || result.total !== fixed.total || result.attackProbability !== fixed.attackProbability || result.attackScore !== fixed.attackScore
+    || result.eligibility !== fixed.eligibility
     || result.criteria.some((item) => !fixed.criteria.some((original) => original.key === item.key && original.score === item.score && original.label === item.label))) throw new Error("Explanation changed fixed scores");
   if (result.usage?.model !== "gpt-6-luna" || result.usage.decisionsModel !== "gpt-6-luna" || result.usage.explanationModel !== "gpt-6.1-sol"
     || result.criteria.some((item) => result.usage!.decisionsScores[item.key] !== item.score)) throw new Error("Explanation changed Decisions authority");
+  if (result.usage.fullSource !== fixed.usage?.fullSource || result.usage.sourceHash !== fixed.usage?.sourceHash
+    || result.usage.sourceFiles !== fixed.usage?.sourceFiles || result.usage.sourceBytes !== fixed.usage?.sourceBytes) throw new Error("Explanation changed source authority");
   const now = new Date().toISOString();
   await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET result_json = ?, explanation_status = 'completed', status = 'completed', completed_at = ?, updated_at = ?, failure_message = NULL, outcome_json = ? WHERE id = ? AND event_id = ? AND callback_token = ? AND attempts = ? AND explanation_dispatches = ? AND explanation_status = 'processing' AND status = 'processing' AND result_json IS NOT NULL")
     .bind(JSON.stringify(result), now, now, JSON.stringify({ kind: "completed", result }), row.id, EVENT_ID, row.callback_token, row.attempts, row.explanation_dispatches).run();

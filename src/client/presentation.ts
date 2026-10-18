@@ -32,15 +32,16 @@ export type RevealAction = "begin" | "complete" | "back" | "restart";
 
 export function capturePresentation(items: readonly PresentationSource[], mode: "real" | "demo" = "real"): PresentationSnapshot {
   const production = items.filter((item) => item.mode === "production");
+  const eligible = production.filter((item) => item.result?.repoAssessment === "scored" && item.result.eligibility !== "no_implementation");
   let message = "10チームの発表を準備できます。";
   if (!production.length) message = "本番審査の提出がありません。";
   else if (production.some((item) => item.status === "failed" && !item.result)) message = "採点結果のない失敗した本番提出があります。";
   else if (production.some((item) => !item.result)) message = "登録済みの本番提出すべての採点確定を待っています。";
   else if (production.some((item) => !Number.isSafeInteger(item.result!.total) || item.result!.total % 2 !== 0 || item.result!.total < 0 || item.result!.total > 40)) message = "本番結果にルーブリックと一致しない総合点があります（0〜40点の偶数）。";
   else if (new Set(production.map((item) => item.id)).size !== production.length) message = "提出IDが重複しています。結果を確認してください。";
-  else if (production.length < 10) message = `採点済みの本番提出が10件必要です（現在${production.length}件）。`;
+  else if (eligible.length < 10) message = `選考対象の採点済み本番提出が10件必要です（現在${eligible.length}件）。`;
   const ready = message === "10チームの発表を準備できます。";
-  const sorted = production.filter((item) => item.result && Number.isFinite(item.result.total)).map((item, index) => ({ item, index })).sort((a, b) => b.item.result!.total - a.item.result!.total || a.index - b.index);
+  const sorted = eligible.filter((item) => Number.isFinite(item.result!.total)).map((item, index) => ({ item, index })).sort((a, b) => b.item.result!.total - a.item.result!.total || a.index - b.index);
   const entries: readonly PresentationEntry[] = Object.freeze(sorted.map(({ item, index }) => {
     const total = item.result!.total;
     return Object.freeze({

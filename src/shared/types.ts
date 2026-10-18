@@ -60,6 +60,10 @@ export interface ScoreItem {
 }
 
 export interface ScoreUsage {
+  fullSource?: true | undefined;
+  sourceFiles?: number | undefined;
+  sourceBytes?: number | undefined;
+  sourceHash?: string | undefined;
   model: string;
   explanationModel?: string;
   effort: "low" | "medium" | "high";
@@ -74,6 +78,7 @@ export interface ScoreUsage {
 }
 
 export interface PublicScoreResult {
+  eligibility?: "eligible" | "no_implementation" | undefined;
   reviewRequired?: boolean;
   summary: string;
   publicReason: string;
@@ -175,12 +180,20 @@ export interface RepoEvidenceFile {
 }
 
 export interface RepoEvidenceSnapshot {
+  fullSource?: true;
   repo: NormalizedRepo;
   pinnedSha: string | null;
   defaultBranch: string | null;
   summary: string;
   assessment: Exclude<RepoAssessmentKind, "retryable_failure" | "unjudgeable">;
   files: RepoEvidenceFile[];
+}
+
+export interface FullSourceMetadata {
+  fullSource: true;
+  sourceFiles: number;
+  sourceBytes: number;
+  sourceHash: string;
 }
 
 export interface BudgetReservationInput {

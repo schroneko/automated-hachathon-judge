@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { explanationModelResultSchema, explanationOutputSchema, normalizeGitHubRepoUrl, parseScoringCallbackBody, validatePublicScoreResult } from "../src/shared/validation";
+import { explanationModelResultSchema, explanationOutputSchema, implementationEligibility, normalizeGitHubRepoUrl, parseScoringCallbackBody, prepareFullSourceSnapshot, validatePublicScoreResult } from "../src/shared/validation";
+import { MAX_EVIDENCE_FILES, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_TOTAL_BYTES, MAX_SNAPSHOT_SERIALIZED_BYTES } from "../src/shared/constants";
+import type { RepoEvidenceSnapshot } from "../src/shared/types";
+import { createHash } from "node:crypto";
 import { SCORE_LEVELS } from "../src/shared/rubric";
 
 describe("normalizeGitHubRepoUrl", () => {
@@ -38,6 +41,13 @@ describe("validatePublicScoreResult", () => {
     expect(validatePublicScoreResult({ ...valid(), attackProbability: 0.8, attackScore: 80 }).attackScore).toBe(80);
   });
 
+  it("accepts a deep source path within the snapshot path capacity", () => {
+    const path = `${"nested/".repeat(80)}main.ts`;
+    const result = valid();
+    result.criteria[0].evidencePaths = [path];
+    expect(validatePublicScoreResult(result, new Set([path, "src/main.ts"])).criteria[0]?.evidencePaths).toEqual([path]);
+  });
+
   it("accepts only the six final score levels and keeps Decisions scores fractional", () => {
     for (const score of SCORE_LEVELS) {
       const result = valid();
@@ -68,7 +78,7 @@ describe("validatePublicScoreResult", () => {
     expect(() => explanationModelResultSchema.parse(model)).toThrow();
     expect(explanationOutputSchema.required).toContain("reviewRequired");
     expect(explanationModelResultSchema.parse({ ...model, reviewRequired: true }).reviewRequired).toBe(true);
-    for (const field of ["attackScore", "attackProbability", "usage"]) {
+    for (const field of ["attackScore", "attackProbability", "usage", "eligibility"]) {
       expect(() => explanationModelResultSchema.parse({ ...model, reviewRequired: false, [field]: 0 })).toThrow();
     }
   });
@@ -84,6 +94,22 @@ describe("validatePublicScoreResult", () => {
     expect(() => validatePublicScoreResult({ ...result, reviewRequired: "true" })).toThrow();
     expect(() => validatePublicScoreResult({ ...result, usage: { ...result.usage, explanationModel: "" } })).toThrow();
     expect(() => validatePublicScoreResult({ ...result, usage: { ...result.usage, requestIds: ["1", "2", "3"] } })).toThrow();
+  });
+
+  it("keeps historical rows readable and requires any new full-source metadata as one complete group", () => {
+    const usage = {
+      model: "gpt-6-luna", effort: "medium", decisionsModel: "gpt-6-luna", inputTokens: 100, outputTokens: 0, costUsd: 0.00001,
+      decisionsScores: { technical: 6, ux: 6, impact: 6, idea: 6 }, requestIds: ["paid-id"]
+    };
+    expect(validatePublicScoreResult({ ...valid(), usage }).usage?.sourceHash).toBeUndefined();
+    const metadata = { fullSource: true, sourceFiles: 1, sourceBytes: 0, sourceHash: "a".repeat(64) };
+    expect(validatePublicScoreResult({ ...valid(), eligibility: "eligible", usage: { ...usage, ...metadata } })).toMatchObject({ eligibility: "eligible", usage: metadata });
+    for (const field of Object.keys(metadata)) {
+      expect(() => validatePublicScoreResult({ ...valid(), usage: { ...usage, ...metadata, [field]: undefined } })).toThrow();
+    }
+    for (const malformed of [{ fullSource: false }, { sourceFiles: -1 }, { sourceBytes: MAX_EVIDENCE_TOTAL_BYTES + 1 }, { sourceHash: "invalid" }]) {
+      expect(() => validatePublicScoreResult({ ...valid(), usage: { ...usage, ...metadata, ...malformed } })).toThrow();
+    }
   });
 
   it("rejects malformed optional usage metadata in callbacks", () => {
@@ -150,6 +176,113 @@ describe("validatePublicScoreResult", () => {
         ]
       })
     ).toThrow(/zero scores/);
+  });
+});
+
+function sourceFile(path: string, content = "") {
+  return { path, content, size: new TextEncoder().encode(content).length, truncated: false };
+}
+
+function fullSnapshot(files = [sourceFile("src/main.ts", "export const main = 1;")]): RepoEvidenceSnapshot {
+  return {
+    repo: normalizeGitHubRepoUrl("https://github.com/demo/project"),
+    assessment: "scored", pinnedSha: "a".repeat(40), defaultBranch: "main", summary: "source",
+    files, fullSource: true
+  };
+}
+
+describe("prepareFullSourceSnapshot", () => {
+  it("canonicalizes only whitelisted fields and hashes the entire stable serialization", async () => {
+    const source = fullSnapshot([sourceFile("z.unknown", "あ\n\"tail\""), sourceFile("a.txt")]);
+    const prepared = await prepareFullSourceSnapshot(source);
+    const reordered = { fullSource: true as const, files: [...source.files].reverse(), summary: source.summary,
+      pinnedSha: source.pinnedSha, defaultBranch: source.defaultBranch, assessment: source.assessment,
+      repo: { canonicalUrl: source.repo.canonicalUrl, normalized: source.repo.normalized, repo: source.repo.repo, owner: source.repo.owner, ignored: "untrusted" },
+      ignored: "untrusted" };
+    expect(await prepareFullSourceSnapshot(reordered)).toEqual(prepared);
+    expect(JSON.parse(prepared.serialized)).toEqual({ ...source, files: [...source.files].reverse() });
+    expect(prepared.metadata).toEqual({ fullSource: true, sourceFiles: 2, sourceBytes: 10, sourceHash: createHash("sha256").update(prepared.serialized).digest("hex") });
+    for (const variant of [
+      { ...source, summary: "different" }, { ...source, pinnedSha: "b".repeat(40) },
+      { ...source, files: [sourceFile("z.unknown", "あ\n\"TAIL\""), sourceFile("a.txt")] }
+    ]) expect((await prepareFullSourceSnapshot(variant)).metadata.sourceHash).not.toBe(prepared.metadata.sourceHash);
+    expect(source.files[0]?.path).toBe("z.unknown");
+  });
+
+  it("includes empty UTF-8 files and accepts inclusive file and byte capacities", async () => {
+    const files = Array.from({ length: MAX_EVIDENCE_FILES }, (_, index) => sourceFile(`${index}.txt`));
+    expect((await prepareFullSourceSnapshot(fullSnapshot(files))).metadata).toMatchObject({ sourceFiles: 2000, sourceBytes: 0 });
+    const content = "a".repeat(MAX_EVIDENCE_FILE_BYTES);
+    expect((await prepareFullSourceSnapshot(fullSnapshot([sourceFile("large.ts", content)]))).metadata.sourceBytes).toBe(MAX_EVIDENCE_TOTAL_BYTES);
+    await expect(prepareFullSourceSnapshot(fullSnapshot([]))).rejects.toThrow(/at least one source file/);
+  });
+
+  it("normalizes a zero assessment without the full-source marker", async () => {
+    const source = { ...fullSnapshot([]), assessment: "missing_or_private" as const, pinnedSha: null, defaultBranch: null };
+    delete source.fullSource;
+    const prepared = await prepareFullSourceSnapshot(source);
+    expect(JSON.parse(prepared.serialized).fullSource).toBe(true);
+    expect(prepared.metadata).toMatchObject({ fullSource: true, sourceFiles: 0, sourceBytes: 0 });
+  });
+
+  it.each(["/absolute.ts", "../escape.ts", "src/../escape.ts", "./main.ts", "a//b.ts", "C:\\main.ts", "a\\b.ts", "a\0b.ts", "a\nb.ts", "a\u202eb.ts", "a/", "a./b.ts", "con.ts"])("rejects unsafe path %j", async (path) => {
+    await expect(prepareFullSourceSnapshot(fullSnapshot([sourceFile(path, "x")]))).rejects.toThrow(/path/);
+  });
+
+  it("rejects partial, malformed, duplicate, and noncanonical snapshots", async () => {
+    const source = fullSnapshot();
+    for (const invalid of [
+      { ...source, fullSource: undefined },
+      { ...source, files: [{ ...source.files[0]!, truncated: true }] },
+      { ...source, files: [{ ...source.files[0]!, size: -1 }] },
+      { ...source, files: [sourceFile("main.ts", "\ud800")] },
+      { ...source, files: [sourceFile("main.ts", "a\0b")] },
+      { ...source, files: [sourceFile("same.ts"), sourceFile("same.ts")] },
+      { ...source, repo: { ...source.repo, canonicalUrl: "https://evil.test/demo/project" } },
+      { ...source, repo: { ...source.repo, normalized: "other/repo" } },
+      { ...source, pinnedSha: "main" }, { ...source, defaultBranch: "" },
+      { ...source, assessment: "empty_repository" },
+      { ...source, files: Array.from({ length: MAX_EVIDENCE_FILES + 1 }, (_, index) => sourceFile(`${index}.txt`)) },
+      { ...source, files: [sourceFile("large.ts", "a".repeat(MAX_EVIDENCE_FILE_BYTES + 1))] },
+      { ...source, files: [sourceFile("large.ts", "a".repeat(MAX_EVIDENCE_FILE_BYTES)), sourceFile("other.ts", "a")] }
+    ]) await expect(prepareFullSourceSnapshot(invalid as RepoEvidenceSnapshot)).rejects.toThrow();
+  });
+
+  it("enforces the 4MiB serialized bound after JSON escaping", async () => {
+    const source = fullSnapshot([sourceFile("escape.ts", "\n".repeat(MAX_SNAPSHOT_SERIALIZED_BYTES / 2))]);
+    expect(source.files[0]!.size).toBeLessThan(MAX_EVIDENCE_TOTAL_BYTES);
+    await expect(prepareFullSourceSnapshot(source)).rejects.toThrow(/serialized/);
+  });
+});
+
+describe("implementationEligibility", () => {
+  it.each([
+    ["README.md", "```ts\nexport const app = 1\n```", "no_implementation"],
+    ["README.ts", "export const app = 1", "no_implementation"],
+    ["docs/demo.ts", "export const app = 1", "no_implementation"],
+    ["config/main.py", "print(1)", "no_implementation"],
+    ["settings/main.py", "print(1)", "no_implementation"],
+    ["vite.config.ts", "export default {}", "no_implementation"],
+    [".eslintrc.js", "module.exports = {}", "no_implementation"],
+    [".storybook/main.ts", "export default {}", "no_implementation"],
+    ["build.gradle.kts", "plugins {}", "no_implementation"],
+    ["package.json", "{}", "no_implementation"],
+    ["notes.txt", "print(1)", "no_implementation"],
+    ["main.ts", "  \n", "no_implementation"],
+    ["main.ts", "export const app = 1", "eligible"],
+    ["index.html", "<main>Hello</main>", "eligible"],
+    ["style.css", "body { color: red; }", "eligible"],
+    ["tests/main.test.ts", "test('works', () => expect(1).toBe(1))", "eligible"],
+    ["examples/main.py", "print(1)", "eligible"],
+    ["bin/run", "#!/usr/bin/env bash\necho yes", "eligible"],
+    ["bin/run", "#!/usr/bin/env bash\n# instructions", "no_implementation"],
+    ["notebook.ipynb", JSON.stringify({ cells: [{ cell_type: "code", source: ["print(1)\n"] }] }), "eligible"],
+    ["notebook.ipynb", JSON.stringify({ cells: [{ cell_type: "code", source: "print(1)" }] }), "eligible"],
+    ["notebook.ipynb", JSON.stringify({ cells: [{ cell_type: "markdown", source: ["print(1)"] }] }), "no_implementation"],
+    ["notebook.ipynb", JSON.stringify({ cells: [{ cell_type: "code", source: [" \n"] }] }), "no_implementation"],
+    ["notebook.ipynb", "not JSON", "no_implementation"]
+  ])("classifies %s without imposing semantic score rules", (path, content, eligibility) => {
+    expect(implementationEligibility(fullSnapshot([sourceFile(path, content)]))).toBe(eligibility);
   });
 });
 

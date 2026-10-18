@@ -1,5 +1,6 @@
 import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, TARGET_TEAMS } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
+import { calculateUsageCost, quoteReservation } from "../shared/pricing";
 import { validatePublicScoreResult } from "../shared/validation";
 import { createBatch, frozenBarrier, getBatch, listBatches, retryBatch } from "./batches";
 import { matchesFrozenResolution, retryExplanation } from "./explanations";
@@ -243,6 +244,7 @@ async function listSubmissions(env: Env): Promise<PublicSubmissionRecord[]> {
 async function ranking(env: Env): Promise<RankingEntry[]> {
   const rows = await env.JUDGE_DB.prepare(`SELECT ${PUBLIC_SUBMISSION_COLUMNS} FROM devday_judge_submissions WHERE event_id = ? AND mode = 'production' AND result_json IS NOT NULL`).bind(EVENT_ID).all<PublicSubmissionRow>();
   const scored = rows.results.map((row) => ({ row, result: JSON.parse(row.result_json!) as PublicScoreResult }))
+    .filter(({ result }) => result.repoAssessment === "scored" && result.eligibility !== "no_implementation")
     .sort((a, b) => b.result.total - a.result.total || a.row.created_at.localeCompare(b.row.created_at) || a.row.id.localeCompare(b.row.id));
   const cutoffScore = scored.length >= FINALIST_COUNT ? scored[FINALIST_COUNT - 1]!.result.total : null;
   const crossesCutoff = cutoffScore !== null && scored.filter((entry) => entry.result.total >= cutoffScore).length > FINALIST_COUNT;
@@ -409,11 +411,9 @@ export async function reserve(request: Request, env: Env): Promise<Response> {
     if (!object(value) || !shortString(value.submissionId, 100) || !shortString(value.callbackToken, 100) || !shortString(value.reservationId, 100) || !object(value.reservation)) throw new Error("Invalid reservation");
     const reservation = value.reservation;
     if (value.explanationDispatch !== undefined && (!Number.isSafeInteger(value.explanationDispatch) || Number(value.explanationDispatch) < 1 || Number(value.explanationDispatch) > 3)) throw new Error("Invalid explanation dispatch");
-    if (!validModel(reservation.kind, reservation.model) || !safeCount(reservation.maxInputTokens) || reservation.maxInputTokens >= 272_000 || !safeCount(reservation.maxOutputTokens) || !positiveMoney(reservation.reservedUsd)) throw new Error("Invalid reservation");
+    if (!validModel(reservation.kind, reservation.model) || !safeCount(reservation.maxInputTokens) || !safeCount(reservation.maxOutputTokens) || !positiveMoney(reservation.reservedUsd)) throw new Error("Invalid reservation");
     if (reservation.kind === "decisions" && reservation.maxOutputTokens !== 0) throw new Error("Decisions must reserve zero output tokens");
-    const required = reservation.kind === "decisions"
-      ? reservation.maxInputTokens * 0.1 / 1_000_000
-      : (reservation.maxInputTokens * 2.5 + reservation.maxOutputTokens * 10) / 1_000_000;
+    const required = quoteReservation(reservation as unknown as BudgetReservationInput);
     if (micro(reservation.reservedUsd) < micro(required)) throw new Error("Reservation is below the maximum call cost");
     input = { submissionId: value.submissionId, callbackToken: value.callbackToken, reservationId: value.reservationId, reservation: reservation as unknown as BudgetReservationInput, ...(value.explanationDispatch === undefined ? {} : { explanationDispatch: Number(value.explanationDispatch) }) };
   } catch (error) {
@@ -475,10 +475,8 @@ export async function settle(request: Request, env: Env): Promise<Response> {
   if (reservation.kind !== input.usage.kind || reservation.model !== input.usage.model) return jsonResponse({ error: "Usage conflict" }, { status: 409 });
   if (input.usage.inputTokens > reservation.max_input_tokens || input.usage.outputTokens > reservation.max_output_tokens) return jsonResponse({ error: "Usage exceeds reserved token limits" }, { status: 409 });
   const actual = micro(input.usage.costUsd);
-  const cacheWrite = input.usage.cacheWriteInputTokens ?? 0;
-  const expectedCost = input.usage.kind === "decisions"
-    ? input.usage.inputTokens * 0.1 / 1_000_000
-    : ((input.usage.inputTokens - input.usage.cachedInputTokens - cacheWrite) * 2 + input.usage.cachedInputTokens * 0.1 + cacheWrite * 2.5 + input.usage.outputTokens * 10) / 1_000_000;
+  let expectedCost: number;
+  try { expectedCost = calculateUsageCost(input.usage); } catch (error) { return invalid(error); }
   if (actual < micro(expectedCost)) return jsonResponse({ error: "Usage cost is below the recorded token cost" }, { status: 409 });
   if (actual > reservation.reserved_micro_usd || input.usage.costUsd > reservation.reserved_micro_usd / 1_000_000) return jsonResponse({ error: "Usage exceeds reservation" }, { status: 409 });
   const usageJson = JSON.stringify(input.usage);
@@ -500,7 +498,13 @@ export async function settle(request: Request, env: Env): Promise<Response> {
 }
 
 function micro(amount: number): number {
-  return Math.ceil(amount * 1_000_000);
+  const [coefficient, exponent = "0"] = amount.toString().toLowerCase().split("e");
+  const [whole = "0", fraction = ""] = coefficient!.split(".");
+  const digits = BigInt(whole + fraction);
+  const scale = 6 + Number(exponent) - fraction.length;
+  if (scale >= 0) return Number(digits * 10n ** BigInt(scale));
+  const divisor = 10n ** BigInt(-scale);
+  return Number((digits + divisor - 1n) / divisor);
 }
 
 function validModel(kind: unknown, model: unknown): boolean {

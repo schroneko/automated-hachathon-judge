@@ -2,15 +2,30 @@ import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CRITERIA, EVENT_ID } from "../src/shared/constants";
-import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, ScoringQueueMessage } from "../src/shared/types";
+import { implementationEligibility, prepareFullSourceSnapshot } from "../src/shared/validation";
+import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot, ScoringQueueMessage } from "../src/shared/types";
 import type { ScoringOptions } from "../src/container/scorer";
 import { processFreezeMessage } from "../src/worker/batches";
 
 const scorer = vi.hoisted(() => ({ scoreSubmissionDecisions: vi.fn(), explainScoredSnapshot: vi.fn() }));
 vi.mock("../src/container/scorer", () => ({
-  scoreSubmissionDecisions: async (job: LeaseJob, options: unknown) => {
-    const result = await scorer.scoreSubmissionDecisions(job, options);
-    return result && "snapshot" in result ? result : { result, snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored", files: [{ path: "README.md", size: 8, content: "evidence", truncated: false }] } };
+  scoreSubmissionDecisions: async (job: LeaseJob, options: ScoringOptions) => {
+    const snapshot: RepoEvidenceSnapshot = { fullSource: true, repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored", files: [{ path: "README.md", size: 8, content: "evidence", truncated: false }, { path: "src/main.ts", size: 8, content: "export{}", truncated: false }] };
+    let saved = false;
+    let measured = false;
+    const beforeSnapshot = async (value: RepoEvidenceSnapshot) => {
+      if (!measured) {
+        options.onSnapshotBytes?.(new TextEncoder().encode((await prepareFullSourceSnapshot(value)).serialized).byteLength);
+        measured = true;
+      }
+      await options.beforeSnapshot?.(value);
+      saved = true;
+    };
+    const result = await scorer.scoreSubmissionDecisions(job, { ...options, beforeSnapshot, beforeCall: async (value) => { if (!saved) await beforeSnapshot(snapshot); return options.beforeCall?.(value); } });
+    const scored = result && "snapshot" in result ? result : { result, snapshot };
+    if (!saved) await beforeSnapshot(scored.snapshot);
+    const prepared = await prepareFullSourceSnapshot(scored.snapshot);
+    return { ...scored, result: { ...scored.result, eligibility: implementationEligibility(scored.snapshot), ...(scored.result?.usage ? { usage: { ...scored.result.usage, ...prepared.metadata } } : {}) } };
   },
   explainScoredSnapshot: scorer.explainScoredSnapshot
 }));
@@ -19,6 +34,7 @@ vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async ()
 import { callback, handleApiRequest } from "../src/worker/api";
 import type { SubmissionRow } from "../src/worker/api";
 import { processExplanationMessage, processScoringMessage } from "../src/worker/queue";
+import { loadEvidenceSnapshot } from "../src/worker/evidence-store";
 import worker from "../src/worker/index";
 
 class SqliteD1 {
@@ -478,6 +494,46 @@ describe("two-stage judging pipeline", () => {
     }));
   });
 
+  it("keeps eight small-source model calls concurrent in both queues with memory admission enabled", async () => {
+    const { env, create, sent, explanations } = setup();
+    function barrier() {
+      let count = 0;
+      let ready!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { ready = resolve; });
+      const waiting = new Promise<void>((resolve) => { release = resolve; });
+      return { started, release, get count() { return count; }, async wait() { if (++count === 8) ready(); await waiting; } };
+    }
+    async function allStarted(gate: ReturnType<typeof barrier>, consumers: Promise<void>[]) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([gate.started, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Eight model calls did not start concurrently")), 1500); })]);
+        expect(gate.count).toBe(8);
+      } finally {
+        clearTimeout(timer);
+        gate.release();
+        await Promise.all(consumers);
+      }
+    }
+    const scoring = barrier();
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: LeaseJob, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
+      await scoring.wait();
+      return score();
+    });
+    for (let index = 0; index < 8; index++) await create(`parallel-small-${index}`);
+    await allStarted(scoring, sent.map((message) => processScoringMessage(message, env)));
+    expect(explanations).toHaveLength(8);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    const reasons = barrier();
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+      await reasons.wait();
+      return explained(fixed);
+    });
+    await allStarted(reasons, explanations.map((message) => processExplanationMessage(message, env)));
+  });
+
   it("publishes fixed ranking before reasons and preflights only the model for each independent queue", async () => {
     const { env, database, create, sent, explanations, api } = setup();
     const created = await create("early-ranking");
@@ -498,7 +554,8 @@ describe("two-stage judging pipeline", () => {
     const ack = vi.fn();
     await worker.queue({ messages: [{ body: explanations[0], ack }] } as unknown as MessageBatch<ExplanationQueueMessage>, env, {} as ExecutionContext);
     expect(ack).toHaveBeenCalledOnce();
-    expect(scorer.explainScoredSnapshot).toHaveBeenCalledWith(JSON.parse(row.evidence_snapshot_json!), JSON.parse(row.decisions_result_json!), expect.objectContaining({ effort: "medium" }));
+    expect(row.evidence_snapshot_json).toBeNull();
+    expect(scorer.explainScoredSnapshot).toHaveBeenCalledWith(await loadEvidenceSnapshot(row, env), JSON.parse(row.decisions_result_json!), expect.objectContaining({ effort: "medium" }));
     expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "completed", scored_at: row.scored_at, frozen_at: row.frozen_at, callback_token: row.callback_token });
     expect((JSON.parse(database.row(created.id).result_json!) as PublicScoreResult).usage).toMatchObject({ model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol" });
     expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
@@ -525,7 +582,7 @@ describe("two-stage judging pipeline", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
-  it.each(["sha", "scores", "assessment", "probability", "attack", "keys", "evidence", "model"])("rejects explanation mutation of %s while retaining scores and rank", async (field) => {
+  it.each(["sha", "scores", "assessment", "probability", "attack", "keys", "evidence", "model", "eligibility", "source"])("rejects explanation mutation of %s while retaining scores and rank", async (field) => {
     const { env, database, create, sent, explanations, api } = setup();
     scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult) => {
       const result = explained(fixed);
@@ -537,15 +594,18 @@ describe("two-stage judging pipeline", () => {
       if (field === "keys") result.criteria[0]!.key = "ux";
       if (field === "evidence") result.criteria[0]!.evidencePaths = ["not-collected.ts"];
       if (field === "model") result.usage!.model = "gpt-6.1-sol";
+      if (field === "eligibility") result.eligibility = "no_implementation";
+      if (field === "source") result.usage!.sourceHash = "0".repeat(64);
       return result;
     });
     const created = await create(`fixed-${field}`);
     await processScoringMessage(sent[0], env);
+    const original = JSON.parse(database.row(created.id).result_json!);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
     await processExplanationMessage(explanations[0], env);
     const row = database.row(created.id);
     expect(row).toMatchObject({ status: "completed", explanation_status: "failed", pinned_sha: "a".repeat(40) });
-    expect(JSON.parse(row.result_json!)).toEqual({ ...score(), reviewRequired: true });
+    expect(JSON.parse(row.result_json!)).toEqual({ ...original, reviewRequired: true });
     expect(row.failure_message).toContain("Scores are retained");
     expect(await (await api("/api/ranking")).json()).toMatchObject({ items: [{ total: 32, pinnedSha: "a".repeat(40) }] });
     const before = database.changes();
@@ -641,26 +701,136 @@ describe("two-stage judging pipeline", () => {
   it("persists a maximum escaped snapshot internally without the callback body limit or public source leakage", async () => {
     const { env, database, create, sent, explanations, api } = setup();
     scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob) => ({
-      result: score(), snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
-        files: Array.from({ length: 10 }, (_, index) => ({ path: `source-${index}.ts`, size: 12_000, content: "\u0000".repeat(12_000), truncated: false })) }
+      result: score(), snapshot: { fullSource: true, repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
+        files: Array.from({ length: 10 }, (_, index) => ({ path: `source-${index}.ts`, size: 12_000, content: "\u0001".repeat(12_000), truncated: false })) }
     }));
     const created = await create("snapshot-size");
     await processScoringMessage(sent[0], env);
     const row = database.row(created.id);
     expect(row).toMatchObject({ status: "processing", explanation_status: "pending" });
-    expect(new TextEncoder().encode(row.evidence_snapshot_json!).byteLength).toBeGreaterThan(700_000);
-    expect(new TextEncoder().encode(row.evidence_snapshot_json!).byteLength).toBeLessThan(850_000);
+    expect(row.evidence_snapshot_json).toBeNull();
+    const manifest = database.db.prepare("SELECT byte_count, chunk_count, complete FROM devday_judge_evidence_manifests WHERE submission_id = ?").get(created.id);
+    expect(manifest).toMatchObject({ byte_count: expect.any(Number), chunk_count: 2, complete: 1 });
+    expect(Number(manifest!.byte_count)).toBeGreaterThan(700_000);
     expect(explanations).toHaveLength(1);
     const publicText = await (await api(`/api/results/${created.id}`)).text();
     expect(publicText).not.toContain("source-0.ts");
     expect(publicText.length).toBeLessThan(10_000);
+    const prepare = vi.spyOn(database, "prepare");
+    for (const path of ["/api/dashboard", "/api/ranking", "/api/recent", `/api/submissions/${created.id}`, `/api/batches/${row.batch_id}`]) {
+      const response = await api(path);
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      for (const secret of ["source-0.ts", "evidence_snapshot_json", "callback_token", "devday_judge_evidence", String(row.callback_token)]) expect(body).not.toContain(secret);
+    }
+    for (const [sql] of prepare.mock.calls) {
+      expect(sql).not.toContain("devday_judge_evidence");
+      if (sql.includes("FROM devday_judge_submissions")) {
+        expect(sql).not.toContain("SELECT *");
+        expect(sql).not.toContain("callback_token");
+        expect(sql).not.toContain("evidence_snapshot_json");
+      }
+    }
   });
 
-  it("rejects more than 120000 UTF8 evidence bytes without persisting or enqueueing the score", async () => {
+  it("blocks Decisions reservation and billing when the evidence batch fails", async () => {
+    const { env, database, create, sent, explanations } = setup();
+    const created = await create("evidence-write-failure");
+    database.db.exec("CREATE TRIGGER reject_evidence BEFORE INSERT ON devday_judge_evidence_chunks BEGIN SELECT RAISE(ABORT, 'evidence unavailable'); END");
+    let paidCalls = 0;
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: LeaseJob, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
+      paidCalls++;
+      return score();
+    });
+    await processScoringMessage(sent[0], env);
+    expect(paidCalls).toBe(0);
+    expect(database.row(created.id)).toMatchObject({ status: "failed", result_json: null, evidence_snapshot_json: null, explanation_dispatches: 0 });
+    expect(database.db.prepare("SELECT COUNT(*) AS n FROM devday_judge_evidence_manifests").get()!.n).toBe(0);
+    expect(database.db.prepare("SELECT COUNT(*) AS n FROM devday_judge_evidence_chunks").get()!.n).toBe(0);
+    expect(database.db.prepare("SELECT COUNT(*) AS n FROM devday_judge_budget_reservations").get()!.n).toBe(0);
+    expect(explanations).toHaveLength(0);
+  });
+
+  it.each(["GitHub evidence exceeds total byte capacity", "API request exceeds conservative input or context token bound"])("reports %s as a complete-source capacity failure without paid calls", async (failure) => {
+    const { env, database, create, sent, explanations } = setup();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    scorer.scoreSubmissionDecisions.mockRejectedValue(new Error(failure));
+    const created = await create("full-source-capacity");
+    await processScoringMessage(sent[0], env);
+    expect(database.row(created.id)).toMatchObject({ status: "failed", result_json: null, failure_message: "全文の容量が審査上限を超えています。要確認です。ソースは途中で切らず、採点を停止しました。" });
+    expect(database.db.prepare("SELECT COUNT(*) AS n FROM devday_judge_budget_reservations").get()!.n).toBe(0);
+    expect(explanations).toHaveLength(0);
+    expect(JSON.parse(String(log.mock.calls[0]![0]))).toMatchObject({ diagnostic: "Full repository evidence exceeds configured source or context capacity" });
+  });
+
+  it("keeps untrusted upload-pack diagnostic details out of logs", async () => {
+    const { env, create, sent } = setup();
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    scorer.scoreSubmissionDecisions.mockRejectedValue(new Error("GitHub upload-pack returned an unexpected content type PRIVATE_UPSTREAM_BODY"));
+    await create("sanitized-upload-pack");
+    await processScoringMessage(sent[0], env);
+    expect(JSON.parse(String(log.mock.calls[0]![0]))).toMatchObject({ diagnostic: "GitHub upload-pack validation failed" });
+    expect(JSON.stringify(log.mock.calls)).not.toContain("PRIVATE_UPSTREAM_BODY");
+  });
+
+  it("retains Decisions points for README-only evidence while excluding it from ranking", async () => {
+    const { env, database, create, sent, api } = setup();
+    scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob) => ({ result: score(), snapshot: {
+      fullSource: true, repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
+      files: [{ path: "README.md", size: 8, content: "evidence", truncated: false }]
+    } }));
+    const created = await create("readme-only");
+    await processScoringMessage(sent[0], env);
+    expect(JSON.parse(database.row(created.id).result_json!)).toMatchObject({ total: 32, eligibility: "no_implementation" });
+    expect(await (await api("/api/ranking")).json()).toEqual({ items: [] });
+  });
+
+  it("keeps legacy inline snapshots readable but refuses explanation retries and queued model work", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create("legacy-inline-evidence");
+    await processScoringMessage(sent[0], env);
+    const row = database.row(created.id);
+    const snapshot = await loadEvidenceSnapshot(row, env);
+    database.db.exec("DELETE FROM devday_judge_evidence_chunks");
+    database.db.exec("DELETE FROM devday_judge_evidence_manifests");
+    database.db.prepare("UPDATE devday_judge_submissions SET evidence_snapshot_json = ? WHERE id = ?").run(JSON.stringify(snapshot), created.id);
+    expect((await loadEvidenceSnapshot(database.row(created.id), env))?.fullSource).toBeUndefined();
+    vi.mocked(fetch).mockClear();
+    await processExplanationMessage(explanations[0], env);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    const before = database.changes();
+    const response = await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "explanation_snapshot_missing" });
+    expect(database.changes()).toBe(before);
+    expect(JSON.parse(database.row(created.id).result_json!)).toMatchObject({ total: 32, reviewRequired: true });
+  });
+
+  it("rejects damaged stored chunks before model lookup or explanation billing and preserves fixed points", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create("damaged-evidence");
+    await processScoringMessage(sent[0], env);
+    database.db.exec("UPDATE devday_judge_evidence_chunks SET content = zeroblob(length(content))");
+    vi.mocked(fetch).mockClear();
+    await processExplanationMessage(explanations[0], env);
+    expect(fetch).not.toHaveBeenCalled();
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "failed" });
+    expect(JSON.parse(database.row(created.id).result_json!)).toMatchObject({ total: 32, reviewRequired: true });
+    const before = database.changes();
+    const retry = await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true });
+    expect(retry.status).toBe(409);
+    expect(await retry.json()).toMatchObject({ code: "explanation_snapshot_missing" });
+    expect(database.changes()).toBe(before);
+  });
+
+  it("rejects more than 3MiB UTF8 evidence bytes without persisting or enqueueing the score", async () => {
     const { env, database, create, sent, explanations } = setup();
     scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob) => ({
-      result: score(), snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
-        files: Array.from({ length: 11 }, (_, index) => ({ path: `source-${index}.ts`, size: 12_000, content: "あ".repeat(4000), truncated: false })) }
+      result: score(), snapshot: { fullSource: true, repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
+        files: Array.from({ length: 2 }, (_, index) => ({ path: `source-${index}.ts`, size: 1_800_000, content: "あ".repeat(600_000), truncated: false })) }
     }));
     const created = await create("snapshot-overflow");
     await processScoringMessage(sent[0], env);
@@ -672,6 +842,7 @@ describe("two-stage judging pipeline", () => {
     const { env, database, create, sent, explanations, api } = setup();
     const created = await create("late-explanation-charge");
     await processScoringMessage(sent[0], env);
+    const original = JSON.parse(database.row(created.id).result_json!);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
     let release!: () => void;
     let started!: () => void;
@@ -700,7 +871,7 @@ describe("two-stage judging pipeline", () => {
     await oldConsumer;
     expect(database.account("production")).toMatchObject({ spent_micro_usd: 300, reserved_micro_usd: 0 });
     expect(database.row(created.id)).toMatchObject({ explanation_status: "pending", explanation_dispatches: 2, completed_at: null });
-    expect(JSON.parse(database.row(created.id).result_json!)).toEqual(score());
+    expect(JSON.parse(database.row(created.id).result_json!)).toEqual(original);
     expect(database.db.prepare("SELECT status, actual_micro_usd FROM devday_judge_budget_reservations").get()).toEqual({ status: "settled", actual_micro_usd: 300 });
   });
 

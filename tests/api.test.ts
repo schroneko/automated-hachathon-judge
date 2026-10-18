@@ -420,6 +420,28 @@ describe("D1 runtime API", () => {
     expect(body.cutoff).toEqual({ score: 10, tied: true, tiedCount: 2 });
   });
 
+  it("excludes no_implementation from ranking and cutoff while preserving its stored points and history", async () => {
+    const { call, database } = setup();
+    const ids: string[] = [];
+    for (let index = 0; index < 14; index++) {
+      await submit(call, `eligibility-${index}`);
+      const job = (await claim(call))!;
+      ids.push(job.submissionId);
+      const result = index >= 11 ? { ...score(0), repoAssessment: ["empty_repository", "missing_or_private", "no_default_branch"][index - 11] }
+        : { ...score(index === 0 ? 40 : 20), eligibility: index === 0 ? "no_implementation" : "eligible" };
+      database.db.prepare("UPDATE devday_judge_submissions SET result_json = ?, status = 'completed' WHERE id = ?").run(JSON.stringify(result), job.submissionId);
+    }
+    const before = database.changes();
+    const dashboard = await (await call("/api/dashboard")).json() as { ranking: Array<{ submissionId: string; total: number; rank: number }>; cutoff: { score: number } };
+    expect(dashboard.ranking).toHaveLength(10);
+    expect(dashboard.ranking.every((item) => item.total === 20 && item.rank === 1)).toBe(true);
+    expect(dashboard.ranking.map((item) => item.submissionId)).not.toContain(ids[0]);
+    expect(dashboard.cutoff.score).toBe(20);
+    expect(await (await call(`/api/results/${ids[0]}`)).json()).toMatchObject({ result: { total: 40, eligibility: "no_implementation" } });
+    expect((await (await call("/api/recent")).json() as { items: unknown[] }).items).toHaveLength(14);
+    expect(database.changes()).toBe(before);
+  });
+
   it("accepts concurrent identical callbacks and settlements exactly once", async () => {
     const { call, database } = setup();
     await submit(call, "concurrent");
@@ -456,6 +478,41 @@ describe("D1 runtime API", () => {
     expect(database.changes()).toBe(before);
     expect((await call("/internal/budget/settle", "POST", { ...ownership, usage }, true)).status).toBe(200);
     expect(database.account("production")).toMatchObject({ spent_micro_usd: 277, reserved_micro_usd: 0 });
+  });
+
+  it("preserves exact shared-pricing microdollars through reservation and settlement", async () => {
+    const { call, database } = setup();
+    await submit(call, "exact-micro-pricing");
+    const job = (await claim(call))!;
+    const ownership = { submissionId: job.submissionId, callbackToken: job.callbackToken, reservationId: "exact-micro" };
+    const reservation = { kind: "decisions", model: "gpt-6-luna", maxInputTokens: 1230, maxOutputTokens: 0, reservedUsd: 0.000123 };
+    expect((await call("/internal/budget/reserve", "POST", { ...ownership, reservation })).status).toBe(201);
+    expect(database.account("production").reserved_micro_usd).toBe(123);
+    const usage = { kind: "decisions", model: "gpt-6-luna", inputTokens: 1230, outputTokens: 0, cachedInputTokens: 0, costUsd: 0.000123 };
+    expect((await call("/internal/budget/settle", "POST", { ...ownership, usage })).status).toBe(200);
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 123, reserved_micro_usd: 0 });
+  });
+
+  it("prices long input reservations and cached usage through the shared model bounds", async () => {
+    const { call, database } = setup();
+    await submit(call, "long-pricing");
+    const job = (await claim(call))!;
+    const ownership = { submissionId: job.submissionId, callbackToken: job.callbackToken };
+    const reservation = { kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 600_000, maxOutputTokens: 1000, reservedUsd: 3.015 };
+    const before = database.changes();
+    for (const invalid of [{ ...reservation, reservedUsd: 1.51 }, { ...reservation, maxInputTokens: 922_001 }, { ...reservation, maxOutputTokens: 128_001 }]) {
+      expect((await call("/internal/budget/reserve", "POST", { ...ownership, reservationId: "invalid-long", reservation: invalid })).status).toBe(400);
+    }
+    expect(database.changes()).toBe(before);
+    expect((await call("/internal/budget/reserve", "POST", { ...ownership, reservationId: "long-responses", reservation })).status).toBe(201);
+    const usage = { kind: "responses", model: "gpt-6.1-sol", inputTokens: 600_000, outputTokens: 1000, cachedInputTokens: 100_000, cacheWriteInputTokens: 50_000, costUsd: 2.085 };
+    expect((await call("/internal/budget/settle", "POST", { ...ownership, reservationId: "long-responses", usage: { ...usage, costUsd: 1.045 } })).status).toBe(409);
+    expect((await call("/internal/budget/settle", "POST", { ...ownership, reservationId: "long-responses", usage })).status).toBe(200);
+    const decisions = { kind: "decisions", model: "gpt-6-luna", maxInputTokens: 600_000, maxOutputTokens: 0, reservedUsd: 0.12 };
+    expect((await call("/internal/budget/reserve", "POST", { ...ownership, reservationId: "long-decisions", reservation: { ...decisions, reservedUsd: 0.06 } })).status).toBe(400);
+    expect((await call("/internal/budget/reserve", "POST", { ...ownership, reservationId: "long-decisions", reservation: decisions })).status).toBe(201);
+    expect((await call("/internal/budget/settle", "POST", { ...ownership, reservationId: "long-decisions", usage: { kind: "decisions", model: "gpt-6-luna", inputTokens: 600_000, outputTokens: 0, cachedInputTokens: 0, costUsd: 0.12 } })).status).toBe(200);
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 2_205_000, reserved_micro_usd: 0 });
   });
 
   it("blocks new billable reservations when the runner is disabled and still accepts charged usage", async () => {

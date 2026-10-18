@@ -316,6 +316,8 @@ function needsOrganizerReview(item: Submission): boolean {
   return Number.isFinite(parsedAt) && Date.now() - parsedAt > 30 * 60 * 1000;
 }
 function statusLabel(item: Submission): string {
+  if (item.result?.eligibility === "no_implementation") return "実装ファイルなし・選考対象外";
+  if (item.result && item.result.repoAssessment !== "scored") return "選考対象外";
   const stage = explanationState(item);
   if (explanationStale(item)) return "採点済み・理由を要確認";
   if (stage) return { pending: "採点済み・理由待ち", processing: "採点済み・理由生成中", completed: "採点済み・理由完了", failed: "理由を要確認" }[stage];
@@ -766,6 +768,11 @@ function detail(
   const stages = document.createElement("dl");
   stages.className = "metadata";
   stages.innerHTML = `<div><dt>採点確定日時</dt><dd>${date(item.scoredAt ?? null)}</dd></div><div><dt>採点モデル</dt><dd>${esc(result?.usage?.decisionsModel || result?.usage?.model || "gpt-6-luna")}</dd></div><div><dt>理由生成</dt><dd>${explanation ? esc(statusLabel(item)) : "採点後に開始"}（GPT-6.1 Sol）</dd></div>`;
+  if (result?.usage?.fullSource) {
+    const coverage = document.createElement("div");
+    coverage.innerHTML = `<dt>評価したソース</dt><dd>対象テキスト全文・${esc(result.usage.sourceFiles ?? 0)}ファイル・${esc(((result.usage.sourceBytes ?? 0) / 1024).toFixed(1))}KB</dd>`;
+    stages.append(coverage);
+  }
   el<HTMLElement>("detail").append(stages);
   extra.innerHTML = `${metadata.submittedAt ? `<div><dt>提出日時</dt><dd>${esc(formatTimestampJst(metadata.submittedAt))}</dd></div>` : ""}${metadata.frozenAt ? `<div><dt>ソース版固定日時</dt><dd>${esc(formatTimestampJst(metadata.frozenAt))}</dd></div>` : ""}${metadata.pinnedSha && /^[a-fA-F0-9]{40}$/.test(metadata.pinnedSha) ? `<div><dt>固定済みSHA</dt><dd class="sha">${esc(metadata.pinnedSha)}</dd></div>` : ""}`;
   el<HTMLElement>("detail").append(extra);

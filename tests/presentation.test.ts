@@ -31,6 +31,18 @@ describe("presentation snapshot readiness", () => {
     expect(snapshot.entries).toHaveLength(10);
     expect(capturePresentation([validation]).ready).toBe(false);
   });
+  it("excludes README-only and unavailable repositories even when they have higher scores", () => {
+    const readmeOnly = item(30, 40);
+    readmeOnly.result!.eligibility = "no_implementation";
+    const unavailable = item(31, 40);
+    unavailable.result!.repoAssessment = "missing_or_private";
+    const snapshot = capturePresentation([...teams(), readmeOnly, unavailable]);
+    expect(snapshot.ready).toBe(true);
+    expect(snapshot.entries).toHaveLength(10);
+    expect(selectPresentation(snapshot).order.some((entry) => entry.id === readmeOnly.id || entry.id === unavailable.id)).toBe(false);
+    expect(readmeOnly.result!.total).toBe(40);
+    expect(capturePresentation([...teams(9), readmeOnly]).ready).toBe(false);
+  });
   it.each(["queued", "processing", "completed", "failed"] as const)("blocks any registered %s production entry without a score", (status) => {
     const snapshot = capturePresentation([...teams(), { ...item(11), status, result: null }]);
     expect(snapshot.ready).toBe(false);

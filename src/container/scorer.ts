@@ -1,9 +1,10 @@
-import { CRITERIA, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_FILES, MAX_EVIDENCE_TOTAL_BYTES } from "../shared/constants";
+import { CRITERIA } from "../shared/constants";
 import { visibleAttackScore, validateAttackProbability } from "../shared/attack-score";
 import { buildDecisionsQuestions, buildExplanationPrompt, DECISION_SCORE_LEVELS } from "../shared/prompt";
 import { DEVDAY_REFERENCE_VERSION } from "../shared/devday-reference";
 import { RUBRIC_VERSION } from "../shared/rubric";
-import { explanationModelResultSchema, explanationOutputSchema, validatePublicScoreResult } from "../shared/validation";
+import { explanationModelResultSchema, explanationOutputSchema, implementationEligibility, prepareFullSourceSnapshot, validatePublicScoreResult } from "../shared/validation";
+import { calculateUsageCost, MAX_MODEL_INPUT_TOKENS, MODEL_CONTEXT_TOKENS, quoteReservation } from "../shared/pricing";
 import type { ApiReservation, ApiUsage, CriterionKey, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot } from "../shared/types";
 import { fetchRepoEvidence, resolveRepoEvidence, RetryableGithubError, zeroResultForAssessment } from "./github";
 
@@ -14,6 +15,8 @@ export interface ScoringOptions {
   apiKey?: string;
   trustedFeatureReference?: string;
   fetch?: typeof globalThis.fetch;
+  onSnapshotBytes?: (serializedBytes: number) => void;
+  beforeSnapshot?: (snapshot: RepoEvidenceSnapshot) => Promise<void>;
   beforeCall?: (reservation: ApiReservation) => Promise<string | void>;
   afterCall?: (usage: ApiUsage) => Promise<void>;
 }
@@ -23,7 +26,6 @@ export class RetryableScoringError extends Error {}
 const DECISIONS_MODEL = "gpt-6-luna";
 const RESPONSES_MODEL = "gpt-6.1-sol";
 const TIMEOUT_MS = 180_000;
-const MAX_INPUT_TOKENS = 272_000;
 
 export async function scoreSubmissionDecisions(job: LeaseJob, options: ScoringOptions = {}): Promise<{ result: PublicScoreResult; snapshot: RepoEvidenceSnapshot }> {
   let snapshot: RepoEvidenceSnapshot;
@@ -54,14 +56,21 @@ export async function scoreSubmissionDecisions(job: LeaseJob, options: ScoringOp
     }
     throw error;
   }
-  const result = await scoreSnapshotWithDecisions(snapshot, { ...options, effort: options.effort ?? (job.mode === "validation" ? job.effort ?? "low" : "medium") });
-  return { result, snapshot };
+  return scoreCanonicalSnapshot(snapshot, { ...options, effort: options.effort ?? (job.mode === "validation" ? job.effort ?? "low" : "medium") });
 }
 
 export async function scoreSnapshotWithDecisions(snapshot: RepoEvidenceSnapshot, options: ScoringOptions = {}): Promise<PublicScoreResult> {
-  assertSnapshotAuthority(snapshot);
+  return (await scoreCanonicalSnapshot(snapshot, options)).result;
+}
+
+async function scoreCanonicalSnapshot(source: RepoEvidenceSnapshot, options: ScoringOptions): Promise<{ result: PublicScoreResult; snapshot: RepoEvidenceSnapshot }> {
+  const prepared = await prepareFullSourceSnapshot(source);
+  options.onSnapshotBytes?.(new TextEncoder().encode(prepared.serialized).byteLength);
+  const snapshot: RepoEvidenceSnapshot = JSON.parse(prepared.serialized);
+  const eligibility = implementationEligibility(snapshot);
   if (snapshot.assessment !== "scored") {
-    return validatePublicScoreResult(zeroResultForAssessment(snapshot));
+    await options.beforeSnapshot?.(JSON.parse(prepared.serialized));
+    return { snapshot, result: validatePublicScoreResult({ ...zeroResultForAssessment(snapshot), eligibility }) };
   }
 
   const { key, effort } = scoringSettings(options);
@@ -69,12 +78,28 @@ export async function scoreSnapshotWithDecisions(snapshot: RepoEvidenceSnapshot,
   const questions = buildDecisionsQuestions(options.trustedFeatureReference);
   const decisionsBody = {
     model: DECISIONS_MODEL,
-    input: JSON.stringify(snapshot),
+    input: prepared.serialized,
     questions
   };
-  const decisionsCall = await callApi("decisions", decisionsBody, 0, key, fetcher, options);
+  const maxInputTokens = await countInput({
+    model: DECISIONS_MODEL,
+    input: [
+      { role: "developer", content: JSON.stringify(questions) },
+      { role: "user", content: prepared.serialized }
+    ]
+  }, 0, key, fetcher);
+  const future = explanationBody(snapshot, {
+    repoAssessment: snapshot.assessment,
+    pinnedSha: snapshot.pinnedSha,
+    criteria: CRITERIA.map(({ key, label }) => ({ key, label, score: 10 })),
+    total: 40
+  }, options.trustedFeatureReference, effort);
+  await countInput({ model: RESPONSES_MODEL, input: future.input }, future.max_output_tokens, key, fetcher);
+  await options.beforeSnapshot?.(JSON.parse(prepared.serialized));
+  const decisionsCall = await callApi("decisions", decisionsBody, maxInputTokens, 0, key, fetcher, options);
   const signals = parseDecisions(decisionsCall.body);
-  return validatePublicScoreResult({
+  const result = validatePublicScoreResult({
+    eligibility,
     summary: "採点が完了しました。採点理由を生成中です。",
     publicReason: "Decisionsによる点数が確定しました。採点理由を生成中です。",
     repoAssessment: "scored",
@@ -90,6 +115,7 @@ export async function scoreSnapshotWithDecisions(snapshot: RepoEvidenceSnapshot,
     attackProbability: signals.attackProbability,
     attackScore: visibleAttackScore(signals.attackProbability),
     usage: {
+      ...prepared.metadata,
       model: DECISIONS_MODEL,
       effort,
       decisionsModel: DECISIONS_MODEL,
@@ -102,6 +128,7 @@ export async function scoreSnapshotWithDecisions(snapshot: RepoEvidenceSnapshot,
       requestIds: decisionsCall.usage.requestId ? [decisionsCall.usage.requestId] : []
     }
   });
+  return { result, snapshot };
 }
 
 export async function explainScoredSnapshot(
@@ -109,18 +136,25 @@ export async function explainScoredSnapshot(
   fixedResult: PublicScoreResult,
   options: ScoringOptions = {}
 ): Promise<PublicScoreResult> {
-  assertSnapshotAuthority(snapshot);
+  const prepared = await prepareFullSourceSnapshot(snapshot);
+  snapshot = JSON.parse(prepared.serialized) as RepoEvidenceSnapshot;
   const fixed = validatePublicScoreResult(fixedResult, new Set(snapshot.files.map((file) => file.path)));
   if (fixed.repoAssessment !== snapshot.assessment || fixed.pinnedSha !== snapshot.pinnedSha) {
     throw new Error("Fixed assessment or pinned SHA does not match the snapshot");
   }
-  if (snapshot.assessment !== "scored") return fixed;
+  const eligibility = implementationEligibility(snapshot);
+  if (snapshot.assessment !== "scored") return { ...fixed, eligibility };
+  if (fixed.eligibility !== eligibility) throw new Error("Fixed eligibility does not match the snapshot");
   const prior = fixed.usage;
   if (!prior || prior.model !== DECISIONS_MODEL || prior.decisionsModel !== DECISIONS_MODEL
     || prior.explanationModel !== undefined || prior.outputTokens !== 0 || prior.requestIds.length > 1
     || fixed.attackProbability === undefined
     || fixed.criteria.some((item) => prior.decisionsScores[item.key] !== item.score)) {
     throw new Error("Fixed scores must match authoritative Decisions usage");
+  }
+  if (prior.fullSource !== true || prior.sourceFiles !== prepared.metadata.sourceFiles
+    || prior.sourceBytes !== prepared.metadata.sourceBytes || prior.sourceHash !== prepared.metadata.sourceHash) {
+    throw new Error("Fixed Decisions full-source metadata does not match the snapshot; partial snapshots cannot be retried");
   }
   const { key, effort } = scoringSettings({ ...options, effort: options.effort ?? prior.effort });
   const fixedScores = {
@@ -129,20 +163,11 @@ export async function explainScoredSnapshot(
     criteria: fixed.criteria.map(({ key, label, score }) => ({ key, label, score })),
     total: fixed.total
   };
-  const prompt = buildExplanationPrompt(options.trustedFeatureReference);
-  const outputCap = effort === "low" ? 6000 : effort === "medium" ? 8192 : 12000;
-  const responsesBody = {
-    model: RESPONSES_MODEL,
-    reasoning: { effort },
-    max_output_tokens: outputCap,
-    store: false,
-    input: [
-      { role: "developer", content: prompt },
-      { role: "user", content: JSON.stringify({ snapshot, fixedScores }) }
-    ],
-    text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }
-  };
-  const responsesCall = await callApi("responses", responsesBody, outputCap, key, options.fetch ?? globalThis.fetch, options);
+  const responsesBody = explanationBody(snapshot, fixedScores, options.trustedFeatureReference, effort);
+  const outputCap = responsesBody.max_output_tokens;
+  const fetcher = options.fetch ?? globalThis.fetch;
+  const maxInputTokens = await countInput({ model: RESPONSES_MODEL, input: responsesBody.input }, outputCap, key, fetcher);
+  const responsesCall = await callApi("responses", responsesBody, maxInputTokens, outputCap, key, fetcher, options);
   const modelResult = parseResponseResult(responsesCall.body);
   if (modelResult.repoAssessment !== fixed.repoAssessment || modelResult.pinnedSha !== fixed.pinnedSha
     || modelResult.total !== fixed.total
@@ -155,11 +180,15 @@ export async function explainScoredSnapshot(
   if (modelResult.criteria.some((item) => item.evidencePaths.length === 0) && !modelResult.reviewRequired) {
     throw new Error("Explanation without evidence requires reviewRequired");
   }
+  if (fixed.eligibility === "no_implementation" && fixed.total > 0 && !modelResult.reviewRequired) {
+    throw new Error("Explanation without implementation support requires reviewRequired");
+  }
   if (modelResult.criteria.some((item) => !/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u.test(item.reason))) {
     throw new Error("Explanation reasons must be Japanese");
   }
   const result: PublicScoreResult = {
     ...modelResult,
+    eligibility: fixed.eligibility,
     attackProbability: fixed.attackProbability,
     attackScore: fixed.attackScore,
     usage: {
@@ -168,7 +197,7 @@ export async function explainScoredSnapshot(
       explanationModel: RESPONSES_MODEL,
       inputTokens: prior.inputTokens + responsesCall.usage.inputTokens,
       outputTokens: prior.outputTokens + responsesCall.usage.outputTokens,
-      costUsd: ceilUsd(prior.costUsd + responsesCall.usage.costUsd),
+      costUsd: (Math.round(prior.costUsd * 1_000_000) + Math.round(responsesCall.usage.costUsd * 1_000_000)) / 1_000_000,
       requestIds: [...prior.requestIds, ...(responsesCall.usage.requestId ? [responsesCall.usage.requestId] : [])]
     }
   };
@@ -183,74 +212,66 @@ function scoringSettings(options: ScoringOptions) {
   return { key, effort };
 }
 
-function assertSnapshotAuthority(snapshot: RepoEvidenceSnapshot): void {
-  if (!snapshot || !snapshot.repo || !Array.isArray(snapshot.files)) {
-    throw new Error("Invalid repository snapshot");
+function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high") {
+  return {
+    model: RESPONSES_MODEL,
+    reasoning: { effort },
+    max_output_tokens: effort === "low" ? 6000 : effort === "medium" ? 8192 : 12000,
+    store: false,
+    input: [
+      { role: "developer", content: buildExplanationPrompt(reference) },
+      { role: "user", content: JSON.stringify({ snapshot, fixedScores }) }
+    ],
+    text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }
+  };
+}
+
+async function countInput(body: { model: string; input: Array<{ role: string; content: string }> }, outputCap: number, key: string, fetcher: typeof globalThis.fetch): Promise<number> {
+  const { data } = await requestApi("responses/input_tokens", body, key, fetcher);
+  if (data.error != null || data.refusal != null || data.incomplete_details != null
+    || (data.status !== undefined && data.status !== "completed")) throw new Error("Input token counter failed or was incomplete");
+  if (data.model !== undefined && data.model !== body.model) throw new Error("Input token counter returned an unexpected model");
+  const actual = nonnegativeInteger(data.input_tokens);
+  if (actual === 0) throw new Error("Input token counter must return a positive token count");
+  const bound = Number((BigInt(actual) * 105n + 99n) / 100n + 8192n);
+  if (!Number.isSafeInteger(bound) || bound > MAX_MODEL_INPUT_TOKENS || bound + outputCap > MODEL_CONTEXT_TOKENS) {
+    throw new Error("API request exceeds conservative input or context token bound");
   }
-  const { owner, repo, normalized, canonicalUrl } = snapshot.repo;
-  if (!/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+$/.test(repo)
-    || normalized !== `${owner.toLowerCase()}/${repo.toLowerCase()}`
-    || canonicalUrl !== `https://github.com/${owner}/${repo}`) {
-    throw new Error("Invalid canonical repository identity");
-  }
-  if (snapshot.assessment !== "scored") {
-    if (!["empty_repository", "missing_or_private", "no_default_branch"].includes(snapshot.assessment) || snapshot.files.length !== 0) {
-      throw new Error("Non-scored snapshot must contain no files");
-    }
-    return;
-  }
-  if (!snapshot.pinnedSha || !/^[0-9a-f]{40}$/.test(snapshot.pinnedSha)
-    || !snapshot.defaultBranch || !snapshot.defaultBranch.trim()) {
-    throw new Error("Scored snapshot requires a valid pinned SHA and branch");
-  }
-  if (snapshot.files.length === 0 || snapshot.files.length > MAX_EVIDENCE_FILES) {
-    throw new Error("Scored snapshot requires bounded file evidence");
-  }
-  const seen = new Set<string>();
-  let total = 0;
-  for (const file of snapshot.files) {
-    if (!file.path || seen.has(file.path) || typeof file.content !== "string" || typeof file.truncated !== "boolean") {
-      throw new Error("Invalid snapshot evidence file");
-    }
-    seen.add(file.path);
-    const size = new TextEncoder().encode(file.content).byteLength;
-    if (size === 0 || size > MAX_EVIDENCE_FILE_BYTES || file.size !== size) {
-      throw new Error("Snapshot file byte limit exceeded");
-    }
-    total += size;
-  }
-  if (total > MAX_EVIDENCE_TOTAL_BYTES) {
-    throw new Error("Snapshot total byte limit exceeded");
-  }
+  return bound;
 }
 
 async function callApi(
   kind: "decisions" | "responses",
   body: object,
+  maxInputTokens: number,
   maxOutputTokens: number,
   apiKey: string,
   fetcher: typeof globalThis.fetch,
   options: ScoringOptions
 ): Promise<{ body: Record<string, unknown>; usage: ApiUsage }> {
-  const payload = JSON.stringify(body);
-  const maxInputTokens = new TextEncoder().encode(payload).byteLength + 4096;
-  if (maxInputTokens >= MAX_INPUT_TOKENS) {
-    throw new Error("API request exceeds short-context input bound");
-  }
   const model = kind === "decisions" ? DECISIONS_MODEL : RESPONSES_MODEL;
-  const reservedUsd = ceilUsd(kind === "decisions"
-    ? maxInputTokens * 0.1 / 1_000_000
-    : (maxInputTokens * 2.5 + maxOutputTokens * 10) / 1_000_000);
+  const reservedUsd = quoteReservation({ kind, model, maxInputTokens, maxOutputTokens });
   const reservationId = await options.beforeCall?.({ kind, model, maxInputTokens, maxOutputTokens, reservedUsd });
+  const { data, requestId } = await requestApi(kind, body, apiKey, fetcher);
+  if (data.model !== model) throw new Error("OpenAI returned an unexpected model");
+  const usage = parseUsage(kind, data.usage, requestId, reservationId);
+  if (usage.inputTokens > maxInputTokens || usage.outputTokens > maxOutputTokens || usage.costUsd > reservedUsd) {
+    throw new Error("API usage exceeded reserved token or cost bounds");
+  }
+  await options.afterCall?.(usage);
+  return { body: data, usage };
+}
+
+async function requestApi(path: string, body: object, apiKey: string, fetcher: typeof globalThis.fetch): Promise<{ data: Record<string, unknown>; requestId: string | null }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
   let response: Response;
   let raw: unknown;
   try {
-    response = await fetcher(`https://api.openai.com/v1/${kind}`, {
+    response = await fetcher(`https://api.openai.com/v1/${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
-      body: payload,
+      body: JSON.stringify(body),
       signal: controller.signal
     });
     if (!response.ok) {
@@ -269,16 +290,7 @@ async function callApi(
   } finally {
     clearTimeout(timer);
   }
-  const data = record(raw);
-  if (data.model !== model) {
-    throw new Error("OpenAI returned an unexpected model");
-  }
-  const usage = parseUsage(kind, data.usage, response.headers.get("x-request-id"), reservationId);
-  if (usage.inputTokens > maxInputTokens || usage.outputTokens > maxOutputTokens) {
-    throw new Error("API usage exceeded reserved token bounds");
-  }
-  await options.afterCall?.(usage);
-  return { body: data, usage };
+  return { data: record(raw), requestId: response.headers.get("x-request-id") };
 }
 
 function parseUsage(kind: "decisions" | "responses", input: unknown, requestId: string | null, reservationId: string | void): ApiUsage {
@@ -297,12 +309,11 @@ function parseUsage(kind: "decisions" | "responses", input: unknown, requestId: 
   if (cachedInputTokens + cacheWriteInputTokens > inputTokens) {
     throw new Error("Cached and cache-write tokens exceed total input tokens");
   }
-  const costUsd = ceilUsd(kind === "decisions"
-    ? inputTokens * 0.1 / 1_000_000
-    : ((inputTokens - cachedInputTokens - cacheWriteInputTokens) * 2 + cachedInputTokens * 0.1 + cacheWriteInputTokens * 2.5 + outputTokens * 10) / 1_000_000);
+  const model = kind === "decisions" ? DECISIONS_MODEL : RESPONSES_MODEL;
+  const costUsd = calculateUsageCost({ kind, model, inputTokens, outputTokens, cachedInputTokens, cacheWriteInputTokens });
   return {
     kind,
-    model: kind === "decisions" ? DECISIONS_MODEL : RESPONSES_MODEL,
+    model,
     ...(typeof reservationId === "string" ? { reservationId } : {}),
     inputTokens,
     outputTokens,
@@ -432,8 +443,4 @@ function nonnegativeInteger(input: unknown): number {
     throw new Error("API usage contains an invalid token count");
   }
   return value;
-}
-
-function ceilUsd(value: number): number {
-  return Math.ceil(value * 1_000_000 - 1e-9) / 1_000_000;
 }

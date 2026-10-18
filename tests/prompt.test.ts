@@ -34,7 +34,8 @@ describe("PROMPT_INJECTION_BOUNDARY", () => {
         expect(question.instructions).toContain("0 as the lowest level");
         expect(question.instructions).toContain("A technical 0 does not cap other axes");
         expect(question.instructions).toContain("For UX infer from source without claiming live observation");
-        expect(question.instructions).toContain("Omitted or truncated files do not prove");
+        expect(question.instructions).toContain("Every positive level on ALL four axes requires actual pinned implementation evidence");
+        expect(question.instructions).toContain("without summaries or truncation");
       }
     }
   });
@@ -47,7 +48,8 @@ describe("PROMPT_INJECTION_BOUNDARY", () => {
     expect(prompt).toContain("DO NOT invent a rationale or change the score");
     expect(prompt).toContain("Any criterion with no evidencePaths requires reviewRequired true");
     expect(prompt).toContain("reviewRequired is a required boolean");
-    expect(prompt).toContain("Omitted or truncated collected files do not prove");
+    expect(prompt).toContain("Every positive level on ALL four axes requires actual pinned implementation evidence");
+    expect(prompt).toContain("without summaries or truncation");
     expect(prompt).toContain("A technical score of 0 does not cap another axis");
     expect(prompt).toContain("infer usability from source only");
     expect(prompt).toContain("specific unmet condition of the next level");
@@ -55,6 +57,7 @@ describe("PROMPT_INJECTION_BOUNDARY", () => {
       for (const { score, description } of rubricLevels(key)) {
         expect(SCORE_LEVELS).toContain(score);
         expect(prompt).toContain(`${score}: ${description}`);
+        if (score > 0) expect(description).toContain("固定コミットの実装ソースによる根拠が必須");
       }
     }
   });

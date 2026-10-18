@@ -48,9 +48,11 @@ op run --environment "$OP_ENVIRONMENT_ID" -- node -e 'console.log(Boolean(proces
 
 点数と攻撃判定はDecisions APIの `gpt-6-luna`、理由生成はResponses APIの `gpt-6.1-sol` です。理由の推論強度は本番medium、検証lowが既定です。検証区分ではmediumとhighも選べます。各段階で必要なモデルの利用権限を確認します。理由生成は点数を変更できません。
 
-画面、Decisions API、最終採点は [同じルーブリック](../src/shared/rubric.ts) を使います。版は `2026-10-18-v1`、各観点は `0 / 2 / 4 / 6 / 8 / 10`、合計40点です。各段階の全条件に照らし、根拠と次の段階に不足する条件を確認します。
+画面、Decisions API、理由生成は [同じルーブリック](../src/shared/rubric.ts) を使います。版は `2026-10-18-v2`、各観点は `0 / 2 / 4 / 6 / 8 / 10`、合計40点です。各段階の全条件に照らし、実装の根拠と次の段階に不足する条件を確認します。実装ファイルのない提出は選考対象外です。
 
-GitHubの公開refs広告からdefault branchとSHAを固定し、treeのREST取得は1試行につき1回です。GitHub tokenや、会場端末のGitHub CLI認証は使いません。RESTのrate limitに達した場合は失敗を確認し、制限解除後に主催者が再試行します。
+GitHubの公開refs広告からdefault branchとSHAを固定し、[Gitの部分取得](https://git-scm.com/docs/gitprotocol-capabilities)で不要物を除いた対象テキストを全文読みます。参加者のGit属性や除外設定で実装を隠せないよう、アーカイブを使わず元のblobを取得します。匿名REST APIのIP共有クォータに依存せず、GitHub tokenや、会場端末のGitHub CLI認証は使いません。両APIに同じ全文を渡し、公式トークン計数で容量を検証します。取得の失敗やサイズ上限は未実装の0点と混同せず、要確認で停止します。修復後の再試行も同じSHAと全文hashを保持します。
+
+全文は最大4MiBを512KiBずつD1へ分割保存します。公開後の検証では512KiBを超える実証拠の保存・復元と、理由生成での同一hashの再利用も確認します。
 
 空のQueueで採点処理は起動しません。常駐ポーリング、定期heartbeat、定期再採点はありません。
 

@@ -8,7 +8,7 @@ Workersで画面とAPIを提供し、既存の共有D1 `wordplay-arcade-budget` 
 
 採点Queue `devday-judge-20261018` と理由生成Queue `devday-judge-explanations-20261018` に審査ID等の有限メッセージを送り、Workerのconsumerで処理します。Decisionsの点数を先に保存し、Solの理由生成が採点の進行を占有しません。ブラウザを閉じても処理が続きます。Durable ObjectsとBrowser Renderingは使用しません。旧Durable Objectのmigration履歴と拒否用classだけを保持します。
 
-公開Git smart HTTP refs広告でdefault branchとSHAを固定し、recursive treeのREST取得を1試行につき1回に抑えます。refsは最大256KB、tree応答は最大2MB、証拠は最大24ファイル・各12KB・合計120KBです。GitHub token、対象コードの実行、リンク巡回は不要です。
+公開Git smart HTTP refs広告でdefault branchとSHAを固定し、部分取得でcommit・treeと必要なblobを読みます。匿名REST APIのIP共有クォータには依存しません。refsは最大256KB、PACKは圧縮16MiB・展開32MiB・単一オブジェクト4MiB・50,000エントリーです。不要物を除いた対象UTF-8テキストを最大2,000ファイル・合計3MiBで全文取得します。途中切りや参加者の除外設定は使いません。GitHub token、対象コードの実行、リンク巡回は不要です。
 
 画面のログインやトークン入力はありません。採点キーは既存1Password Environmentの `OPENAI_API_KEY_20261018_HACKATHON` をWorker secretへ非表示のpipeで設定済みです。ブラウザへ渡しません。
 
@@ -23,6 +23,7 @@ Workersで画面とAPIを提供し、既存の共有D1 `wordplay-arcade-budget` 
 | コミット固定Queue送信 | batchにつき最大3回、合計最大240件 |
 | Consumer | 両Queueともbatch 1、最大同時8件、自動再試行0 |
 | GitHub取得 | 1試行につき全体45秒 |
+| 固定証拠 | 最大4MiB、512KiBずつ最大8分割。各提出で1個を再利用 |
 | OpenAI採点 | 各API呼び出し最大180秒 |
 | OpenAI費用 | 予約を含め本番$90、検証$20 |
 | Queue保持 | Workers Freeの24時間 |
@@ -32,7 +33,9 @@ Queueの通常配信は書き込み・読み取り・削除で1通あたり3操�
 
 変更のないリクエスト、空のキュー、重複登録、処理済みメッセージの重複配信は書き込み0件です。常駐ポーリング、定期heartbeat、Cronはありません。再試行で過去の精算や未確定の費用予約を消さず、同じ区分の上限へ含めます。登録上限・送信上限・試行上限・費用予約・停止フラグをテストしてから公開します。
 
-本番はSolのmedium、検証はlowが既定で、検証区分ではmediumとhighも選べます。ルーブリック `2026-10-18-v1` の `0 / 2 / 4 / 6 / 8 / 10` を画面と両APIで共有し、根拠と次の段階に不足する条件を示します。
+本番はSolのmedium、検証はlowが既定で、検証区分ではmediumとhighも選べます。ルーブリック `2026-10-18-v2` の `0 / 2 / 4 / 6 / 8 / 10` を画面と両APIで共有し、実装の根拠と次の段階に不足する条件を示します。実装ファイルのない提出は選考対象外です。両モデルは同じSHA・同じ全文を読み、Solは点数を変更しません。
+
+採点前に公式APIで両モデルの入力トークンを計数します。入力上限922,000トークンと説明用の余裕を確認し、長文料金の割増を含めて予約します。容量不足は要確認として停止し、黙ってソースを切りません。
 
 料金・制限の確認元: [Queues pricing](https://developers.cloudflare.com/queues/platform/pricing/)、[Queues limits](https://developers.cloudflare.com/queues/platform/limits/)。
 

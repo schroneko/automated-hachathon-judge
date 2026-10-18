@@ -1,5 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
+import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CRITERIA, JUDGING_START_ISO, SUBMISSION_DEADLINE_ISO } from "../src/shared/constants";
 import { validatePublicScoreResult } from "../src/shared/validation";
@@ -7,6 +9,8 @@ import type { FreezeQueueMessage, JudgeQueueMessage, PublicBatchRecord, PublicSu
 import { callback, claimQueueMessage, handleApiRequest, reserve, settle } from "../src/worker/api";
 import { listBatches, processFreezeMessage } from "../src/worker/batches";
 import { processExplanationMessage, processScoringMessage } from "../src/worker/queue";
+import { loadEvidenceSnapshot } from "../src/worker/evidence-store";
+import type { SubmissionRow } from "../src/worker/api";
 import type { ExplanationQueueMessage } from "../src/shared/types";
 import { resolveRepoAuthority } from "../src/container/github";
 import worker from "../src/worker/index";
@@ -76,6 +80,45 @@ function setup() {
   const controls = () => messages.filter((message): message is FreezeQueueMessage => "type" in message);
   const scoring = () => messages.filter((message): message is ScoringQueueMessage => !("type" in message));
   return { database, env, messages, call, create, controls, scoring, onSend: (hook: typeof sendHook) => { sendHook = hook; } };
+}
+
+function sourceFixture(empty = false) {
+  const object = (type: number, name: string, data: Buffer) => ({ type, data, sha: createHash("sha1").update(`${name} ${data.length}\0`).update(data).digest("hex") });
+  const blob = object(3, "blob", Buffer.from("evidence"));
+  const tree = object(2, "tree", empty ? Buffer.alloc(0) : Buffer.concat([Buffer.from("100644 main.ts\0"), Buffer.from(blob.sha, "hex")]));
+  const commit = object(1, "commit", Buffer.from(`tree ${tree.sha}\nauthor Test <test@example.test> 1 +0000\ncommitter Test <test@example.test> 1 +0000\n\nfixture\n`));
+  const packet = (value: string) => (Buffer.byteLength(value) + 4).toString(16).padStart(4, "0") + value;
+  const refs = packet("# service=git-upload-pack\n") + "0000" + packet(`${commit.sha} HEAD\0filter shallow ofs-delta no-progress symref=HEAD:refs/heads/main\n`) + packet(`${commit.sha} refs/heads/main\n`) + "0000";
+  function response(url: string, body: BodyInit, mime: string) {
+    const result = new Response(body, { headers: { "content-type": mime } });
+    Object.defineProperty(result, "url", { value: url });
+    return result;
+  }
+  return {
+    sha: commit.sha,
+    fetch(url: string, init?: RequestInit) {
+      if (url.endsWith("/info/refs?service=git-upload-pack")) return response(url, refs, "application/x-git-upload-pack-advertisement");
+      if (!url.endsWith("/git-upload-pack")) throw new Error(`Unexpected fixture request: ${url}`);
+      const request = Buffer.from(init?.body as Uint8Array).toString();
+      const objects = request.includes("filter blob:none") ? [commit, tree] : [blob];
+      const header = Buffer.alloc(12);
+      header.write("PACK");
+      header.writeUInt32BE(2, 4);
+      header.writeUInt32BE(objects.length, 8);
+      const entries = objects.map(({ type, data }) => {
+        let remaining = Math.floor(data.length / 16);
+        const bytes = [(type << 4) | (data.length & 15) | (remaining ? 128 : 0)];
+        while (remaining) {
+          const byte = remaining & 127;
+          remaining = Math.floor(remaining / 128);
+          bytes.push(byte | (remaining ? 128 : 0));
+        }
+        return Buffer.concat([Buffer.from(bytes), deflateSync(data)]);
+      });
+      const pack = Buffer.concat([header, ...entries]);
+      return response(url, Buffer.concat([Buffer.from(packet("NAK\n")), pack, createHash("sha1").update(pack).digest()]), "application/x-git-upload-pack-result");
+    }
+  };
 }
 
 beforeEach(() => {
@@ -618,12 +661,15 @@ describe("freeze control and bounded recovery", () => {
 describe("backend compatibility", () => {
   it("runs real Decisions then reasons on a persisted snapshot with no GitHub reads during explanation", async () => {
     const { create, controls, scoring, call, env, database } = setup();
+    const prepare = vi.spyOn(database, "prepare");
+    const sourceWrites = () => prepare.mock.calls.filter(([sql]) => /^(?:INSERT INTO|UPDATE) devday_judge_evidence_/.test(sql)).length;
+    let fixedSourceWrites = 0;
     const demoUrl = "https://demo.example/never-fetch-or-score";
     const explanations: ExplanationQueueMessage[] = [];
     env.EXPLANATION_QUEUE = { send: async (message: ExplanationQueueMessage) => { explanations.push(message); } } as Queue<ExplanationQueueMessage>;
     env.OPENAI_API_KEY_20261018_HACKATHON = "local-fixture-key";
-    const packet = (value: string) => (new TextEncoder().encode(value).length + 4).toString(16).padStart(4, "0") + value;
-    const advertisement = packet("# service=git-upload-pack\n") + "0000" + packet(`${frozen.pinnedSha} HEAD\0multi_ack symref=HEAD:refs/heads/main\n`) + packet(`${frozen.pinnedSha} refs/heads/main\n`) + "0000";
+    const source = sourceFixture();
+    resolver.mockResolvedValue({ ...frozen, pinnedSha: source.sha });
     let explanationStage = false;
     const requests: string[] = [];
     vi.stubGlobal("fetch", vi.fn(async (input: string | URL, init?: RequestInit) => {
@@ -632,21 +678,24 @@ describe("backend compatibility", () => {
       expect(String(init?.body)).not.toContain(demoUrl);
       requests.push(url);
       if (url === "https://api.openai.com/v1/models") return Response.json({ data: [{ id: explanationStage ? "gpt-6.1-sol" : "gpt-6-luna" }] });
+      if (url === "https://api.openai.com/v1/responses/input_tokens") return Response.json({ input_tokens: 1000 });
       if (explanationStage) {
         expect(url).toBe("https://api.openai.com/v1/responses");
         const body = JSON.parse(String(init?.body));
         expect(body).toMatchObject({ model: "gpt-6.1-sol", reasoning: { effort: "medium" } });
         const evidence = JSON.parse(body.input[1].content);
-        expect(evidence.snapshot).toEqual(JSON.parse(String(database.rows()[0]!.evidence_snapshot_json)));
+        expect(evidence.snapshot).toEqual(await loadEvidenceSnapshot(database.rows()[0] as unknown as SubmissionRow, env));
         return Response.json({ model: "gpt-6.1-sol", status: "completed", usage: { input_tokens: 200, output_tokens: 50 },
           output: [{ type: "message", content: [{ type: "output_text", text: JSON.stringify({ ...evidence.fixedScores, summary: "保存した実装を確認しました", publicReason: "固定済みの評価を説明しました", reviewRequired: false,
-            criteria: evidence.fixedScores.criteria.map((criterion: Record<string, unknown>) => ({ ...criterion, reason: "README.mdの実装根拠を確認しました", evidencePaths: ["README.md"] })) }) }] }] });
+            criteria: evidence.fixedScores.criteria.map((criterion: Record<string, unknown>) => ({ ...criterion, reason: "main.tsの実装根拠を確認しました", evidencePaths: ["main.ts"] })) }) }] }] });
       }
-      if (url.includes("info/refs")) return new Response(advertisement, { headers: { "content-type": "application/x-git-upload-pack-advertisement" } });
-      if (url.includes("/git/trees/")) return Response.json({ truncated: false, tree: [{ path: "README.md", type: "blob", size: 8 }] });
-      if (url.startsWith("https://raw.githubusercontent.com/")) { expect(url).toContain(`/${frozen.pinnedSha}/`); return new Response("evidence"); }
+      if (url.startsWith("https://github.com/")) return source.fetch(url, init);
       expect(url).toBe("https://api.openai.com/v1/decisions");
       expect(JSON.parse(String(init?.body)).model).toBe("gpt-6-luna");
+      expect(database.db.prepare("SELECT complete FROM devday_judge_evidence_manifests").get()).toEqual({ complete: 1 });
+      expect(database.rows()[0]!.evidence_snapshot_json).toBeNull();
+      fixedSourceWrites = sourceWrites();
+      expect(fixedSourceWrites).toBeGreaterThan(0);
       return Response.json({ model: "gpt-6-luna", usage: { input_tokens: 100, output_tokens: 0 }, answers: [
         { type: "predicate", name: "prompt_injection", probability: 0.2 },
         ...CRITERIA.map(({ key }) => ({ type: "choice", name: key, choice: "8", confidence: 0.9, probabilities: [0, 2, 4, 6, 8, 10].map((value) => ({ value: String(value), probability: value === 8 ? 1 : 0 })) }))
@@ -663,42 +712,44 @@ describe("backend compatibility", () => {
     await processScoringMessage(scoring()[0], env);
     expect(await (await call("/api/dashboard")).json()).toMatchObject({ scoredCount: 1, counts: { processing: 1 }, ranking: [{ total: 32 }] });
     expect(database.rows()[0]).toMatchObject({ explanation_status: "pending", status: "processing" });
-    const snapshot = database.rows()[0]!.evidence_snapshot_json;
-    expect(String(snapshot)).not.toContain(demoUrl);
+    const snapshot = await loadEvidenceSnapshot(database.rows()[0] as unknown as SubmissionRow, env);
+    expect(database.rows()[0]!.evidence_snapshot_json).toBeNull();
+    expect(JSON.stringify(snapshot)).not.toContain(demoUrl);
     expect(JSON.stringify(explanations)).not.toContain(demoUrl);
     const firstRequests = requests.length;
     explanationStage = true;
     await processExplanationMessage(explanations[0], env);
-    expect(requests.slice(firstRequests)).toEqual(["https://api.openai.com/v1/models", "https://api.openai.com/v1/responses"]);
-    expect(database.rows()[0]).toMatchObject({ status: "completed", explanation_status: "completed", evidence_snapshot_json: snapshot });
+    expect(requests.slice(firstRequests)).toEqual(["https://api.openai.com/v1/models", "https://api.openai.com/v1/responses/input_tokens", "https://api.openai.com/v1/responses"]);
+    expect(database.rows()[0]).toMatchObject({ status: "completed", explanation_status: "completed", evidence_snapshot_json: null });
+    expect(await loadEvidenceSnapshot(database.rows()[0] as unknown as SubmissionRow, env)).toEqual(snapshot);
     const result = await (await call(`/api/results/${payload.submissions[0]!.id}`)).json() as PublicSubmissionRecord;
     expect(result.demoUrl).toBe(demoUrl);
-    expect(result.result).toMatchObject({ total: 32, pinnedSha: frozen.pinnedSha, attackProbability: 0.2, usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol" } });
+    expect(result.result).toMatchObject({ total: 32, pinnedSha: source.sha, eligibility: "eligible", attackProbability: 0.2, usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol", fullSource: true, sourceFiles: 1, sourceBytes: 8 } });
+    expect(result.result!.usage!.sourceHash).toBe(database.db.prepare("SELECT sha256 FROM devday_judge_evidence_manifests").get()!.sha256);
     expect(database.db.prepare("SELECT kind, status FROM devday_judge_budget_reservations ORDER BY kind").all()).toEqual([{ kind: "decisions", status: "settled" }, { kind: "responses", status: "settled" }]);
     expect(database.db.prepare("SELECT spent_micro_usd, reserved_micro_usd FROM devday_judge_budget_accounts WHERE mode = 'production'").get()).toMatchObject({ spent_micro_usd: 910, reserved_micro_usd: 0 });
+    expect(sourceWrites()).toBe(fixedSourceWrites);
   });
 
   it("accepts an empty Git tree at the frozen scored SHA in direct save and callback without allowing any other authority change", async () => {
     const { create, controls, scoring, call, env, database } = setup();
     env.OPENAI_API_KEY_20261018_HACKATHON = "local-fixture-key";
-    const packet = (value: string) => (new TextEncoder().encode(value).length + 4).toString(16).padStart(4, "0") + value;
-    const advertisement = packet("# service=git-upload-pack\n") + "0000" + packet(`${frozen.pinnedSha} HEAD\0multi_ack symref=HEAD:refs/heads/main\n`) + packet(`${frozen.pinnedSha} refs/heads/main\n`) + "0000";
-    const fetcher = vi.fn(async (input: string | URL) => {
+    const source = sourceFixture(true);
+    resolver.mockResolvedValue({ ...frozen, pinnedSha: source.sha });
+    const fetcher = vi.fn(async (input: string | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.endsWith("/v1/models")) return Response.json({ data: [{ id: "gpt-6-luna" }] });
-      if (url.includes("info/refs")) return new Response(advertisement, { headers: { "content-type": "application/x-git-upload-pack-advertisement" } });
-      expect(url).toContain(`/git/trees/${frozen.pinnedSha}?recursive=1`);
-      return Response.json({ truncated: false, tree: [] });
+      return source.fetch(url, init);
     });
     vi.stubGlobal("fetch", fetcher);
     const { payload } = await create(input(2));
     await processFreezeMessage(controls()[0]!, env);
     await processScoringMessage(scoring()[0], env);
-    expect(database.rows()[0]).toMatchObject({ pinned_sha: frozen.pinnedSha, status: "completed", explanation_status: "completed", explanation_dispatches: 0 });
-    expect(JSON.parse(String(database.rows()[0]!.result_json))).toMatchObject({ pinnedSha: frozen.pinnedSha, repoAssessment: "empty_repository", total: 0 });
+    expect(database.rows()[0]).toMatchObject({ pinned_sha: source.sha, status: "completed", explanation_status: "completed", explanation_dispatches: 0 });
+    expect(JSON.parse(String(database.rows()[0]!.result_json))).toMatchObject({ pinnedSha: source.sha, repoAssessment: "empty_repository", total: 0 });
     expect(fetcher).toHaveBeenCalledTimes(3);
     const job = (await claimQueueMessage(scoring()[1]!, env))!;
-    const zero = { summary: "empty", publicReason: "empty", repoAssessment: "empty_repository", pinnedSha: frozen.pinnedSha,
+    const zero = { summary: "empty", publicReason: "empty", repoAssessment: "empty_repository", pinnedSha: source.sha,
       criteria: CRITERIA.map((item) => ({ key: item.key, label: item.label, score: 0, reason: "empty", evidencePaths: [] })), total: 0, attackScore: null };
     const finalize = (result: unknown) => callback(new Request("https://internal.example", { method: "POST", body: JSON.stringify({ submissionId: job.submissionId, callbackToken: job.callbackToken, outcome: { kind: "completed", result } }) }), env);
     expect((await finalize({ ...zero, repoAssessment: "missing_or_private" })).status).toBe(400);
@@ -760,6 +811,11 @@ describe("backend compatibility", () => {
       const account = database.prepare("SELECT * FROM devday_judge_budget_accounts WHERE mode = 'production'").get()!;
       database.exec(readFileSync(new URL("../migrations/0006_two_stage_judging.sql", import.meta.url), "utf8"));
       expect(database.prepare("SELECT * FROM devday_judge_submissions").get()).toMatchObject({ ...previous, explanation_status: "completed", evidence_snapshot_json: null, decisions_result_json: null, scored_at: "completed", explanation_dispatches: 0, explanation_requested_at: null, explanation_started_at: null });
+      const beforeEvidence = database.prepare("SELECT * FROM devday_judge_submissions").get()!;
+      database.exec(readFileSync(new URL("../migrations/0008_full_source_evidence.sql", import.meta.url), "utf8"));
+      expect(database.prepare("SELECT * FROM devday_judge_submissions").get()).toEqual(beforeEvidence);
+      expect(database.prepare("SELECT COUNT(*) AS n FROM devday_judge_evidence_manifests").get()).toEqual({ n: 0 });
+      expect(database.prepare("SELECT COUNT(*) AS n FROM devday_judge_evidence_chunks").get()).toEqual({ n: 0 });
       expect(database.prepare("SELECT * FROM devday_judge_budget_reservations").get()).toEqual(reservation);
       expect(database.prepare("SELECT * FROM devday_judge_budget_accounts WHERE mode = 'production'").get()).toEqual(account);
       expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
