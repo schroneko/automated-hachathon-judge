@@ -178,7 +178,7 @@ root.innerHTML = `
               <span>1. 回答シートを貼り付け</span>
               <textarea id="batch" rows="7" placeholder="Google Forms の回答を見出し行ごと貼り付けてください"></textarea>
             </label>
-            <p class="note">最大30回答。提出日時・チーム名・GitHub リポジトリURL・デモURLを取り込み、メールや不要な列はブラウザ内で破棄します。GitHubの公開状態はサーバーで確認します。</p><p class="note">本番の提出締切: 10/18 17:15:00 日本時間（締切時刻を含む）。開始: 17:30 日本時間。全件のソース版を保存後、最大8並列で審査します。検証は今すぐ開始できます。</p><button id="import-review" type="button" class="subtle">2. 内容を確認</button>
+            <p class="note">最大30回答。提出日時・チーム名・GitHub リポジトリURL・デモURLを取り込み、メールや不要な列はブラウザ内で破棄します。GitHubの公開状態はサーバーで確認します。</p><p class="note">本番の提出締切: 10/18 17:15:59 日本時間（締切時刻を含む）。開始: 17:30 日本時間。全件のソース版を保存後、最大8並列で審査します。検証は今すぐ開始できます。</p><button id="import-review" type="button" class="subtle">2. 内容を確認</button>
             <div id="preview"></div>
             <button id="batch-submit" type="button" class="dark">3. 対象の回答を一括審査</button>
             <div id="batch-results" role="status" aria-live="polite"></div>

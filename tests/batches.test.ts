@@ -139,7 +139,7 @@ describe("batch admission", () => {
     expect(first.payload.batch).toMatchObject({ effort: "medium", status: "queued", counts: { total: 2, queued: 2 }, freezeDispatches: 1, maxFreezeDispatches: 3 });
     expect(database.rows().every((row) => row.effort === "high" && row.scoring_effort === "medium")).toBe(true);
     const writes = database.changes();
-    const equivalent = { ...value, effort: "medium", items: value.items.toReversed().map((item) => ({ ...item, repoUrl: item.repoUrl.toUpperCase() + ".git/", submittedAt: "2026-10-18T17:15:00+09:00" })) };
+    const equivalent = { ...value, effort: "medium", items: value.items.toReversed().map((item) => ({ ...item, repoUrl: item.repoUrl.toUpperCase() + ".git/", submittedAt: "2026-10-18T17:15:59+09:00" })) };
     expect((await create(equivalent)).response.status).toBe(202);
     expect((await create({ ...value, items: value.items.map((item) => ({ ...item, teamName: "changed" })) })).response.status).toBe(409);
     expect(database.changes()).toBe(writes);
@@ -175,13 +175,13 @@ describe("batch admission", () => {
 
   it("enforces the inclusive submission deadline without a lower date restriction and the judging start gate", async () => {
     const { create, call } = setup();
-    for (const submittedAt of ["2026-10-17T08:15:00.000Z", "2026-01-01T00:00:00Z", "2026-10-18T08:14:59.999Z", SUBMISSION_DEADLINE_ISO]) {
+    for (const submittedAt of ["2026-10-17T08:15:00.000Z", "2026-01-01T00:00:00Z", "2026-10-18T08:14:59.999Z", "2026-10-18T08:15:12.000Z", "2026-10-18T08:15:55.000Z", SUBMISSION_DEADLINE_ISO]) {
       const value = input(1, "production", crypto.randomUUID());
       value.items[0]!.submittedAt = submittedAt;
       expect((await create(value)).response.status).toBe(202);
     }
     const late = input();
-    late.items[0]!.submittedAt = "2026-10-18T08:15:00.001Z";
+    late.items[0]!.submittedAt = "2026-10-18T08:15:59.001Z";
     expect((await create(late)).response.status).toBe(400);
     expect((await create({ ...input(), items: [{ teamName: "missing", repoUrl: "https://github.com/a/b" }] } as ReturnType<typeof input>)).response.status).toBe(400);
     vi.setSystemTime("2026-10-18T08:29:59.999Z");

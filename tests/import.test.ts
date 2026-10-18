@@ -67,7 +67,7 @@ describe("submission import", () => {
     expect(parseSubmissionImport("Custom\thttps://github.com/Owner/Repo", { mode: "validation" }).items[0]?.teamName).toBe("Custom");
     expect(parseSubmissionImport("teamName\tgithubRepositoryURL\n\thttps://github.com/a/b", { mode: "validation" }).items).toEqual([]);
   });
-  it.each(["2026/10/18 17:15:01", "2026/02/30 12:00"])("does not reserve a repository for an invalid first timestamp %s", (time) => {
+  it.each(["2026/10/18 17:16:00", "2026/02/30 12:00"])("does not reserve a repository for an invalid first timestamp %s", (time) => {
     const result = parse(`${header}\n${response(1, time)}\n${response(1)}`);
     expect(result.rows[1]?.reason).toBe("ready");
     expect(result.items).toHaveLength(1);
@@ -156,9 +156,9 @@ describe("submission import", () => {
     expect(result.rows[0]?.reason).toBe("invalid_timestamp");
     expect(result.sanitized).toContain("2026/02/30 17:00");
   });
-  it("uses JST and includes only the exact deadline", () => {
-    const results = parse(`${header}\n${response(1)}\n${response(2, "2026/10/18 17:15:01")}`);
-    expect(results.rows.map((row) => row.reason)).toEqual(["ready", "late"]);
+  it("uses JST and includes submissions through 17:15:59", () => {
+    const results = parse([header, response(1), response(2, "2026/10/18 17:15:12"), response(3, "2026/10/18 17:15:55"), response(4, "2026/10/18 17:15:59"), response(5, "2026/10/18 17:16:00")].join("\n"));
+    expect(results.rows.map((row) => row.reason)).toEqual(["ready", "ready", "ready", "ready", "late"]);
     expect(normalizeTimestamp("2026-10-18T08:15:00Z")).toBe(normalizeTimestamp("2026-10-18T17:15:00+09:00"));
     expect(normalizeTimestamp("2026年10月18日 17時14分59秒")).toBe("2026-10-18T08:14:59.000Z");
   });
