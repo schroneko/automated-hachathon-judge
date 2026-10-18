@@ -410,10 +410,7 @@ async function withEvidenceDeadline<T>(operation: (signal: AbortSignal) => Promi
     return await Promise.race([operation(controller.signal), expired]);
   } catch (error) {
     if (controller.signal.aborted) throw new RetryableGithubError("GitHub evidence collection timed out");
-    if (error instanceof TypeError) {
-      console.error(JSON.stringify({ event: "github_evidence_failed", name: error.name, message: error.message.slice(0, 500) }));
-      throw new RetryableGithubError("GitHub evidence collection request failed");
-    }
+    if (error instanceof TypeError) throw new RetryableGithubError("GitHub evidence collection request failed");
     throw error;
   } finally {
     clearTimeout(timer);

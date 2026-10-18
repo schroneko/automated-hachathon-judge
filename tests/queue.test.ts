@@ -10,7 +10,6 @@ vi.mock("../src/container/scorer", () => scorer);
 import { handleApiRequest } from "../src/worker/api";
 import { processScoringMessage } from "../src/worker/queue";
 import worker from "../src/worker/index";
-import worker from "../src/worker/index";
 
 class SqliteD1 {
   readonly db = new DatabaseSync(":memory:");
@@ -102,7 +101,7 @@ function setup() {
   return { database, env, sent, api, create, setSendError: (value: boolean) => { sendError = value; } };
 }
 
-afterEach(() => { vi.unstubAllGlobals(); scorer.scoreSubmission.mockReset(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); scorer.scoreSubmission.mockReset(); });
 
 describe("cloud queue runtime", () => {
   it("acknowledges a completed or skipped Queue delivery without requesting retry", async () => {
@@ -243,6 +242,7 @@ describe("cloud queue runtime", () => {
   });
 
   it("retains an unresolved reservation after a scorer failure without an automatic retry", async () => {
+    const diagnostics = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { database, env, sent, create } = setup();
     const modelFetch = vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] }));
     vi.stubGlobal("fetch", modelFetch);
@@ -254,6 +254,8 @@ describe("cloud queue runtime", () => {
     await processScoringMessage(sent[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 1 });
     expect(database.row(created.id).failure_message).not.toContain("sensitive");
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain("sensitive provider response");
+    expect(JSON.stringify(diagnostics.mock.calls)).not.toContain("scoring-secret");
     expect(database.account("production")).toMatchObject({ spent_micro_usd: 0, reserved_micro_usd: 1_000_000 });
     const before = database.changes();
     await processScoringMessage(sent[0], env);

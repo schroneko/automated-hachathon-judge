@@ -8,10 +8,12 @@ export async function processScoringMessage(value: unknown, env: Env): Promise<v
   const job = await claimQueueMessage(message, env);
   if (!job) return;
   let outcome: FinalizePayload["outcome"];
+  let stage = "model_check";
   try {
     const apiKey = env.OPENAI_API_KEY_20261018_HACKATHON?.trim();
     if (!apiKey) throw new Error("Scoring service is unavailable");
     await requireModels(apiKey);
+    stage = "scoring";
     const result = await scoreSubmission(job, {
       apiKey,
       effort: job.mode === "production" ? "high" : job.effort,
@@ -29,10 +31,10 @@ export async function processScoringMessage(value: unknown, env: Env): Promise<v
     });
     outcome = { kind: "completed", result };
   } catch (error) {
-    console.error(JSON.stringify({ event: "judging_failed", submissionId: job.submissionId, name: error instanceof Error ? error.name : "UnknownError", message: error instanceof Error ? error.message.slice(0, 500) : "Unexpected scoring failure" }));
     const message = error instanceof Error && ["Budget exhausted", "Scoring service is unavailable", "Budget reservation failed", "Usage settlement failed"].includes(error.message)
       ? error.message
       : "Scoring failed. Review the submission and retry manually.";
+    console.error(JSON.stringify({ event: "judging_failed", submissionId: job.submissionId, stage, message }));
     outcome = { kind: "failed", message };
   }
   let response = await callback(internalRequest({ submissionId: job.submissionId, callbackToken: job.callbackToken, outcome }), env);
