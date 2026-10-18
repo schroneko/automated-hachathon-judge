@@ -249,7 +249,8 @@ function isEvidencePath(path: string): boolean {
   if (/^(?:\.env(?:\..*)?|\.npmrc|\.pypirc|\.netrc|_netrc|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?)$/.test(name)) return false;
   if (/^(?:.*credentials?(?:[._-].*)?|.*private[._-]?key(?:\..*)?|service[._-]?account(?:[._-].*)?|\.?secrets?(?:\..*)?)$/.test(name)
     && !/\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|cs|rb|kt|kts|swift|c|h|cc|cpp|hpp|vue|svelte|php|sh|bash|zsh|fish|ps1|sql)$/.test(name)) return false;
-  if (/\.(?:png|jpe?g|gif|webp|avif|bmp|tiff?|ico|icns|heic|psd|pdf|woff2?|ttf|otf|eot|mp[234]|m4[av]|aac|ogg|oga|opus|flac|wav|aiff?|mov|avi|mkv|webm|mpeg|mpg|zip|gz|tgz|bz2|xz|zst|7z|rar|tar|jar|war|wasm|exe|dll|so|dylib|bin|o|a|lib|class|pyc|pyo|db|sqlite3?|p12|pfx|pem|key|crt|cer|der|jks|keystore)$/.test(name)) return false;
+  if (/\.(?:js|mjs|cjs|jsx|ts|tsx|css)\.map$/.test(name)) return false;
+  if (/\.(?:svgz?|png|apng|jpe?g|jxl|gif|webp|avif|bmp|tiff?|ico|icns|cur|heic|heif|psd|tga|dds|ktx2?|exr|hdr|pdf|woff2?|ttf|ttc|otf|eot|sfnt|mp[234]|m4[av]|aac|ogg|oga|ogv|opus|flac|wav|aiff?|midi?|mov|avi|mkv|webm|mpeg|mpg|flv|wmv|3gp|3g2|gltf|glb|obj|mtl|stl|fbx|blend|dae|ply|3ds|usda?|usdc|usdz|onnx|safetensors|gguf|ggml|ckpt|tflite|zip|gz|tgz|bz2|xz|zst|7z|rar|tar|jar|war|wasm|exe|dll|so|dylib|bin|o|a|lib|class|pyc|pyo|db|sqlite3?|p12|pfx|pem|key|crt|cer|der|jks|keystore)$/.test(name)) return false;
   return true;
 }
 

@@ -381,6 +381,80 @@ describe("GitHub partial-clone tracked evidence", () => {
     expect(excluded.every((path) => !blobWants(fetch).includes(data.paths.get(path)!))).toBe(true);
   });
 
+  it("never wants excluded media, models or generated source maps even when every blob is unique UTF-8 XML", async () => {
+    const excluded = [
+      "assets/lower.svg", "assets/upper.SVG", "assets/mixed.SvG", "assets/lower.svgz", "assets/upper.SVGZ", "assets/mixed.SvGz",
+      "assets/image.PNG", "assets/photo.JPEG", "assets/image.WEBP", "assets/font.WOFF2", "assets/font.TTF",
+      "assets/audio.MP3", "assets/audio.WAV", "assets/video.MP4", "assets/video.WEBM", "assets/archive.ZIP", "assets/archive.GZ",
+      "assets/model.GlTf", "assets/model.GLB", "assets/model.OBJ", "assets/model.USDZ", "models/model.ONNX",
+      "models/weights.SafeTensors", "models/model.GGUF", "models/model.CKPT", "src/app.JS.MAP", "assets/theme.CSS.MAP"
+    ];
+    const source = { path: "src/main.ts", content: "export const title = '雪';\n" };
+    const data = fixture([
+      ...excluded.map((path) => ({ path, content: `<svg xmlns="http://www.w3.org/2000/svg"><text>${path} 雪</text></svg>\n` })),
+      source
+    ]);
+    const fetch = stubGithub(data);
+    const result = await fetchRepoEvidence(repo, data.sha, "main", "summary");
+    expect(result.files).toEqual([{ ...source, size: Buffer.byteLength(source.content), truncated: false }]);
+    const wants = blobWants(fetch);
+    expect(wants).toEqual([data.paths.get(source.path)]);
+    expect(new Set(excluded.map((path) => data.paths.get(path))).size).toBe(excluded.length);
+    for (const path of excluded) expect(wants).not.toContain(data.paths.get(path));
+  });
+
+  it("retains source without a capacity error or blob request for an oversized UTF-8 SVG", async () => {
+    const svg = {
+      path: "assets/oversized.SvG",
+      content: `<svg xmlns="http://www.w3.org/2000/svg"><text>${"雪".repeat(MAX_EVIDENCE_FILE_BYTES)}</text></svg>\n`
+    };
+    const source = { path: "src/main.ts", content: "export const answer = 42;\n" };
+    expect(Buffer.byteLength(svg.content)).toBeGreaterThan(MAX_EVIDENCE_FILE_BYTES);
+    const data = fixture([svg, source]);
+    const fetch = stubGithub(data);
+    const result = await fetchRepoEvidence(repo, data.sha, "main", "summary");
+    expect(result).toMatchObject({ assessment: "scored", fullSource: true });
+    expect(result.files).toEqual([{ ...source, size: Buffer.byteLength(source.content), truncated: false }]);
+    expect(blobWants(fetch)).toEqual([data.paths.get(source.path)]);
+    expect(blobWants(fetch)).not.toContain(data.paths.get(svg.path));
+  });
+
+  it("retains exact implementation and unknown UTF-8 text referencing excluded assets", async () => {
+    const entries = [
+      { path: "public/index.html", content: '<!doctype html>\n<html lang="ja"><body><img src="/assets/logo.SVG" alt="雪"><video src="/assets/intro.MP4" poster="/assets/hero.PNG"></video></body></html>\n' },
+      { path: "assets/theme.css", content: '@font-face { font-family: "Demo"; src: url("./demo.WOFF2") format("woff2"); }\r\n.hero { background-image: url("./pattern.svgz"), url("./hero.PNG"); }\r\n' },
+      { path: "src/App.tsx", content: 'import logo from "../assets/logo.SVG";\nexport const App = () => <img src={logo} alt="雪" />;\n' },
+      { path: "src/Icon.tsx", content: 'export const Icon = () => <svg viewBox="0 0 8 8"><path d="M0 0L8 8" /></svg>;\n' },
+      { path: "src/Preview.jsx", content: 'import hero from "../assets/hero.PNG";\nexport const Preview = () => <img src={hero} alt="写真" />;\n' },
+      { path: "src/Player.vue", content: '<script setup>\r\nimport clip from "../assets/intro.MP4";\r\n</script>\r\n<template><video :src="clip" poster="/assets/hero.PNG"></video></template>\r\n' },
+      { path: "assets/copy.unrecognized", content: '\ufefftitle=雪\r\nimage=./hero.PNG\r\nicon=./logo.SVG\r\n' },
+      { path: "assets/shaders/basic.glsl", content: 'void main() { gl_FragColor = vec4(1.0); }\n' },
+      { path: "assets/routes.map", content: 'north=東京\nsouth=大阪\n' },
+      { path: "templates/page.pt", content: '<html><body tal:content="context/title">Title</body></html>\n' },
+      { path: "config/runtime.pth", content: 'import application_startup\n../application\n' }
+    ];
+    const assets = [
+      { path: "assets/logo.SVG", content: '<svg xmlns="http://www.w3.org/2000/svg"><text>logo</text></svg>\n' },
+      { path: "assets/pattern.svgz", content: '<svg xmlns="http://www.w3.org/2000/svg"><text>pattern</text></svg>\n' },
+      { path: "assets/hero.PNG", content: "unique image fixture" },
+      { path: "assets/demo.WOFF2", content: "unique font fixture" },
+      { path: "assets/intro.MP4", content: "unique video fixture" }
+    ];
+    const data = fixture([...entries, ...assets]);
+    const fetch = stubGithub(data);
+    const result = await fetchRepoEvidence(repo, data.sha, "main", "summary");
+    expect(result.files).toHaveLength(entries.length);
+    for (const entry of entries) {
+      const file = result.files.find((candidate) => candidate.path === entry.path);
+      expect(file).toEqual({ ...entry, size: Buffer.byteLength(entry.content), truncated: false });
+      expect(Buffer.from(file!.content)).toEqual(Buffer.from(entry.content));
+    }
+    const wants = blobWants(fetch);
+    expect(wants).toHaveLength(entries.length);
+    expect(new Set(wants)).toEqual(new Set(entries.map((entry) => data.paths.get(entry.path))));
+    for (const asset of assets) expect(wants).not.toContain(data.paths.get(asset.path));
+  });
+
   it("classifies NUL and malformed UTF-8 as binary without partial decoding", async () => {
     const data = fixture([
       { path: "unknown-format", content: "text\0binary" }, { path: "another.unknown", content: new Uint8Array([0x61, 0xc3, 0x28]) },
