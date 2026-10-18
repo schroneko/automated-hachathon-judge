@@ -1,4 +1,4 @@
-export const RUBRIC_VERSION = "2026-10-18-v3";
+export const RUBRIC_VERSION = "2026-10-18-v4";
 export const SCORE_LEVELS = [0, 2, 4, 6, 8, 10] as const;
 export const MAX_CRITERION_SCORE = 10;
 export const MAX_TOTAL_SCORE = 40;

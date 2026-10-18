@@ -1,6 +1,7 @@
 import { CRITERIA } from "../shared/constants";
 import { visibleAttackScore, validateAttackProbability } from "../shared/attack-score";
-import { buildDecisionsQuestions, buildExplanationPrompt, DECISION_SCORE_LEVELS } from "../shared/prompt";
+import { buildDecisionsQuestions, buildExplanationPrompt } from "../shared/prompt";
+import { CONDITION_PROBABILITY_THRESHOLD, DECISION_CONDITIONS, deriveConditionScores } from "../shared/decision-conditions";
 import { packModelEvidence, SHARED_CONTENT_INSTRUCTIONS } from "../shared/model-evidence";
 import { DEVDAY_REFERENCE_VERSION } from "../shared/devday-reference";
 import { RUBRIC_VERSION } from "../shared/rubric";
@@ -97,13 +98,14 @@ async function scoreCanonicalSnapshot(source: RepoEvidenceSnapshot, options: Sco
     pinnedSha: snapshot.pinnedSha,
     criteria: CRITERIA.map(({ key, label }) => ({ key, label, score: 10 })),
     total: 40
-  }, options.trustedFeatureReference, effort);
+  }, options.trustedFeatureReference, effort, RUBRIC_VERSION, Object.fromEntries(DECISION_CONDITIONS.map((condition) => [condition.name, true])), Object.fromEntries(DECISION_CONDITIONS.map((condition) => [condition.name, 1])));
   await countInput({ model: RESPONSES_MODEL, input: future.input }, future.max_output_tokens, key, fetcher);
   await options.beforeSnapshot?.(JSON.parse(prepared.serialized));
   const decisionsCall = await callApi("decisions", decisionsBody, maxInputTokens, 0, key, fetcher, options);
   const signals = parseDecisions(decisionsCall.body);
   const result = validatePublicScoreResult({
     eligibility,
+    reviewRequired: signals.reviewRequired,
     summary: "採点が完了しました。採点理由を生成中です。",
     publicReason: "Decisionsによる点数が確定しました。採点理由を生成中です。",
     repoAssessment: "scored",
@@ -129,6 +131,9 @@ async function scoreCanonicalSnapshot(source: RepoEvidenceSnapshot, options: Sco
       outputTokens: decisionsCall.usage.outputTokens,
       costUsd: decisionsCall.usage.costUsd,
       decisionsScores: signals.scores,
+      decisionsConditions: signals.conditions,
+      decisionsConditionProbabilities: signals.probabilities,
+      conditionThreshold: CONDITION_PROBABILITY_THRESHOLD,
       requestIds: decisionsCall.usage.requestId ? [decisionsCall.usage.requestId] : []
     }
   });
@@ -167,7 +172,7 @@ export async function explainScoredSnapshot(
     criteria: fixed.criteria.map(({ key, label, score }) => ({ key, label, score })),
     total: fixed.total
   };
-  const responsesBody = explanationBody(snapshot, fixedScores, options.trustedFeatureReference, effort, prior.rubricVersion);
+  const responsesBody = explanationBody(snapshot, fixedScores, options.trustedFeatureReference, effort, prior.rubricVersion, prior.decisionsConditions, prior.decisionsConditionProbabilities);
   const outputCap = responsesBody.max_output_tokens;
   const fetcher = options.fetch ?? globalThis.fetch;
   const maxInputTokens = await countInput({ model: RESPONSES_MODEL, input: responsesBody.input }, outputCap, key, fetcher);
@@ -192,6 +197,7 @@ export async function explainScoredSnapshot(
   }
   const result: PublicScoreResult = {
     ...modelResult,
+    reviewRequired: Boolean(fixed.reviewRequired || modelResult.reviewRequired),
     eligibility: fixed.eligibility,
     attackProbability: fixed.attackProbability,
     attackScore: fixed.attackScore,
@@ -216,7 +222,7 @@ function scoringSettings(options: ScoringOptions) {
   return { key, effort };
 }
 
-function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high", version = RUBRIC_VERSION) {
+function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high", version = RUBRIC_VERSION, conditionChecks?: Record<string, boolean>, conditionProbabilities?: Record<string, number>) {
   const modelEvidence = packModelEvidence(snapshot);
   const prompt = buildExplanationPrompt(reference, version);
   return {
@@ -226,7 +232,7 @@ function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, re
     store: false,
     input: [
       { role: "developer", content: modelEvidence.shared ? `${prompt}\n\n${SHARED_CONTENT_INSTRUCTIONS}` : prompt },
-      { role: "user", content: JSON.stringify({ snapshot: modelEvidence.data, fixedScores }) }
+      { role: "user", content: JSON.stringify({ snapshot: modelEvidence.data, fixedScores, ...(conditionChecks ? { conditionChecks, conditionProbabilities, conditionThreshold: CONDITION_PROBABILITY_THRESHOLD } : {}) }) }
     ],
     text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }
   };
@@ -330,17 +336,18 @@ function parseUsage(kind: "decisions" | "responses", input: unknown, requestId: 
   };
 }
 
-function parseDecisions(input: Record<string, unknown>): { attackProbability: number; scores: Record<CriterionKey, number> } {
+function parseDecisions(input: Record<string, unknown>): { attackProbability: number; scores: Record<CriterionKey, number>; conditions: Record<string, boolean>; probabilities: Record<string, number>; reviewRequired: boolean } {
   if (input.refusal != null || (input.status !== undefined && input.status !== "completed")
     || input.incomplete_details != null || input.error != null) {
     throw new Error("Decisions judgment was refused or incomplete");
   }
   const answers = input.answers;
-  if (!Array.isArray(answers) || answers.length !== 5) {
-    throw new Error("Decisions must provide five answers");
+  if (!Array.isArray(answers) || answers.length !== DECISION_CONDITIONS.length + 1) {
+    throw new Error("Decisions must provide all condition answers and the attack predicate");
   }
-  const expected = new Set(["prompt_injection", ...CRITERIA.map((item) => item.key)]);
-  const scores = {} as Record<CriterionKey, number>;
+  const expected = new Set(["prompt_injection", ...DECISION_CONDITIONS.map((item) => item.name)]);
+  const conditions: Record<string, boolean> = {};
+  const probabilities: Record<string, number> = {};
   let attackProbability: number | undefined;
   for (const raw of answers) {
     const answer = record(raw);
@@ -359,38 +366,17 @@ function parseDecisions(input: Record<string, unknown>): { attackProbability: nu
       attackProbability = validateAttackProbability(finiteNumber(answer.probability));
       continue;
     }
-    if (answer.type !== "choice" || "score" in answer) {
-      throw new Error("Rubric answer must be an unambiguous choice");
+    if (answer.type !== "predicate") {
+      throw new Error("Condition answer must be a predicate");
     }
-    const levels = new Set<string>(DECISION_SCORE_LEVELS.map(String));
-    if (typeof answer.choice !== "string" || !levels.has(answer.choice)) {
-      throw new Error("Decisions choice is not an allowed score level");
-    }
-    const confidence = finiteNumber(answer.confidence);
-    if (confidence < 0 || confidence > 1) {
-      throw new Error("Decisions confidence is out of range");
-    }
-    if (!Array.isArray(answer.probabilities) || answer.probabilities.length !== DECISION_SCORE_LEVELS.length) {
-      throw new Error("Decisions choice distribution must contain six levels");
-    }
-    let sum = 0;
-    for (const rawPoint of answer.probabilities) {
-      const point = record(rawPoint);
-      const probability = finiteNumber(point.probability);
-      if (typeof point.value !== "string" || !levels.delete(point.value) || probability < 0 || probability > 1) {
-        throw new Error("Decisions choice distribution has invalid levels");
-      }
-      sum += probability;
-    }
-    if (levels.size || Math.abs(sum - 1) > 0.001) {
-      throw new Error("Decisions choice distribution is inconsistent");
-    }
-    scores[name as CriterionKey] = Number(answer.choice);
+    const probability = validateAttackProbability(finiteNumber(answer.probability));
+    probabilities[name] = probability;
+    conditions[name] = probability >= CONDITION_PROBABILITY_THRESHOLD;
   }
   if (expected.size || attackProbability === undefined) {
     throw new Error("Decisions answers are incomplete");
   }
-  return { attackProbability, scores };
+  return { attackProbability, conditions, probabilities, ...deriveConditionScores(conditions) };
 }
 
 function parseResponseResult(input: Record<string, unknown>) {

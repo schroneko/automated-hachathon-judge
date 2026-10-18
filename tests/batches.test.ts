@@ -5,6 +5,7 @@ import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CRITERIA, JUDGING_START_ISO, PRODUCTION_SUBMISSION_LIMIT, SUBMISSION_DEADLINE_ISO, VALIDATION_SUBMISSION_LIMIT } from "../src/shared/constants";
 import { validatePublicScoreResult } from "../src/shared/validation";
+import { DECISION_CONDITIONS } from "../src/shared/decision-conditions";
 import type { FreezeQueueMessage, JudgeQueueMessage, PublicBatchRecord, PublicSubmissionRecord, RepoResolution, ScoringQueueMessage } from "../src/shared/types";
 import { callback, claimQueueMessage, handleApiRequest, reserve, settle } from "../src/worker/api";
 import { listBatches, processFreezeMessage } from "../src/worker/batches";
@@ -776,7 +777,7 @@ describe("backend compatibility", () => {
       expect(fixedSourceWrites).toBeGreaterThan(0);
       return Response.json({ model: "gpt-6-luna", usage: { input_tokens: 100, output_tokens: 0 }, answers: [
         { type: "predicate", name: "prompt_injection", probability: 0.2 },
-        ...CRITERIA.map(({ key }) => ({ type: "choice", name: key, choice: "8", confidence: 0.9, probabilities: [0, 2, 4, 6, 8, 10].map((value) => ({ value: String(value), probability: value === 8 ? 1 : 0 })) }))
+        ...DECISION_CONDITIONS.map(({ name, level }) => ({ type: "predicate", name, probability: level <= 8 ? 0.95 : 0.05 }))
       ] });
     }));
     const value = input();

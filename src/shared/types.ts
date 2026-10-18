@@ -81,6 +81,9 @@ export interface ScoreUsage {
   outputTokens: number;
   costUsd: number;
   decisionsScores: Record<string, number>;
+  decisionsConditions?: Record<string, boolean> | undefined;
+  decisionsConditionProbabilities?: Record<string, number> | undefined;
+  conditionThreshold?: number | undefined;
   requestIds: string[];
   referenceVersion?: string;
   rubricVersion?: string | undefined;

@@ -93,6 +93,13 @@ export async function claimExplanation(message: ExplanationQueueMessage, env: En
     .bind(now, now, row.id, EVENT_ID, row.callback_token, message.attempt, message.dispatch).first<SubmissionRow>();
 }
 
+function sameConditionEvidence(left: Readonly<Record<string, boolean | number>> | undefined, right: Readonly<Record<string, boolean | number>> | undefined): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  const keys = Object.keys(left);
+  return keys.length === Object.keys(right).length
+    && keys.every((key) => Object.prototype.hasOwnProperty.call(right, key) && left[key] === right[key]);
+}
+
 export async function completeExplanation(row: SubmissionRow, value: PublicScoreResult, snapshot: RepoEvidenceSnapshot, env: Env): Promise<void> {
   const result = validatePublicScoreResult(value, new Set(snapshot.files.map((file) => file.path)));
   const fixed = JSON.parse(row.result_json!) as PublicScoreResult;
@@ -104,6 +111,10 @@ export async function completeExplanation(row: SubmissionRow, value: PublicScore
     || result.criteria.some((item) => result.usage!.decisionsScores[item.key] !== item.score)) throw new Error("Explanation changed Decisions authority");
   if (result.usage.fullSource !== fixed.usage?.fullSource || result.usage.sourceHash !== fixed.usage?.sourceHash
     || result.usage.sourceFiles !== fixed.usage?.sourceFiles || result.usage.sourceBytes !== fixed.usage?.sourceBytes) throw new Error("Explanation changed source authority");
+  if (result.usage.rubricVersion !== fixed.usage?.rubricVersion || result.usage.referenceVersion !== fixed.usage?.referenceVersion) throw new Error("Explanation changed judging policy authority");
+  if (result.usage.conditionThreshold !== fixed.usage?.conditionThreshold
+    || !sameConditionEvidence(result.usage.decisionsConditions, fixed.usage?.decisionsConditions)
+    || !sameConditionEvidence(result.usage.decisionsConditionProbabilities, fixed.usage?.decisionsConditionProbabilities)) throw new Error("Explanation changed condition authority");
   const now = new Date().toISOString();
   await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET result_json = ?, explanation_status = 'completed', status = 'completed', completed_at = ?, updated_at = ?, failure_message = NULL, outcome_json = ? WHERE id = ? AND event_id = ? AND callback_token = ? AND attempts = ? AND explanation_dispatches = ? AND explanation_status = 'processing' AND status = 'processing' AND result_json IS NOT NULL")
     .bind(JSON.stringify(result), now, now, JSON.stringify({ kind: "completed", result }), row.id, EVENT_ID, row.callback_token, row.attempts, row.explanation_dispatches).run();

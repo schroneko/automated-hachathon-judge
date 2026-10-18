@@ -2,6 +2,7 @@ import { z } from "zod";
 import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, CRITERIA, MAX_EVIDENCE_FILES, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_TOTAL_BYTES, MAX_SNAPSHOT_SERIALIZED_BYTES } from "./constants";
 import { visibleAttackScore } from "./attack-score";
 import { MAX_CRITERION_SCORE, MAX_TOTAL_SCORE, SCORE_LEVELS, rubricText } from "./rubric";
+import { CONDITION_PROBABILITY_THRESHOLD, deriveConditionScores } from "./decision-conditions";
 import type { CriterionKey, FinalizePayload, FullSourceMetadata, NormalizedRepo, PublicScoreResult, RepoEvidenceSnapshot, SubmissionMode } from "./types";
 
 const submissionBodySchema = z.object({
@@ -25,6 +26,9 @@ const usageSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
   costUsd: z.number().finite().nonnegative(),
   decisionsScores: z.record(z.string(), z.number().finite().min(0).max(MAX_CRITERION_SCORE)),
+  decisionsConditions: z.record(z.string(), z.boolean()).optional(),
+  decisionsConditionProbabilities: z.record(z.string(), z.number().finite().min(0).max(1)).optional(),
+  conditionThreshold: z.literal(CONDITION_PROBABILITY_THRESHOLD).optional(),
   requestIds: z.array(z.string().min(1)).max(2)
 }).strict().refine((value) => {
   const values = [value.fullSource, value.sourceFiles, value.sourceBytes, value.sourceHash];
@@ -200,6 +204,20 @@ export function validatePublicScoreResult(input: unknown, allowedEvidencePaths?:
   }
   if (parsed.usage && Object.keys(parsed.usage.decisionsScores).sort().join(",") !== "idea,impact,technical,ux") {
     throw new Error("Usage Decisions scores must contain exactly four criteria");
+  }
+  if (parsed.usage?.rubricVersion === "2026-10-18-v4" || parsed.usage?.decisionsConditions !== undefined
+    || parsed.usage?.decisionsConditionProbabilities !== undefined || parsed.usage?.conditionThreshold !== undefined) {
+    if (!parsed.usage?.decisionsConditions || !parsed.usage.decisionsConditionProbabilities
+      || parsed.usage.conditionThreshold !== CONDITION_PROBABILITY_THRESHOLD) throw new Error("Condition-based judging requires complete Decisions condition evidence");
+    const derived = deriveConditionScores(parsed.usage.decisionsConditions);
+    const probabilities = parsed.usage.decisionsConditionProbabilities;
+    if (Object.keys(probabilities).sort().join(",") !== Object.keys(parsed.usage.decisionsConditions).sort().join(",")
+      || Object.entries(parsed.usage.decisionsConditions).some(([name, met]) => met !== (probabilities[name]! >= CONDITION_PROBABILITY_THRESHOLD))) {
+      throw new Error("Decisions conditions do not match recorded probabilities and threshold");
+    }
+    if (parsed.criteria.some((criterion) => derived.scores[criterion.key] !== criterion.score
+      || parsed.usage!.decisionsScores[criterion.key] !== criterion.score)) throw new Error("Scores do not match Decisions conditions");
+    if (derived.reviewRequired && parsed.reviewRequired !== true) throw new Error("Inconsistent Decisions conditions require review");
   }
   const seen = new Set<CriterionKey>();
   for (const criterion of parsed.criteria) {

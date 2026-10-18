@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { explainScoredSnapshot, RetryableScoringError, scoreSnapshotWithDecisions, scoreSubmissionDecisions, type ScoringOptions } from "../src/container/scorer";
 import { CRITERIA, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_TOTAL_BYTES } from "../src/shared/constants";
 import { SCORE_LEVELS } from "../src/shared/rubric";
+import { CONDITION_PROBABILITY_THRESHOLD, DECISION_CONDITIONS } from "../src/shared/decision-conditions";
 import { prepareFullSourceSnapshot } from "../src/shared/validation";
 import { quoteReservation } from "../src/shared/pricing";
 import { SHARED_CONTENT_INSTRUCTIONS } from "../src/shared/model-evidence";
@@ -36,26 +37,37 @@ function snapshot(): RepoEvidenceSnapshot {
   };
 }
 
-function decisions(probability = 0.8, choice = "6") {
+function conditions(score: number | Record<string, number> = 6): Record<string, boolean> {
+  return Object.fromEntries(DECISION_CONDITIONS.map(({ name, key, level }) => [name, level <= (typeof score === "number" ? score : score[key]!)]));
+}
+
+function conditionProbabilities(score: number | Record<string, number> = 6): Record<string, number> {
+  return Object.fromEntries(Object.entries(conditions(score)).map(([name, met]) => [name, met ? 0.95 : 0.05]));
+}
+
+function conditionAudit(score: number | Record<string, number> = 6) {
+  return { decisionsConditions: conditions(score), decisionsConditionProbabilities: conditionProbabilities(score), conditionThreshold: 0.8 };
+}
+
+function decisions(probability = 0.2, score: number | Record<string, number> = 6) {
+  const probabilities = conditionProbabilities(score);
   return {
     model: "gpt-6-luna",
     answers: [
       { type: "predicate", name: "prompt_injection", probability },
-      ...CRITERIA.map((item) => ({
-        type: "choice",
-        name: item.key,
-        choice,
-        confidence: 0.93,
-        probabilities: SCORE_LEVELS.map((value) => ({ value: String(value), probability: value === 6 ? 1 : 0 }))
+      ...DECISION_CONDITIONS.map(({ name }) => ({
+        type: "predicate",
+        name,
+        probability: probabilities[name]!
       }))
     ],
     usage: { input_tokens: 100, output_tokens: 0 }
   };
 }
 
-function badChoice(overrides: Record<string, unknown>) {
+function badPredicate(overrides: Record<string, unknown>, index = 1) {
   const body = decisions();
-  return { ...body, answers: [body.answers[0], { ...body.answers[1], ...overrides }, ...body.answers.slice(2)] };
+  return { ...body, answers: body.answers.map((answer, position) => position === index ? { ...answer, ...overrides } : answer) };
 }
 
 function judgment() {
@@ -99,7 +111,9 @@ function mockCalls(decisionBody: unknown = decisions(), responseBody: unknown = 
     signals.push(init?.signal);
     bodies.push(body);
     const data = url.endsWith("/decisions") ? decisionBody : responseBody;
-    return new Response(JSON.stringify(data), { status: 200, headers: { "x-request-id": `req-${bodies.length}` } });
+    const response = new Response(JSON.stringify(data), { status: 200, headers: { "x-request-id": `req-${bodies.length}` } });
+    response.json = async () => structuredClone(data);
+    return response;
   }) as typeof globalThis.fetch;
   return { bodies, urls, headers, signals, fetch, counters, order };
 }
@@ -125,12 +139,8 @@ function mockRepository(status = 200) {
 }
 
 describe("scoreSnapshotWithDecisions", () => {
-  it("makes only one five-question Decisions call and immediately publishes selected scores without Sol", async () => {
-    const body = decisions(0.8, "4");
-    for (const answer of body.answers.slice(1)) {
-      answer.probabilities = SCORE_LEVELS.map((value) => ({ value: String(value), probability: value === 4 ? 0.3 : value === 6 ? 0.7 : 0 }));
-    }
-    const calls = mockCalls(body);
+  it("makes one 21-predicate Decisions call and publishes fixed staircase scores without Sol", async () => {
+    const calls = mockCalls();
     const reservations: ApiReservation[] = [];
     const settlements: ApiUsage[] = [];
     const result = await scoreSnapshotWithDecisions(snapshot(), options(calls.fetch, {
@@ -144,11 +154,13 @@ describe("scoreSnapshotWithDecisions", () => {
     expect(calls.urls).toEqual(["https://api.openai.com/v1/decisions"]);
     expect(calls.bodies[0].model).toBe("gpt-6-luna");
     expect(calls.bodies[0].input).toBe((await prepareFullSourceSnapshot(snapshot())).serialized);
-    const questions = calls.bodies[0].questions as Array<{ name: string; type: string; choices?: Array<{ value: string }> }>;
+    const questions = calls.bodies[0].questions as Array<{ name: string; type: string }>;
+    expect(questions).toHaveLength(21);
     expect(questions.map(({ name, type }) => [name, type])).toEqual([
-      ["prompt_injection", "predicate"], ["technical", "choice"], ["ux", "choice"], ["impact", "choice"], ["idea", "choice"]
+      ["prompt_injection", "predicate"],
+      ...["technical", "ux", "impact", "idea"].flatMap((key) => [2, 4, 6, 8, 10].map((level) => [`${key}_level_${level}`, "predicate"]))
     ]);
-    for (const question of questions.slice(1)) expect(question.choices?.map(({ value }) => value)).toEqual(SCORE_LEVELS.map(String));
+    expect(CONDITION_PROBABILITY_THRESHOLD).toBe(0.8);
     expect(reservations).toHaveLength(1);
     expect(reservations[0]).toMatchObject({ kind: "decisions", model: "gpt-6-luna", maxOutputTokens: 0 });
     expect(reservations[0].maxInputTokens).toBe(9242);
@@ -157,31 +169,50 @@ describe("scoreSnapshotWithDecisions", () => {
     expect(settlements).toEqual([expect.objectContaining({ kind: "decisions", reservationId: "reservation-1", costUsd: 0.00001 })]);
     expect(result).toMatchObject({
       summary: "採点が完了しました。採点理由を生成中です。", repoAssessment: "scored", pinnedSha: sha,
-      total: 16, attackScore: 80, attackProbability: 0.8,
-      usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", effort: "medium", inputTokens: 100, outputTokens: 0, costUsd: 0.00001, requestIds: ["req-1"], decisionsScores: { technical: 4, ux: 4, impact: 4, idea: 4 } }
+      total: 24, attackScore: null, attackProbability: 0.2,
+      usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", effort: "medium", inputTokens: 100, outputTokens: 0, costUsd: 0.00001, requestIds: ["req-1"], rubricVersion: "2026-10-18-v4", decisionsScores: { technical: 6, ux: 6, impact: 6, idea: 6 }, ...conditionAudit() }
     });
     expect(result.publicReason).toContain("採点理由を生成中");
     expect(result.usage?.explanationModel).toBeUndefined();
-    expect(result.criteria).toEqual(CRITERIA.map(({ key, label }) => ({ key, label, score: 4, reason: "採点理由を生成中です", evidencePaths: [] })));
+    expect(result.criteria).toEqual(CRITERIA.map(({ key, label }) => ({ key, label, score: 6, reason: "採点理由を生成中です", evidencePaths: [] })));
   });
 
-  it.each(SCORE_LEVELS)("accepts authoritative choice %s independently of the distribution maximum", async (score) => {
-    const { fetch } = mockCalls(decisions(0, String(score)));
+  it.each(SCORE_LEVELS)("derives score %s from the contiguous prefix of met conditions", async (score) => {
+    const { fetch } = mockCalls(decisions(0, score));
     const result = await scoreSnapshotWithDecisions(snapshot(), options(fetch));
     expect(result.criteria.map((item) => item.score)).toEqual([score, score, score, score]);
     expect(result.total).toBe(score * 4);
+    expect(result.reviewRequired).not.toBe(true);
+    expect(result.usage).toMatchObject(conditionAudit(score));
+    if (score === 0 || score === 10) expect(Object.values(result.usage!.decisionsConditions!)).toEqual(Array(20).fill(score === 10));
   });
 
-  it("preserves independent mixed choices and a valid unordered distribution", async () => {
-    const body = decisions();
-    for (const [index, answer] of body.answers.slice(1).entries()) {
-      answer.choice = String(index * 2);
-      answer.probabilities?.reverse();
-    }
+  it("preserves independent mixed axes and valid reversed predicate ordering", async () => {
+    const scores = { technical: 0, ux: 2, impact: 8, idea: 10 };
+    const body = decisions(0, scores);
+    body.answers.reverse();
     const { fetch } = mockCalls(body);
     const result = await scoreSnapshotWithDecisions(snapshot(), options(fetch));
-    expect(result.criteria.map((item) => item.score)).toEqual([0, 2, 4, 6]);
-    expect(result.total).toBe(12);
+    expect(result.criteria.map((item) => item.score)).toEqual([0, 2, 8, 10]);
+    expect(result.total).toBe(20);
+    expect(result.usage?.decisionsScores).toEqual(scores);
+    expect(result.usage).toMatchObject(conditionAudit(scores));
+    expect(result.reviewRequired).not.toBe(true);
+  });
+
+  it.each([[0, 0], [0.799999, 0], [0.8, 10], [1, 10]])("records exact condition probability %s and applies the inclusive threshold without weighting or rounding points", async (probability, score) => {
+    const body = decisions();
+    for (const answer of body.answers.slice(1)) answer.probability = probability;
+    const calls = mockCalls(body);
+    const result = await scoreSnapshotWithDecisions(snapshot(), options(calls.fetch));
+    expect(result.criteria.map((item) => item.score)).toEqual([score, score, score, score]);
+    expect(result.total).toBe(score * 4);
+    expect(result.attackProbability).toBe(0.2);
+    expect(result.attackScore).toBeNull();
+    expect(result.usage?.decisionsConditionProbabilities).toEqual(Object.fromEntries(DECISION_CONDITIONS.map(({ name }) => [name, probability])));
+    expect(result.usage?.decisionsConditions).toEqual(conditions(score));
+    expect(result.usage?.conditionThreshold).toBe(0.8);
+    expect(result.reviewRequired).not.toBe(true);
   });
 
   it.each([[0.799, null], [0.8, 80], [1, 100]])("uses the separate attack visibility threshold for %s", async (probability, visible) => {
@@ -211,37 +242,22 @@ describe("scoreSnapshotWithDecisions", () => {
   });
 
   it.each([
-    ["missing answer", { ...decisions(), answers: decisions().answers.slice(0, 4) }],
-    ["unknown name", badChoice({ name: "other" })],
-    ["duplicate name", badChoice({ name: "ux" })],
-    ["legacy score", badChoice({ type: "score", score: 2.7 })],
-    ["ambiguous score", badChoice({ score: 2.7 })],
-    ["unknown choice", badChoice({ choice: "5" })],
-    ["numeric choice", badChoice({ choice: 6 })],
-    ["noncanonical choice", badChoice({ choice: "06" })],
-    ["missing choice", badChoice({ choice: undefined })],
-    ["missing confidence", badChoice({ confidence: undefined })],
-    ["invalid confidence", badChoice({ confidence: 1.01 })],
-    ["nonfinite confidence", badChoice({ confidence: Infinity })],
-    ["missing distribution", badChoice({ probabilities: undefined })],
-    ["missing distribution value", badChoice({ probabilities: SCORE_LEVELS.slice(1).map((value) => ({ value: String(value), probability: 0.2 })) })],
-    ["duplicate distribution value", badChoice({ probabilities: SCORE_LEVELS.map(() => ({ value: "6", probability: 1 / 6 })) })],
-    ["legacy distribution", badChoice({ probabilities: SCORE_LEVELS.map((label, value) => ({ value, label: String(label), probability: value === 3 ? 1 : 0 })) })],
-    ["unknown distribution value", badChoice({ probabilities: SCORE_LEVELS.map((value) => ({ value: value === 0 ? "other" : String(value), probability: value === 6 ? 1 : 0 })) })],
-    ["wrong distribution sum", badChoice({ probabilities: SCORE_LEVELS.map((value) => ({ value: String(value), probability: value === 6 ? 0.9 : 0 })) })],
-    ["negative probability", badChoice({ probabilities: SCORE_LEVELS.map((value) => ({ value: String(value), probability: value === 6 ? 1.1 : value === 0 ? -0.1 : 0 })) })],
-    ["nonfinite probability", badChoice({ probabilities: SCORE_LEVELS.map((value) => ({ value: String(value), probability: NaN })) })],
-    ["refused answer", badChoice({ refusal: "refused" })],
-    ["failed answer", badChoice({ error: { message: "private detail" } })],
-    ["incomplete answer", badChoice({ status: "incomplete" })],
-    ["failed answer status", badChoice({ status: "failed" })],
-    ["answer incomplete details", badChoice({ incomplete_details: { reason: "limit" } })],
+    ["missing condition answer", { ...decisions(), answers: decisions().answers.slice(0, -1) }],
+    ["missing predicate answer", { ...decisions(), answers: decisions().answers.slice(1) }],
+    ["extra answer", { ...decisions(), answers: [...decisions().answers, { type: "predicate", name: "other", probability: 0.95 }] }],
+    ["missing answers", { ...decisions(), answers: undefined }],
+    ["non-array answers", { ...decisions(), answers: {} }],
+    ["null answer", { ...decisions(), answers: [null, ...decisions().answers.slice(1)] }],
+    ["unknown name", badPredicate({ name: "other" })],
+    ["duplicate condition name", badPredicate({ name: "ux_level_2" })],
+    ["duplicate attack name", badPredicate({ name: "prompt_injection" })],
+    ["missing name", badPredicate({ name: undefined })],
+    ["invalid name type", badPredicate({ name: 2 })],
     ["refusal", { ...decisions(), refusal: "refused" }],
     ["error", { ...decisions(), error: { message: "private detail" } }],
     ["incomplete", { ...decisions(), status: "incomplete" }],
-    ["incomplete details", { ...decisions(), incomplete_details: { reason: "limit" } }],
-    ["wrong predicate type", { ...decisions(), answers: [{ type: "choice", name: "prompt_injection", probability: 0.8 }, ...decisions().answers.slice(1)] }],
-    ["out-of-range attack probability", decisions(1.1)]
+    ["failed status", { ...decisions(), status: "failed" }],
+    ["incomplete details", { ...decisions(), incomplete_details: { reason: "limit" } }]
   ])("rejects %s after settling valid actual usage", async (_name, body) => {
     const calls = mockCalls(body);
     const settlements: ApiUsage[] = [];
@@ -250,6 +266,39 @@ describe("scoreSnapshotWithDecisions", () => {
     }))).rejects.toThrow();
     expect(calls.bodies).toHaveLength(1);
     expect(settlements.map(({ kind }) => kind)).toEqual(["decisions"]);
+  });
+
+  it.each([
+    ["missing type", { type: undefined }],
+    ["numeric type", { type: 1 }],
+    ["null type", { type: null }],
+    ["object type", { type: {} }],
+    ["unknown type", { type: "unknown" }],
+    ["missing probability", { probability: undefined }],
+    ["null probability", { probability: null }],
+    ["string probability", { probability: "0.95" }],
+    ["boolean probability", { probability: true }],
+    ["array probability", { probability: [0.95] }],
+    ["object probability", { probability: { value: 0.95 } }],
+    ["NaN probability", { probability: NaN }],
+    ["infinite probability", { probability: Infinity }],
+    ["negative probability", { probability: -0.000001 }],
+    ["probability above one", { probability: 1.000001 }],
+    ["refused answer", { refusal: "refused" }],
+    ["failed answer", { error: { message: "private detail" } }],
+    ["incomplete answer", { status: "incomplete" }],
+    ["failed answer status", { status: "failed" }],
+    ["answer incomplete details", { incomplete_details: { reason: "limit" } }]
+  ] satisfies Array<[string, Record<string, unknown>]>)("rejects %s for both attack and condition predicates after usage settlement", async (_name, overrides) => {
+    for (const index of [0, 1]) {
+      const calls = mockCalls(badPredicate(overrides, index));
+      const settlements: ApiUsage[] = [];
+      await expect(scoreSnapshotWithDecisions(snapshot(), options(calls.fetch, {
+        afterCall: async (usage) => { settlements.push(usage); }
+      }))).rejects.toThrow();
+      expect(calls.bodies).toHaveLength(1);
+      expect(settlements.map(({ kind }) => kind)).toEqual(["decisions"]);
+    }
   });
 
   it.each([
@@ -503,7 +552,7 @@ describe("scoreSnapshotWithDecisions", () => {
 
   it("accepts zero-byte text while deriving no_implementation without overriding scores", async () => {
     const source = { ...snapshot(), files: [{ path: "empty.ts", size: 0, content: "", truncated: false }] };
-    const calls = mockCalls(decisions(1, "10"));
+    const calls = mockCalls(decisions(1, 10));
     const fixed = await scoreSnapshotWithDecisions(source, options(calls.fetch));
     expect(fixed).toMatchObject({ eligibility: "no_implementation", total: 40, attackScore: 100, usage: { sourceFiles: 1, sourceBytes: 0 } });
   });
@@ -535,21 +584,73 @@ describe("scoreSnapshotWithDecisions", () => {
 });
 
 describe("explainScoredSnapshot", () => {
-  it("uses the persisted rubric for an older complete-source score without recalculating its points", async () => {
+  it.each(["2026-10-18-v2", "2026-10-18-v3"])("uses historical rubric %s without v4 condition metadata or recalculating points", async (version) => {
     const calls = mockCalls();
     const source = snapshot();
     const settings = options(calls.fetch, { trustedFeatureReference: undefined });
     const fixed = await scoreSnapshotWithDecisions(source, settings);
-    fixed.usage!.rubricVersion = "2026-10-18-v2";
-    fixed.usage!.referenceVersion = "2026-09-29-verified-2026-10-18";
+    fixed.usage!.rubricVersion = version;
+    fixed.usage!.referenceVersion = version === "2026-10-18-v2" ? "2026-09-29-verified-2026-10-18" : "2026-10-18-verified-v2";
+    delete fixed.usage!.decisionsConditions;
+    delete fixed.usage!.decisionsConditionProbabilities;
+    delete fixed.usage!.conditionThreshold;
+    const original = structuredClone(fixed);
     const explained = await explainScoredSnapshot(source, fixed, settings);
     const developer = (calls.bodies[1].input as Array<{ role: string; content: string }>).find((item) => item.role === "developer")!.content;
-    expect(developer).toContain("rubric version 2026-10-18-v2");
-    expect(developer).not.toContain("Website annotations are also included");
-    expect(explained.usage?.rubricVersion).toBe("2026-10-18-v2");
+    expect(developer).toContain(`rubric version ${version}`);
+    if (version === "2026-10-18-v2") expect(developer).not.toContain("Website annotations are also included");
+    else expect(developer).toContain("Website annotations are also included");
+    expect(developer).not.toContain("For condition-based v4 judging");
+    const user = (calls.bodies[1].input as Array<{ role: string; content: string }>).find((item) => item.role === "user")!.content;
+    expect(JSON.parse(user)).not.toHaveProperty("conditionChecks");
+    expect(JSON.parse(user)).not.toHaveProperty("conditionProbabilities");
+    expect(JSON.parse(user)).not.toHaveProperty("conditionThreshold");
+    expect(explained.usage?.rubricVersion).toBe(version);
+    expect(explained.usage?.decisionsConditions).toBeUndefined();
+    expect(explained.usage?.decisionsConditionProbabilities).toBeUndefined();
+    expect(explained.usage?.conditionThreshold).toBeUndefined();
     expect(explained.criteria.map((item) => item.score)).toEqual(fixed.criteria.map((item) => item.score));
     expect(explained.total).toBe(fixed.total);
     expect(explained.usage?.sourceHash).toBe(fixed.usage?.sourceHash);
+    expect(fixed).toEqual(original);
+    expect(calls.urls).toEqual(["https://api.openai.com/v1/decisions", "https://api.openai.com/v1/responses"]);
+  });
+
+  it.each([
+    { prefix: 0, upper: [4, 10] },
+    { prefix: 2, upper: [6, 10] },
+    { prefix: 6, upper: [10] }
+  ])("keeps the contiguous technical prefix $prefix and preserves its nonmonotonic review guard through Sol", async ({ prefix, upper }) => {
+    const body = decisions(0.8, { technical: prefix, ux: 6, impact: 6, idea: 6 });
+    const selected = conditions({ technical: prefix, ux: 6, impact: 6, idea: 6 });
+    const probabilities = conditionProbabilities({ technical: prefix, ux: 6, impact: 6, idea: 6 });
+    for (const level of upper) {
+      const name = `technical_level_${level}`;
+      selected[name] = true;
+      probabilities[name] = 0.95;
+      const answer = body.answers.find((item) => item.name === name)!;
+      answer.probability = 0.95;
+    }
+    const value = judgment();
+    value.criteria[0]!.score = prefix;
+    value.total = prefix + 18;
+    expect(value.reviewRequired).toBe(false);
+    const calls = mockCalls(body, responses(value));
+    const source = snapshot();
+    const fixed = await scoreSnapshotWithDecisions(source, options(calls.fetch));
+    expect(fixed.criteria.map((item) => item.score)).toEqual([prefix, 6, 6, 6]);
+    expect(fixed.total).toBe(prefix + 18);
+    expect(fixed.reviewRequired).toBe(true);
+    const audit = { decisionsConditions: selected, decisionsConditionProbabilities: probabilities, conditionThreshold: 0.8 };
+    expect(fixed.usage).toMatchObject(audit);
+    const original = structuredClone({ source, fixed });
+    const result = await explainScoredSnapshot(source, fixed, options(calls.fetch));
+    expect(result.reviewRequired).toBe(true);
+    expect(result.criteria.map((item) => item.score)).toEqual([prefix, 6, 6, 6]);
+    expect(result.total).toBe(prefix + 18);
+    expect(result.usage).toMatchObject(audit);
+    expect(result.usage?.decisionsScores).toEqual(fixed.usage?.decisionsScores);
+    expect({ source, fixed }).toEqual(original);
   });
 
   it("explains immutable scores from the supplied snapshot only and appends Sol usage", async () => {
@@ -574,20 +675,26 @@ describe("explainScoredSnapshot", () => {
     expect(input[0].role).toBe("developer");
     expect(input[0].content).not.toContain(injected);
     expect(input[1].role).toBe("user");
-    expect(JSON.parse(input[1].content)).toEqual({ snapshot: JSON.parse((await prepareFullSourceSnapshot(source)).serialized), fixedScores: {
+    expect(JSON.parse(input[1].content)).toEqual({ snapshot: JSON.parse((await prepareFullSourceSnapshot(source)).serialized), conditionChecks: conditions(), conditionProbabilities: conditionProbabilities(), conditionThreshold: 0.8, fixedScores: {
       repoAssessment: "scored", pinnedSha: sha, total: 24,
       criteria: CRITERIA.map(({ key, label }) => ({ key, label, score: 6 }))
     } });
+    const futureInput = calls.counters[1]!.input as Array<{ role: string; content: string }>;
+    expect(JSON.parse(futureInput[1]!.content)).toMatchObject({ conditionChecks: conditions(10), conditionProbabilities: Object.fromEntries(DECISION_CONDITIONS.map(({ name }) => [name, 1])), conditionThreshold: 0.8 });
+    expect(calls.counters[2]!.input).toEqual(input);
     expect(calls.bodies[1].text).toMatchObject({ format: { type: "json_schema", strict: true, schema: { required: expect.arrayContaining(["reviewRequired"]) } } });
     expect(reservations[1]).toMatchObject({ kind: "responses", model: "gpt-6.1-sol", maxOutputTokens: 8192 });
     expect(reservations[1].maxInputTokens).toBe(9242);
     expect(reservations[1].reservedUsd).toBeGreaterThanOrEqual((reservations[1].maxInputTokens * 2.5 + 8192 * 10) / 1_000_000);
     expect(settlements.map(({ kind }) => kind)).toEqual(["decisions", "responses"]);
     expect(result).toMatchObject({ ...judgment(), attackProbability: fixed.attackProbability, attackScore: fixed.attackScore,
-      usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol", effort: "medium", inputTokens: 300, outputTokens: 50, costUsd: 0.000872, requestIds: ["req-1", "req-2"], decisionsScores: fixed.usage!.decisionsScores }
+      usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol", effort: "medium", inputTokens: 300, outputTokens: 50, costUsd: 0.000872, requestIds: ["req-1", "req-2"], decisionsScores: fixed.usage!.decisionsScores, ...conditionAudit() }
     });
     expect(result.usage?.referenceVersion).toBe(fixed.usage?.referenceVersion);
     expect(result.usage?.rubricVersion).toBe(fixed.usage?.rubricVersion);
+    expect(result.usage?.decisionsConditions).toEqual(fixed.usage?.decisionsConditions);
+    expect(result.usage?.decisionsConditionProbabilities).toEqual(fixed.usage?.decisionsConditionProbabilities);
+    expect(result.usage?.conditionThreshold).toBe(fixed.usage?.conditionThreshold);
     expect({ source, fixed }).toEqual(original);
   });
 
@@ -623,6 +730,12 @@ describe("explainScoredSnapshot", () => {
     ["attack score field", { ...judgment(), attackScore: 100 }],
     ["attack probability field", { ...judgment(), attackProbability: 1 }],
     ["usage field", { ...judgment(), usage: {} }],
+    ["condition checks field", { ...judgment(), conditionChecks: conditions(10) }],
+    ["condition probability input field", { ...judgment(), conditionProbabilities: conditionProbabilities(10) }],
+    ["condition metadata field", { ...judgment(), decisionsConditions: conditions(10) }],
+    ["condition probabilities field", { ...judgment(), decisionsConditionProbabilities: conditionProbabilities(10) }],
+    ["condition input probabilities field", { ...judgment(), conditionProbabilities: conditionProbabilities(10) }],
+    ["condition threshold field", { ...judgment(), conditionThreshold: 0.8 }],
     ["eligibility field", { ...judgment(), eligibility: "eligible" }],
     ["missing review flag", { ...judgment(), reviewRequired: undefined }],
     ["invalid review flag", { ...judgment(), reviewRequired: "true" }],
@@ -702,6 +815,70 @@ describe("explainScoredSnapshot", () => {
     expect({ source, fixed }).toEqual(original);
   });
 
+  it.each([
+    ["missing audit group", { decisionsConditions: undefined, decisionsConditionProbabilities: undefined, conditionThreshold: undefined }],
+    ["only boolean map", { decisionsConditionProbabilities: undefined, conditionThreshold: undefined }],
+    ["only probability map", { decisionsConditions: undefined, conditionThreshold: undefined }],
+    ["only threshold", { decisionsConditions: undefined, decisionsConditionProbabilities: undefined }],
+    ["missing boolean map", { decisionsConditions: undefined }],
+    ["missing probability map", { decisionsConditionProbabilities: undefined }],
+    ["missing threshold", { conditionThreshold: undefined }],
+    ["null boolean map", { decisionsConditions: null }],
+    ["array boolean map", { decisionsConditions: Array(20).fill(true) }],
+    ["missing condition", { decisionsConditions: Object.fromEntries(Object.entries(conditions()).slice(1)) }],
+    ["extra condition", { decisionsConditions: { ...conditions(), other_level_2: false } }],
+    ["renamed condition", { decisionsConditions: { ...Object.fromEntries(Object.entries(conditions()).slice(1)), other_level_2: true } }],
+    ["string condition", { decisionsConditions: { ...conditions(), technical_level_2: "true" } }],
+    ["numeric condition", { decisionsConditions: { ...conditions(), technical_level_2: 1 } }],
+    ["null condition", { decisionsConditions: { ...conditions(), technical_level_2: null } }],
+    ["null probability map", { decisionsConditionProbabilities: null }],
+    ["array probability map", { decisionsConditionProbabilities: Array(20).fill(0.95) }],
+    ["missing probability name", { decisionsConditionProbabilities: Object.fromEntries(Object.entries(conditionProbabilities()).slice(1)) }],
+    ["extra probability name", { decisionsConditionProbabilities: { ...conditionProbabilities(), other_level_2: 0.95 } }],
+    ["renamed probability name", { decisionsConditionProbabilities: { ...Object.fromEntries(Object.entries(conditionProbabilities()).slice(1)), other_level_2: 0.95 } }],
+    ...([
+      ["string probability", "0.95"], ["null probability", null], ["boolean probability", true],
+      ["array probability", [0.95]], ["object probability", { value: 0.95 }],
+      ["NaN probability", NaN], ["infinite probability", Infinity],
+      ["negative probability", -0.000001], ["probability above one", 1.000001]
+    ] satisfies Array<[string, unknown]>).map(([name, value]) => [name, { decisionsConditionProbabilities: { ...conditionProbabilities(), technical_level_2: value } }] as const),
+    ...([
+      ["null threshold", null], ["string threshold", "0.8"], ["boolean threshold", true],
+      ["lower threshold", 0.799999], ["higher threshold", 0.800001]
+    ] satisfies Array<[string, unknown]>).map(([name, value]) => [name, { conditionThreshold: value }] as const),
+    ["boolean-probability mismatch", { decisionsConditionProbabilities: { ...conditionProbabilities(), technical_level_2: 0.799999 } }],
+    ["false boolean at inclusive boundary", { decisionsConditionProbabilities: { ...conditionProbabilities(), technical_level_8: 0.8 } }],
+    ["derived score contradiction", conditionAudit(4)],
+    ["missing nonmonotonic review guard", {
+      decisionsConditions: { ...conditions(), technical_level_10: true },
+      decisionsConditionProbabilities: { ...conditionProbabilities(), technical_level_10: 0.95 }
+    }]
+  ])("rejects fixed v4 %s before Sol, counters, or callbacks", async (_name, metadata) => {
+    const calls = mockCalls();
+    const source = snapshot();
+    const fixed = await scoreSnapshotWithDecisions(source, options(calls.fetch));
+    expect(fixed.usage?.rubricVersion).toBe("2026-10-18-v4");
+    const altered = { ...fixed, usage: { ...fixed.usage, ...metadata } } as unknown as PublicScoreResult;
+    for (const [key, value] of Object.entries(metadata)) {
+      if (value === undefined) delete (altered.usage as unknown as Record<string, unknown>)[key];
+    }
+    const original = structuredClone({ source, altered });
+    const beforeCall = vi.fn();
+    const afterCall = vi.fn();
+    const beforeSnapshot = vi.fn();
+    const onSnapshotBytes = vi.fn();
+    await expect(explainScoredSnapshot(source, altered, options(calls.fetch, {
+      beforeCall, afterCall, beforeSnapshot, onSnapshotBytes
+    }))).rejects.toThrow();
+    expect(calls.counters).toHaveLength(2);
+    expect(calls.bodies).toHaveLength(1);
+    expect(beforeCall).not.toHaveBeenCalled();
+    expect(afterCall).not.toHaveBeenCalled();
+    expect(beforeSnapshot).not.toHaveBeenCalled();
+    expect(onSnapshotBytes).not.toHaveBeenCalled();
+    expect({ source, altered }).toEqual(original);
+  });
+
   it("validates all fixed authority and Decisions usage before invoking Sol", async () => {
     const calls = mockCalls();
     const fixed = await scoreSnapshotWithDecisions(snapshot(), options(calls.fetch));
@@ -711,7 +888,7 @@ describe("explainScoredSnapshot", () => {
       { ...fixed, criteria: fixed.criteria.map((item, index) => index === 0 ? { ...item, score: 4 } : item), total: 22 },
       { ...fixed, criteria: fixed.criteria.map((item) => ({ ...item, label: "other" })) },
       { ...fixed, criteria: fixed.criteria.map((item) => ({ ...item, evidencePaths: ["other.ts"] })) },
-      { ...fixed, attackScore: null },
+      { ...fixed, attackScore: 80 },
       { ...fixed, attackProbability: undefined },
       { ...fixed, usage: undefined },
       { ...fixed, usage: { ...fixed.usage, model: "gpt-6.1-sol" } },
@@ -733,7 +910,7 @@ describe("explainScoredSnapshot", () => {
     const source = snapshot();
     source.files[0]!.path = "README.md";
     const value = { ...judgment(), reviewRequired: true, criteria: judgment().criteria.map((item) => ({ ...item, evidencePaths: ["README.md"], reason: "固定点を支える実装ソースの証拠が不足しています。" })) };
-    const calls = mockCalls(decisions(), responses(value));
+    const calls = mockCalls(decisions(0.8), responses(value));
     const settings = options(calls.fetch);
     const fixed = await scoreSnapshotWithDecisions(source, settings);
     const result = await explainScoredSnapshot(source, fixed, settings);

@@ -15,8 +15,9 @@ Opt-in paid scoring calibration. Requires only ${KEY_NAME}.
   --repeats 1|2|3           Decisions calls per case (default: 2)
   --output path            JSON report (default: /tmp/devday-scoring-calibration-<timestamp>.json)
   --budget USD             Positive run budget, at most 10 (default: 5)
+  --decisions-only         Probe conditions without a paid explanation
 
-Each case gets Decisions replicates and one explanation of its first fixed result.
+Each case gets Decisions replicates and, unless --decisions-only, one explanation of its first fixed result.
 No automatic retries. Unsettled reservations remain charged against the budget.
 Model catalog checks confirm availability only, not model recency.
 `;
@@ -33,10 +34,10 @@ function parseArgs(args) {
   const seen = new Set();
   for (let i = 0; i < args.length; i++) {
     const flag = args[i];
-    requireThat(["--live", "--help", "--effort", "--cases", "--repeats", "--output", "--budget"].includes(flag), "arguments", "Unknown argument");
+    requireThat(["--live", "--help", "--effort", "--cases", "--repeats", "--output", "--budget", "--decisions-only"].includes(flag), "arguments", "Unknown argument");
     requireThat(!seen.has(flag), "arguments", "Duplicate argument");
     seen.add(flag);
-    if (flag === "--help" || flag === "--live") { options[flag.slice(2)] = true; continue; }
+    if (flag === "--help" || flag === "--live" || flag === "--decisions-only") { options[flag.slice(2)] = true; continue; }
     const value = args[++i];
     requireThat(typeof value === "string" && value.trim() && !value.startsWith("--"), "arguments", "Missing argument value");
     options[flag.slice(2)] = value;
@@ -65,8 +66,12 @@ const redact = (value) => apiKey ? value.split(apiKey).join("[REDACTED]") : valu
 const json = (value) => JSON.stringify(value, (_key, item) => typeof item === "string" ? redact(item) : item, 2);
 const safeRequestId = (value) => typeof value === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value)
   && (!apiKey || !value.includes(apiKey)) ? value : null;
-const safeError = (error) => ({ stage, code: error instanceof CalibrationError ? error.code : "operation_failed",
-  message: error instanceof CalibrationError ? redact(error.message) : "Operation failed; sensitive error details omitted" });
+const safeError = (error) => {
+  const status = error instanceof Error && /^OpenAI request returned status (\d{3})$/.exec(error.message);
+  return { stage, code: error instanceof CalibrationError ? error.code : status ? "openai_http_error" : "operation_failed",
+    ...(status ? { status: Number(status[1]) } : {}),
+    message: error instanceof CalibrationError ? redact(error.message) : status ? `OpenAI request returned status ${status[1]}` : "Operation failed; sensitive error details omitted" };
+};
 function progress(event, extra = {}) {
   process.stdout.write(`${JSON.stringify({ event, ...extra, ...(report ? {
     spentMicroUsd: report.ledger.spentMicroUsd, pendingMicroUsd: report.ledger.pendingMicroUsd
@@ -107,6 +112,9 @@ export { buildDecisionsQuestions, buildExplanationPrompt } from './src/shared/pr
 export { RUBRIC_VERSION } from './src/shared/rubric.ts';
 export { DEVDAY_REFERENCE_VERSION } from './src/shared/devday-reference.ts';
 export { SHARED_CONTENT_INSTRUCTIONS } from './src/shared/model-evidence.ts';
+export { DECISION_CONDITIONS } from './src/shared/decision-conditions.ts';
+export { CONDITION_PROBABILITY_THRESHOLD } from './src/shared/decision-conditions.ts';
+export { deriveConditionScores } from './src/shared/decision-conditions.ts';
 export { CALIBRATION_CASES } from './tests/calibration-cases.ts';`,
       resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "calibration-entry.ts", loader: "ts" } });
   return import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`);
@@ -188,11 +196,14 @@ function validateCase(item) {
     && typeof item.label === "string" && item.label.trim() && item.expected && typeof item.expected === "object"
     && !Array.isArray(item.expected), "fixtures", "Invalid calibration case identity or expectations");
   const expected = item.expected;
-  requireThat(Object.keys(expected).every((key) => ["scores", "eligibility", "attack", "total", "forbiddenOutputStrings"].includes(key)),
+  requireThat(Object.keys(expected).every((key) => ["scores", "conditions", "eligibility", "attack", "total", "forbiddenOutputStrings"].includes(key)),
     "fixtures", "Unknown expectation field");
   const band = (value) => Array.isArray(value) && value.length === 2 && value.every(Number.isFinite) && value[0] <= value[1];
   requireThat(expected.scores === undefined || (expected.scores && typeof expected.scores === "object"
     && Object.entries(expected.scores).every(([key, value]) => CRITERIA.includes(key) && band(value))), "fixtures", "Invalid criterion bands");
+  requireThat(expected.conditions === undefined || (expected.conditions && typeof expected.conditions === "object"
+    && !Array.isArray(expected.conditions) && Object.entries(expected.conditions).every(([name, value]) =>
+      /^(technical|ux|impact|idea)_level_(2|4|6|8|10)$/.test(name) && typeof value === "boolean")), "fixtures", "Invalid condition expectations");
   requireThat([expected.total, expected.attack].every((value) => value === undefined || band(value))
     && (expected.eligibility === undefined || ["eligible", "no_implementation"].includes(expected.eligibility))
     && (expected.forbiddenOutputStrings === undefined || (Array.isArray(expected.forbiddenOutputStrings)
@@ -233,6 +244,23 @@ function inspectResult(raw, snapshot, metadata, row, name, modules, explanation 
     const value = result.criteria.find((item) => item.key === key)?.score;
     check(row, `${name}:score:${key}`, value >= band[0] && value <= band[1]);
   }
+  check(row, `${name}:conditionsComplete`, usage?.decisionsConditions
+    && Object.keys(usage.decisionsConditions).length === modules.DECISION_CONDITIONS.length);
+  const conditionReview = usage?.decisionsConditions && modules.deriveConditionScores(usage.decisionsConditions).reviewRequired;
+  check(row, `${name}:conditionReviewPreserved`, !conditionReview || result.reviewRequired === true);
+  if (conditionReview) {
+    for (const key of CRITERIA) {
+      const conditions = modules.DECISION_CONDITIONS.filter((condition) => condition.key === key);
+      const unmet = conditions.find((condition) => !usage.decisionsConditions[condition.name]);
+      const later = unmet && conditions.filter((condition) => condition.level > unmet.level && usage.decisionsConditions[condition.name]);
+      if (later?.length) row.conditionDiagnostics.push({ phase: name, key, unmetPrerequisite: unmet.name,
+        unmetProbability: usage.decisionsConditionProbabilities[unmet.name], laterMetConditions: later.map((condition) => ({
+          name: condition.name, probability: usage.decisionsConditionProbabilities[condition.name] })), reviewRequired: result.reviewRequired === true });
+    }
+  }
+  for (const [condition, expected] of Object.entries(row.expected.conditions ?? {})) {
+    check(row, `${name}:condition:${condition}`, usage?.decisionsConditions?.[condition] === expected);
+  }
   for (const [key, value] of [["total", result.total], ["attack", result.attackScore ?? 0]]) {
     const band = row.expected[key];
     if (band) check(row, `${name}:${key}`, value >= band[0] && value <= band[1]);
@@ -250,11 +278,14 @@ function fixedFields(result) {
   return { scores: CRITERIA.map((key) => result.criteria.find((item) => item.key === key)?.score), total: result.total,
     pinnedSha: result.pinnedSha, repoAssessment: result.repoAssessment, eligibility: result.eligibility,
     attackScore: result.attackScore, attackProbability: result.attackProbability,
-    source: ["fullSource", "sourceFiles", "sourceBytes", "sourceHash"].map((key) => result.usage?.[key]) };
+    source: ["fullSource", "sourceFiles", "sourceBytes", "sourceHash"].map((key) => result.usage?.[key]),
+    conditions: result.usage?.decisionsConditions,
+    conditionProbabilities: result.usage?.decisionsConditionProbabilities,
+    conditionThreshold: result.usage?.conditionThreshold };
 }
 async function runCase(item, modules) {
   const row = { id: item.id, label: item.label, synthetic: item.repoUrl === undefined, expected: item.expected, status: "running", decisionsReplicates: [],
-    explanation: null, reviewRequired: null, checks: [], errors: [], costUSD: 0, requestIds: [] };
+    explanation: null, reviewRequired: null, conditionDiagnostics: [], checks: [], errors: [], costUSD: 0, requestIds: [] };
   report.cases.push(row);
   await persist();
   try {
@@ -268,15 +299,17 @@ async function runCase(item, modules) {
       row.decisionsReplicates.push(inspectResult(result, snapshot, prepared.metadata, row, `decisions:${replicate}`, modules));
       await persist();
     }
-    stage = "explanation";
-    const first = row.decisionsReplicates[0];
-    const fixed = JSON.stringify(fixedFields(first));
-    const result = await modules.explainScoredSnapshot(snapshot, structuredClone(first), callbacks(modules, { caseId: item.id, phase: stage }));
-    row.explanation = inspectResult(result, snapshot, prepared.metadata, row, "explanation", modules, true);
-    row.reviewRequired = row.explanation.reviewRequired ?? null;
-    check(row, "explanation:fixed", JSON.stringify(fixedFields(row.explanation)) === fixed);
-    check(row, "explanation:reasons", row.explanation.criteria.every((criterion) => typeof criterion.reason === "string" && criterion.reason.trim())
-      && row.explanation.summary.trim() && row.explanation.publicReason.trim());
+    if (!options["decisions-only"]) {
+      stage = "explanation";
+      const first = row.decisionsReplicates[0];
+      const fixed = JSON.stringify(fixedFields(first));
+      const result = await modules.explainScoredSnapshot(snapshot, structuredClone(first), callbacks(modules, { caseId: item.id, phase: stage }));
+      row.explanation = inspectResult(result, snapshot, prepared.metadata, row, "explanation", modules, true);
+      row.reviewRequired = row.explanation.reviewRequired ?? null;
+      check(row, "explanation:fixed", JSON.stringify(fixedFields(row.explanation)) === fixed);
+      check(row, "explanation:reasons", row.explanation.criteria.every((criterion) => typeof criterion.reason === "string" && criterion.reason.trim())
+        && row.explanation.summary.trim() && row.explanation.publicReason.trim());
+    }
     check(row, "snapshot:unchanged", (await modules.prepareFullSourceSnapshot(snapshot)).metadata.sourceHash === prepared.metadata.sourceHash);
   } catch (error) {
     row.errors.push(safeError(error));
@@ -284,7 +317,7 @@ async function runCase(item, modules) {
   }
   const entries = report.ledger.reservations.filter((entry) => entry.caseId === item.id);
   check(row, "reservations:settled", entries.every((entry) => entry.status === "settled"));
-  row.status = !row.errors.length && row.explanation && row.decisionsReplicates.length === options.repeats
+  row.status = !row.errors.length && (options["decisions-only"] || row.explanation) && row.decisionsReplicates.length === options.repeats
     && row.checks.every((item) => item.pass) ? "passed" : "failed";
   await persist();
   progress("case", { id: row.id, status: row.status });
@@ -293,7 +326,7 @@ async function main() {
   options = parseArgs(process.argv.slice(2));
   if (options.help) { process.stdout.write(HELP); return; }
   apiKey = process.env[KEY_NAME] ?? "";
-  report = { startedAt: new Date().toISOString(), status: "running", effort: options.effort, repeats: options.repeats,
+  report = { startedAt: new Date().toISOString(), status: "running", effort: options.effort, repeats: options.repeats, decisionsOnly: Boolean(options["decisions-only"]),
     selectedIds: options.cases ?? null, models: MODELS, catalogChecksAvailabilityOnly: true, budgetStopped: false,
     ledger: { budgetMicroUsd: Math.floor(options.budget * 1_000_000), spentMicroUsd: 0, pendingMicroUsd: 0, reservations: [], events: [] },
     cases: [], checks: [], errors: [] };
@@ -305,6 +338,8 @@ async function main() {
   const modules = await trustedModules();
   report.policy = {
     rubricVersion: modules.RUBRIC_VERSION,
+    scoreDerivation: "highest-consecutive-met-condition-v1",
+    conditionThreshold: modules.CONDITION_PROBABILITY_THRESHOLD,
     referenceVersion: modules.DEVDAY_REFERENCE_VERSION,
     evidenceEncoding: "exact-content-references-v1",
     encodingInstructionsHash: createHash("sha256").update(modules.SHARED_CONTENT_INSTRUCTIONS).digest("hex"),
