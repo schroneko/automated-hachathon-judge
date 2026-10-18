@@ -1,4 +1,4 @@
-import { EVENT_ID } from "../shared/constants";
+import { EVENT_ID, MAX_MEMORY_DEFERRALS } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import type { ExplanationQueueMessage, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot } from "../shared/types";
 import { implementationEligibility, prepareFullSourceSnapshot, validatePublicScoreResult } from "../shared/validation";
@@ -38,7 +38,8 @@ export async function persistDecisions(job: LeaseJob, result: PublicScoreResult,
 export function validExplanationMessage(value: unknown): value is ExplanationQueueMessage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const message = value as Record<string, unknown>;
-  return Object.keys(message).length === 5 && message.type === "explain_submission" && message.eventId === EVENT_ID
+  return Object.keys(message).every((key) => ["type", "eventId", "submissionId", "attempt", "dispatch", "memoryDeferrals"].includes(key)) && message.type === "explain_submission" && message.eventId === EVENT_ID
+    && (message.memoryDeferrals === undefined || Number.isSafeInteger(message.memoryDeferrals) && Number(message.memoryDeferrals) >= 0 && Number(message.memoryDeferrals) <= MAX_MEMORY_DEFERRALS)
     && typeof message.submissionId === "string" && /^[A-Za-z0-9-]{1,100}$/.test(message.submissionId)
     && Number.isSafeInteger(message.attempt) && Number(message.attempt) >= 1 && Number(message.attempt) <= 3
     && Number.isSafeInteger(message.dispatch) && Number(message.dispatch) >= 1 && Number(message.dispatch) <= 3;

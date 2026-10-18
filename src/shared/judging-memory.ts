@@ -25,6 +25,12 @@ export class JudgingMemoryPool {
     return this.waiters.length;
   }
 
+  tryAcquire(): JudgingMemoryLease | null {
+    this.pruneExpiredTickets(Date.now());
+    if (this.waiters.length > 0 || this.reservedBytes + INITIAL_RESERVATION_BYTES > MEMORY_BUDGET_BYTES) return null;
+    return this.createLease();
+  }
+
   async acquire(): Promise<JudgingMemoryLease> {
     const ticket = this.nextTicket++;
     const deadline = Date.now() + ACQUISITION_TIMEOUT_MS;
@@ -89,4 +95,8 @@ const judgingMemoryPool = new JudgingMemoryPool();
 
 export function acquireJudgingMemory(): Promise<JudgingMemoryLease> {
   return judgingMemoryPool.acquire();
+}
+
+export function tryAcquireJudgingMemory(): JudgingMemoryLease | null {
+  return judgingMemoryPool.tryAcquire();
 }

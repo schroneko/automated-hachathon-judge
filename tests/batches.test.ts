@@ -240,23 +240,37 @@ describe("batch admission", () => {
     expect(fresh.database.rows()).toHaveLength(2);
   });
 
-  it("accepts thirty new validation submissions after thirty-three existing results without using production capacity", async () => {
+  it("accepts thirty new validation submissions after seventy-one existing results without using production capacity", async () => {
     const { create, database, call } = setup();
     expect((await create(input(30, "validation", "previous"))).response.status).toBe(202);
-    expect((await create(input(3, "validation", "additional"))).response.status).toBe(202);
+    expect((await create(input(30, "validation", "additional"))).response.status).toBe(202);
+    expect((await create(input(11, "validation", "more"))).response.status).toBe(202);
     const next = await create(input(30, "validation", "manual-test"));
     expect(next.response.status).toBe(202);
     expect(next.payload.submissions).toHaveLength(30);
-    expect(database.rows().filter((row) => row.mode === "validation")).toHaveLength(63);
+    expect(database.rows().filter((row) => row.mode === "validation")).toHaveLength(101);
     expect(database.rows().filter((row) => row.mode === "production")).toHaveLength(0);
     const account = database.db.prepare("SELECT mode, limit_micro_usd, spent_micro_usd, reserved_micro_usd FROM devday_judge_budget_accounts ORDER BY mode").all();
     expect(account).toEqual([
       { mode: "production", limit_micro_usd: 90_000_000, spent_micro_usd: 0, reserved_micro_usd: 0 },
-      { mode: "validation", limit_micro_usd: 20_000_000, spent_micro_usd: 0, reserved_micro_usd: 0 }
+      { mode: "validation", limit_micro_usd: 40_000_000, spent_micro_usd: 0, reserved_micro_usd: 0 }
     ]);
     const before = database.changes();
     const dashboard = await (await call("/api/dashboard")).json();
-    expect(dashboard).toMatchObject({ event: { submissionLimits: { production: 40, validation: 100 } }, counts: { total: 0 }, ranking: [] });
+    expect(dashboard).toMatchObject({ event: { submissionLimits: { production: 40, validation: 140 } }, counts: { total: 0 }, ranking: [] });
+    expect(database.changes()).toBe(before);
+  });
+
+  it("raises only the validation allowance while retaining charges, reservations and larger existing limits", () => {
+    const { database } = setup();
+    database.db.exec("UPDATE devday_judge_budget_accounts SET limit_micro_usd = 20000000, spent_micro_usd = 17000000, reserved_micro_usd = 500000 WHERE mode = 'validation'");
+    const beforeProduction = database.db.prepare("SELECT * FROM devday_judge_budget_accounts WHERE mode = 'production'").get();
+    const migration = readFileSync(new URL("../migrations/0010_validation_capacity.sql", import.meta.url), "utf8");
+    database.db.exec(migration);
+    expect(database.db.prepare("SELECT limit_micro_usd, spent_micro_usd, reserved_micro_usd FROM devday_judge_budget_accounts WHERE mode = 'validation'").get()).toEqual({limit_micro_usd: 40000000, spent_micro_usd: 17000000, reserved_micro_usd: 500000});
+    expect(database.db.prepare("SELECT * FROM devday_judge_budget_accounts WHERE mode = 'production'").get()).toEqual(beforeProduction);
+    const before = database.changes();
+    database.db.exec(migration);
     expect(database.changes()).toBe(before);
   });
 

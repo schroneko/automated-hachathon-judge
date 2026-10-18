@@ -6,6 +6,7 @@ import { implementationEligibility, prepareFullSourceSnapshot } from "../src/sha
 import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, RecoveryQueueMessage, RepoEvidenceSnapshot, ScoringQueueMessage } from "../src/shared/types";
 import type { ScoringOptions } from "../src/container/scorer";
 import { processFreezeMessage } from "../src/worker/batches";
+import { tryAcquireJudgingMemory } from "../src/shared/judging-memory";
 
 const scorer = vi.hoisted(() => ({ scoreSubmissionDecisions: vi.fn(), explainScoredSnapshot: vi.fn() }));
 vi.mock("../src/container/scorer", () => ({
@@ -35,7 +36,7 @@ import { callback, claimQueueMessage, claimRecoveryMessage, handleApiRequest, va
 import type { SubmissionRow } from "../src/worker/api";
 import { processExplanationMessage, processRecoveryMessage, processScoringMessage } from "../src/worker/queue";
 import { loadEvidenceSnapshot, persistEvidenceSnapshot } from "../src/worker/evidence-store";
-import { persistDecisions } from "../src/worker/explanations";
+import { claimExplanation, persistDecisions } from "../src/worker/explanations";
 import worker from "../src/worker/index";
 
 class SqliteD1 {
@@ -114,11 +115,13 @@ function setup() {
   const controls: FreezeQueueMessage[] = [];
   const explanations: ExplanationQueueMessage[] = [];
   const recoveries: RecoveryQueueMessage[] = [];
+  const delayed: Array<{ queue: "scoring" | "explanation"; message: ScoringQueueMessage | RecoveryQueueMessage | ExplanationQueueMessage; options: { delaySeconds: number } }> = [];
   let sendError = false;
+  let delayedSendError = false;
   const env = {
     JUDGE_DB: database,
-    SCORING_QUEUE: { send: async (message: ScoringQueueMessage | FreezeQueueMessage | RecoveryQueueMessage) => { if ("type" in message && message.type === "freeze_batch") { controls.push(message); return; } if ("type" in message) recoveries.push(message); else sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
-    EXPLANATION_QUEUE: { send: async (message: ExplanationQueueMessage) => { explanations.push(message); } },
+    SCORING_QUEUE: { send: async (message: ScoringQueueMessage | FreezeQueueMessage | RecoveryQueueMessage, options?: { delaySeconds: number }) => { if ("type" in message && message.type === "freeze_batch") { controls.push(message); return; } if (options) { delayed.push({ queue: "scoring", message, options }); if (delayedSendError) throw new Error("delayed send failed"); return; } if ("type" in message) recoveries.push(message); else sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
+    EXPLANATION_QUEUE: { send: async (message: ExplanationQueueMessage, options?: { delaySeconds: number }) => { if (options) { delayed.push({ queue: "explanation", message, options }); if (delayedSendError) throw new Error("delayed send failed"); return; } explanations.push(message); } },
     RUNNER_TOKEN: "organizer-secret",
     JUDGING_ENABLED: "true",
     SUBMISSIONS_OPEN: "true",
@@ -137,7 +140,7 @@ function setup() {
     const body = await response.json() as { submission?: { id: string } };
     return { response, id: body.submission?.id ?? "" };
   }
-  return { database, env, sent, explanations, recoveries, api, create, setSendError: (value: boolean) => { sendError = value; } };
+  return { database, env, sent, explanations, recoveries, delayed, api, create, setSendError: (value: boolean) => { sendError = value; }, setDelayedSendError: (value: boolean) => { delayedSendError = value; } };
 }
 
 async function queuedRecovery(attempt = 1, mode: "production" | "validation" = "production") {
@@ -152,6 +155,239 @@ async function queuedRecovery(attempt = 1, mode: "production" | "validation" = "
 
 beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); scorer.scoreSubmissionDecisions.mockReset(); scorer.explainScoredSnapshot.mockReset(); });
+
+describe("preclaim memory admission", () => {
+  const kinds = ["scoring", "recovery", "explanation"] as const;
+  type Kind = typeof kinds[number];
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6-luna" }, { id: "gpt-6.1-sol" }] })));
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
+  });
+
+  async function pending(kind: Kind) {
+    const fixture = kind === "recovery" ? await queuedRecovery() : await (async () => {
+      const value = setup();
+      const { id } = await value.create(`memory-${kind}`);
+      return { ...value, id };
+    })();
+    if (kind === "explanation") await processScoringMessage(fixture.sent[0], fixture.env);
+    scorer.scoreSubmissionDecisions.mockClear();
+    scorer.explainScoredSnapshot.mockClear();
+    vi.mocked(fetch).mockClear();
+    const message = kind === "scoring" ? fixture.sent[0]! : kind === "recovery" ? fixture.recoveries[0]! : fixture.explanations[0]!;
+    const deliver = kind === "scoring" ? processScoringMessage : kind === "recovery" ? processRecoveryMessage : processExplanationMessage;
+    return { ...fixture, message, deliver };
+  }
+
+  function available() {
+    const probe = tryAcquireJudgingMemory();
+    try { expect(probe).not.toBeNull(); } finally { probe?.release(); }
+  }
+
+  it.each(kinds)("keeps %s unclaimed beyond 120 seconds and succeeds once after delayed delivery", async (kind) => {
+    const fixture = await pending(kind);
+    const { database, env, id, message, deliver, delayed } = fixture;
+    const held = tryAcquireJudgingMemory();
+    expect(held).not.toBeNull();
+    try {
+      held!.reduceForSnapshot(2_100_773);
+      const before = database.row(id);
+      const budget = database.account("production");
+      const writes = database.changes();
+      const evidence = await loadEvidenceSnapshot(before, env);
+      const reservations = database.db.prepare("SELECT * FROM devday_judge_budget_reservations WHERE submission_id = ?").all(id);
+      let current = message;
+      for (let iteration = 1; iteration <= 26; iteration++) {
+        const ack = vi.fn();
+        await worker.queue({ messages: [{ body: current, ack }] } as unknown as MessageBatch<ScoringQueueMessage | RecoveryQueueMessage | ExplanationQueueMessage>, env, {} as ExecutionContext);
+        expect(ack).toHaveBeenCalledOnce();
+        expect(delayed).toHaveLength(1);
+        const next = delayed.shift()!;
+        expect(next).toEqual({ queue: kind === "explanation" ? "explanation" : "scoring", message: { ...message, memoryDeferrals: iteration }, options: { delaySeconds: 5 } });
+        current = next.message;
+        vi.setSystemTime(Date.now() + 5_000);
+        expect(database.row(id)).toEqual(before);
+        expect(database.account("production")).toEqual(budget);
+        expect(database.db.prepare("SELECT * FROM devday_judge_budget_reservations WHERE submission_id = ?").all(id)).toEqual(reservations);
+        expect(database.changes()).toBe(writes);
+      }
+      expect(await loadEvidenceSnapshot(database.row(id), env)).toEqual(evidence);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+      expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+      held!.release();
+      const prepare = database.prepare.bind(database);
+      let evidenceBeforeBudget = false;
+      vi.spyOn(database, "prepare").mockImplementation((sql) => {
+        if (sql.startsWith("UPDATE devday_judge_budget_accounts SET reserved_micro_usd = reserved_micro_usd +")) {
+          expect(database.db.prepare("SELECT complete, pinned_sha, callback_token, attempt FROM devday_judge_evidence_manifests WHERE submission_id = ?").get(id)).toMatchObject({ complete: 1, pinned_sha: before.pinned_sha, callback_token: database.row(id).callback_token, attempt: database.row(id).attempts });
+          evidenceBeforeBudget = true;
+        }
+        return prepare(sql);
+      });
+      const inference = kind === "explanation" ? scorer.explainScoredSnapshot : scorer.scoreSubmissionDecisions;
+      const charge = async (options: ScoringOptions) => {
+        const row = database.row(id);
+        expect(row.pinned_sha).toBe(before.pinned_sha);
+        const reservationId = await options.beforeCall!({ kind: kind === "explanation" ? "responses" : "decisions", model: kind === "explanation" ? "gpt-6.1-sol" : "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: kind === "explanation" ? 100 : 0, reservedUsd: 1 });
+        expect(await loadEvidenceSnapshot(database.row(id), env)).not.toBeNull();
+        await options.afterCall!({ reservationId, kind: kind === "explanation" ? "responses" : "decisions", model: kind === "explanation" ? "gpt-6.1-sol" : "gpt-6-luna", inputTokens: 100, outputTokens: 0, cachedInputTokens: 0, costUsd: kind === "explanation" ? 0.0003 : 0.00001 });
+      };
+      scorer.scoreSubmissionDecisions.mockImplementation(async (_job: LeaseJob, options: ScoringOptions) => { await charge(options); return score(); });
+      scorer.explainScoredSnapshot.mockImplementation(async (snapshot: RepoEvidenceSnapshot, fixed: PublicScoreResult, options: ScoringOptions) => { expect(snapshot).toEqual(evidence); await charge(options); return explained(fixed); });
+      await deliver(current, env);
+      const completedWrites = database.changes();
+      await deliver(current, env);
+      expect(database.changes()).toBe(completedWrites);
+      expect(inference).toHaveBeenCalledOnce();
+      expect(evidenceBeforeBudget).toBe(true);
+      expect(database.account("production")).toMatchObject({ spent_micro_usd: budget.spent_micro_usd + (kind === "explanation" ? 300 : 10), reserved_micro_usd: 0 });
+      expect(database.row(id)).toMatchObject({ attempts: before.attempts + (kind === "scoring" ? 1 : 0), dispatch_count: before.dispatch_count, recovery_dispatch_count: before.recovery_dispatch_count, pinned_sha: before.pinned_sha, frozen_at: before.frozen_at, explanation_status: kind === "explanation" ? "completed" : "pending" });
+      expect(delayed).toHaveLength(0);
+    } finally { held?.release(); }
+    available();
+  });
+
+  for (const kind of kinds) {
+    it.each(["cap", "send failure"] as const)(`terminates ${kind} on memory %s without attempts or charges`, async (failure) => {
+      const { database, env, id, message, deliver, delayed, setDelayedSendError } = await pending(kind);
+      const held = tryAcquireJudgingMemory();
+      expect(held).not.toBeNull();
+      try {
+        const before = database.row(id);
+        const budget = database.account("production");
+        setDelayedSendError(failure === "send failure");
+        await deliver({ ...message, memoryDeferrals: failure === "cap" ? 360 : 7 }, env);
+        expect(delayed).toHaveLength(failure === "cap" ? 0 : 1);
+        expect(database.row(id)).toMatchObject({ status: kind === "explanation" ? "completed" : "failed", attempts: before.attempts, dispatch_count: before.dispatch_count, recovery_dispatch_count: before.recovery_dispatch_count, callback_token: before.callback_token, pinned_sha: before.pinned_sha, decisions_result_json: before.decisions_result_json, explanation_dispatches: before.explanation_dispatches });
+        expect(database.row(id).failure_message).toMatch(failure === "cap" ? /memory capacity/ : /deferral delivery failed/);
+        if (kind === "explanation") {
+          expect(database.row(id).explanation_status).toBe("failed");
+          expect(JSON.parse(database.row(id).result_json!)).toEqual({ ...JSON.parse(before.result_json!), reviewRequired: true });
+        }
+        expect(database.account("production")).toEqual(budget);
+        expect(fetch).not.toHaveBeenCalled();
+        expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+        expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+      } finally { held?.release(); }
+      available();
+    });
+
+    it.each(["replacement", "completed"] as const)(`fences ${kind} memory terminal writes against a %s race`, async (race) => {
+      const { database, env, id, message, deliver, setDelayedSendError } = await pending(kind);
+      const held = tryAcquireJudgingMemory();
+      expect(held).not.toBeNull();
+      try {
+        const prepare = database.prepare.bind(database);
+        let raced: SubmissionRow | undefined;
+        let writes = 0;
+        vi.spyOn(database, "prepare").mockImplementation((sql) => {
+          const prepared = prepare(sql);
+          if (!sql.startsWith("UPDATE devday_judge_submissions SET") || !sql.includes("failure_message = ?")) return prepared;
+          return { bind(...values: unknown[]) {
+            const statement = prepared.bind(...values);
+            return { ...statement, async run() {
+              if (race === "replacement") database.db.prepare("UPDATE devday_judge_submissions SET callback_token = 'replacement', dispatch_count = dispatch_count + 1, explanation_dispatches = explanation_dispatches + 1 WHERE id = ?").run(id);
+              else database.db.prepare("UPDATE devday_judge_submissions SET status = 'completed', explanation_status = 'completed', result_json = ? WHERE id = ?").run(JSON.stringify(explained(score())), id);
+              raced = database.row(id);
+              writes = database.changes();
+              return statement.run();
+            } };
+          } };
+        });
+        setDelayedSendError(race === "replacement");
+        await deliver({ ...message, memoryDeferrals: race === "completed" ? 360 : 2 }, env);
+        expect(raced).toBeDefined();
+        expect(database.row(id)).toEqual(raced);
+        expect(database.changes()).toBe(writes);
+        expect(fetch).not.toHaveBeenCalled();
+      } finally { held?.release(); }
+      available();
+    });
+  }
+
+  it.each(["cap", "send failure"] as const)("preserves another delivery's active explanation when pending memory %s terminates", async (failure) => {
+    const { database, env, id, message, deliver, setDelayedSendError } = await pending("explanation");
+    const held = tryAcquireJudgingMemory();
+    expect(held).not.toBeNull();
+    try {
+      const budget = database.account("production");
+      const prepare = database.prepare.bind(database);
+      let active: SubmissionRow | undefined;
+      let writes = 0;
+      vi.spyOn(database, "prepare").mockImplementation((sql) => {
+        const prepared = prepare(sql);
+        if (!sql.startsWith("UPDATE devday_judge_submissions SET") || !sql.includes("explanation_status = 'failed'") || !sql.includes("failure_message = ?")) return prepared;
+        return { bind(...values: unknown[]) {
+          const statement = prepared.bind(...values);
+          return { ...statement, async run() {
+            expect(await claimExplanation(message as ExplanationQueueMessage, env)).not.toBeNull();
+            active = database.row(id);
+            expect(active.explanation_status).toBe("processing");
+            writes = database.changes();
+            return statement.run();
+          } };
+        } };
+      });
+      setDelayedSendError(failure === "send failure");
+      await deliver({ ...message, memoryDeferrals: failure === "cap" ? 360 : 1 }, env);
+      expect(active).toBeDefined();
+      expect(database.row(id)).toEqual(active);
+      expect(database.changes()).toBe(writes);
+      expect(database.account("production")).toEqual(budget);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    } finally { held?.release(); }
+    available();
+  });
+
+  it.each(kinds)("does not defer invalid, stale or paused %s messages under real contention", async (kind) => {
+    const { database, env, id, message, deliver, delayed } = await pending(kind);
+    const held = tryAcquireJudgingMemory();
+    expect(held).not.toBeNull();
+    try {
+      const writes = database.changes();
+      for (const invalid of [null, { ...message, memoryDeferrals: -1 }, { ...message, memoryDeferrals: 361 }, { ...message, memoryDeferrals: 0.5 }, { ...message, memoryDeferrals: "1" }, { ...message, extra: true }, { ...message, attempt: message.attempt + 1 }, { ...message, submissionId: "missing" }]) await deliver(invalid, env);
+      expect(database.changes()).toBe(writes);
+      env.JUDGING_ENABLED = "false";
+      await deliver(message, env);
+      expect(database.row(id)).toMatchObject(kind === "recovery" ? { status: "queued" } : kind === "scoring" ? { status: "failed" } : { status: "completed", explanation_status: "failed" });
+      if (kind === "recovery") expect(database.changes()).toBe(writes);
+      expect(delayed).toHaveLength(0);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+      expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    } finally { held?.release(); }
+    available();
+  });
+
+  for (const kind of kinds) {
+    it.each(["null", "throw"] as const)(`releases ${kind} admission when claim returns %s`, async (outcome) => {
+      const { database, env, message, deliver, delayed } = await pending(kind);
+      const prepare = database.prepare.bind(database);
+      let intercepted = false;
+      vi.spyOn(database, "prepare").mockImplementation((sql) => {
+        const prepared = prepare(sql);
+        if (!sql.startsWith("UPDATE devday_judge_submissions SET") || !sql.includes("RETURNING *")) return prepared;
+        return { bind(...values: unknown[]) {
+          const statement = prepared.bind(...values);
+          return { ...statement, async first<T>(): Promise<T | null> {
+            intercepted = true;
+            if (outcome === "throw") throw new Error("claim unavailable");
+            return null;
+          } };
+        } };
+      });
+      if (outcome === "throw") await expect(deliver(message, env)).rejects.toThrow("claim unavailable");
+      else await deliver(message, env);
+      expect(intercepted).toBe(true);
+      expect(delayed).toHaveLength(0);
+      expect(fetch).not.toHaveBeenCalled();
+      available();
+    });
+  }
+});
 
 describe("cloud queue runtime", () => {
   it("claims a recovery exactly once with the exact generation while leaving normal attempts unchanged", async () => {
@@ -246,7 +482,7 @@ describe("cloud queue runtime", () => {
 
   it.each(["production", "validation"] as const)("retains the %s budget cap during recovery", async (mode) => {
     const { database, env, id, message } = await queuedRecovery(3, mode);
-    const cap = mode === "production" ? 90_000_000 : 20_000_000;
+    const cap = mode === "production" ? 90_000_000 : 40_000_000;
     database.db.prepare("UPDATE devday_judge_budget_accounts SET spent_micro_usd = ? WHERE mode = ?").run(cap, mode);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6-luna" }] })));
     scorer.scoreSubmissionDecisions.mockImplementation(async (_job: LeaseJob, options: ScoringOptions) => {
@@ -642,7 +878,7 @@ describe("two-stage judging pipeline", () => {
   });
 
   it("keeps eight small-source model calls concurrent in both queues with memory admission enabled", async () => {
-    const { env, create, sent, explanations } = setup();
+    const { env, create, sent, explanations, delayed } = setup();
     function barrier() {
       let count = 0;
       let ready!: () => void;
@@ -651,13 +887,19 @@ describe("two-stage judging pipeline", () => {
       const waiting = new Promise<void>((resolve) => { release = resolve; });
       return { started, release, get count() { return count; }, async wait() { if (++count === 8) ready(); await waiting; } };
     }
-    async function allStarted(gate: ReturnType<typeof barrier>, consumers: Promise<void>[]) {
-      let timer: ReturnType<typeof setTimeout> | undefined;
+    async function allStarted(gate: ReturnType<typeof barrier>, consumers: Promise<void>[], deliver: (message: unknown, env: Env) => Promise<void>) {
       try {
-        await Promise.race([gate.started, new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Eight model calls did not start concurrently")), 1500); })]);
+        for (let iteration = 0; iteration < 200 && gate.count < 8; iteration++) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 5));
+          if (delayed.length) vi.setSystemTime(Date.now() + 5_000);
+          for (const delivery of delayed.splice(0)) {
+            expect(delivery.options).toEqual({ delaySeconds: 5 });
+            consumers.push(deliver(delivery.message, env));
+          }
+        }
         expect(gate.count).toBe(8);
+        await gate.started;
       } finally {
-        clearTimeout(timer);
         gate.release();
         await Promise.all(consumers);
       }
@@ -669,7 +911,9 @@ describe("two-stage judging pipeline", () => {
       return score();
     });
     for (let index = 0; index < 8; index++) await create(`parallel-small-${index}`);
-    await allStarted(scoring, sent.map((message) => processScoringMessage(message, env)));
+    await allStarted(scoring, sent.map((message) => processScoringMessage(message, env)), processScoringMessage);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(8);
+    expect(delayed).toHaveLength(0);
     expect(explanations).toHaveLength(8);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
     const reasons = barrier();
@@ -678,7 +922,9 @@ describe("two-stage judging pipeline", () => {
       await reasons.wait();
       return explained(fixed);
     });
-    await allStarted(reasons, explanations.map((message) => processExplanationMessage(message, env)));
+    await allStarted(reasons, explanations.map((message) => processExplanationMessage(message, env)), processExplanationMessage);
+    expect(scorer.explainScoredSnapshot).toHaveBeenCalledTimes(8);
+    expect(delayed).toHaveLength(0);
   });
 
   it("publishes fixed ranking before reasons and preflights only the model for each independent queue", async () => {

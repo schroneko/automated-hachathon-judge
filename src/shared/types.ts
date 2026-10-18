@@ -10,6 +10,7 @@ export interface FreezeQueueMessage {
 }
 export type ExplanationStatus = "pending" | "processing" | "completed" | "failed";
 export interface ExplanationQueueMessage {
+  memoryDeferrals?: number;
   type: "explain_submission";
   eventId: string;
   submissionId: string;
@@ -17,6 +18,7 @@ export interface ExplanationQueueMessage {
   dispatch: number;
 }
 export interface RecoveryQueueMessage {
+  memoryDeferrals?: number;
   type: "resume_submission";
   eventId: string;
   submissionId: string;
@@ -45,6 +47,7 @@ export interface PublicBatchRecord {
   maxFreezeDispatches?: number;
 }
 export interface ScoringQueueMessage {
+  memoryDeferrals?: number;
   eventId: string;
   submissionId: string;
   mode: SubmissionMode;

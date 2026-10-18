@@ -1,4 +1,4 @@
-import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, MAX_MEMORY_DEFERRALS, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import { calculateUsageCost, quoteReservation } from "../shared/pricing";
 import { validatePublicScoreResult } from "../shared/validation";
@@ -366,7 +366,8 @@ async function getAccount(mode: SubmissionMode, env: Env): Promise<AccountRow> {
 }
 
 export function validQueueMessage(value: unknown): value is ScoringQueueMessage {
-  return object(value) && Object.keys(value).length === 5 && value.eventId === EVENT_ID
+  return object(value) && Object.keys(value).every((key) => ["eventId", "submissionId", "mode", "attempt", "dispatch", "memoryDeferrals"].includes(key)) && value.eventId === EVENT_ID
+    && (value.memoryDeferrals === undefined || Number.isSafeInteger(value.memoryDeferrals) && Number(value.memoryDeferrals) >= 0 && Number(value.memoryDeferrals) <= MAX_MEMORY_DEFERRALS)
     && shortString(value.submissionId, 100) && /^[A-Za-z0-9-]+$/.test(value.submissionId)
     && (value.mode === "production" || value.mode === "validation")
     && Number.isSafeInteger(value.attempt) && Number(value.attempt) >= 0 && Number(value.attempt) <= 2
@@ -374,7 +375,8 @@ export function validQueueMessage(value: unknown): value is ScoringQueueMessage 
 }
 
 export function validRecoveryMessage(value: unknown): value is RecoveryQueueMessage {
-  return object(value) && Object.keys(value).length === 7 && value.type === "resume_submission" && value.eventId === EVENT_ID
+  return object(value) && Object.keys(value).every((key) => ["type", "eventId", "submissionId", "mode", "attempt", "dispatch", "callbackToken", "memoryDeferrals"].includes(key)) && value.type === "resume_submission" && value.eventId === EVENT_ID
+    && (value.memoryDeferrals === undefined || Number.isSafeInteger(value.memoryDeferrals) && Number(value.memoryDeferrals) >= 0 && Number(value.memoryDeferrals) <= MAX_MEMORY_DEFERRALS)
     && shortString(value.submissionId, 100) && /^[A-Za-z0-9-]+$/.test(value.submissionId)
     && (value.mode === "production" || value.mode === "validation")
     && Number.isSafeInteger(value.attempt) && Number(value.attempt) >= 1 && Number(value.attempt) <= 3

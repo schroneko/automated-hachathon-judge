@@ -326,7 +326,7 @@ describe("D1 runtime API", () => {
     const before = database.changes();
     const dashboard = await call("/api/dashboard");
     expect(dashboard.status).toBe(200);
-    expect(await dashboard.json()).toMatchObject({ event: { submissionLimits: { production: 40, validation: 100 } }, budget: { limitUsd: 90 } });
+    expect(await dashboard.json()).toMatchObject({ event: { submissionLimits: { production: 40, validation: 140 } }, budget: { limitUsd: 90 } });
     expect((await call("/internal/runner/claim", "POST", {}, true)).status).toBe(204);
     await call("/api/ranking");
     await call("/api/recent");

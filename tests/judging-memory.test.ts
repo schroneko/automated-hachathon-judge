@@ -28,6 +28,37 @@ afterEach(() => {
 });
 
 describe("judging memory", () => {
+  it("declines busy admission without timers or waiters and admits again after release", () => {
+    const pool = new JudgingMemoryPool();
+    const first = pool.tryAcquire()!;
+    leases.push(first);
+    expect(pool.usedBytes).toBe(64 * MiB);
+    expect(pool.tryAcquire()).toBeNull();
+    expect(pool.pendingCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    vi.setSystemTime(121_000);
+    expect(pool.tryAcquire()).toBeNull();
+    first.release();
+    const next = pool.tryAcquire()!;
+    leases.push(next);
+    expect(next).not.toBeNull();
+    next.reduceForSnapshot(1000);
+    expect(pool.usedBytes).toBe(2 * MiB);
+  });
+
+  it("does not let immediate admission pass a live FIFO waiter", async () => {
+    const pool = new JudgingMemoryPool();
+    const first = await track(pool.acquire());
+    const waiting = track(pool.acquire());
+    first.release();
+    expect(pool.tryAcquire()).toBeNull();
+    await vi.advanceTimersByTimeAsync(25);
+    const next = await waiting;
+    expect(pool.pendingCount).toBe(0);
+    expect(pool.usedBytes).toBe(64 * MiB);
+    next.release();
+  });
+
   it("reserves 64 MiB immediately and blocks another acquisition against the 96 MiB budget", async () => {
     const pool = new JudgingMemoryPool();
     const firstPromise = track(pool.acquire());

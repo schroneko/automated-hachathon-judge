@@ -1,36 +1,66 @@
 import { explainScoredSnapshot, scoreSubmissionDecisions, type ScoringOptions } from "../container/scorer";
-import { acquireJudgingMemory, type JudgingMemoryLease } from "../shared/judging-memory";
+import { EVENT_ID, MAX_MEMORY_DEFERRALS, MEMORY_DEFERRAL_DELAY_SECONDS } from "../shared/constants";
+import { tryAcquireJudgingMemory, type JudgingMemoryLease } from "../shared/judging-memory";
 import { prepareFullSourceSnapshot } from "../shared/validation";
-import type { BudgetReservationInput, BudgetUsage, LeaseJob } from "../shared/types";
-import { callback, claimQueueMessage, claimRecoveryMessage, effectiveEffort, getRow, reserve, settle, validQueueMessage, validRecoveryMessage } from "./api";
+import type { BudgetReservationInput, BudgetUsage, ExplanationQueueMessage, LeaseJob, RecoveryQueueMessage, ScoringQueueMessage } from "../shared/types";
+import { callback, claimQueueMessage, claimRecoveryMessage, effectiveEffort, getRow, reserve, settle, validQueueMessage, validRecoveryMessage, workEnabled, type SubmissionRow } from "./api";
 import { claimExplanation, completeExplanation, failExplanation, persistDecisions, sendExplanation, validExplanationMessage } from "./explanations";
 import { loadEvidenceSnapshot, persistEvidenceSnapshot } from "./evidence-store";
 
 export async function processScoringMessage(value: unknown, env: Env): Promise<void> {
   if (!validQueueMessage(value)) return;
-  const job = await claimQueueMessage(value, env);
-  if (!job) return;
-  await executeScoring(job, env);
+  const row = await getRow(value.submissionId, env);
+  if (!row || row.event_id !== value.eventId || row.result_json || row.mode !== value.mode || row.status !== "queued"
+    || row.attempts !== value.attempt || row.dispatch_count !== value.dispatch
+    || (row.recovery_dispatch_count === 1 && row.callback_token !== null)) return;
+  if (!workEnabled(env)) {
+    await claimQueueMessage(value, env);
+    return;
+  }
+  const memory = tryAcquireJudgingMemory();
+  if (!memory) {
+    await deferForMemory(value, row, env);
+    return;
+  }
+  try {
+    const job = await claimQueueMessage(value, env);
+    if (job) await executeScoring(job, env, memory);
+  } finally {
+    memory.release();
+  }
 }
 
 export async function processRecoveryMessage(value: unknown, env: Env): Promise<void> {
   if (!validRecoveryMessage(value)) return;
-  const job = await claimRecoveryMessage(value, env);
-  if (!job) return;
-  await executeScoring(job, env);
+  const row = await getRow(value.submissionId, env);
+  if (!row || row.event_id !== value.eventId || row.result_json || row.mode !== value.mode || row.status !== "queued"
+    || row.attempts !== value.attempt || row.callback_token !== value.callbackToken || row.recovery_dispatch_count !== 1) return;
+  if (!workEnabled(env)) {
+    await claimRecoveryMessage(value, env);
+    return;
+  }
+  const memory = tryAcquireJudgingMemory();
+  if (!memory) {
+    await deferForMemory(value, row, env);
+    return;
+  }
+  try {
+    const job = await claimRecoveryMessage(value, env);
+    if (job) await executeScoring(job, env, memory);
+  } finally {
+    memory.release();
+  }
 }
 
-async function executeScoring(job: LeaseJob, env: Env): Promise<void> {
+async function executeScoring(job: LeaseJob, env: Env, memory: JudgingMemoryLease): Promise<void> {
   let stage = "model_check";
-  let memory: JudgingMemoryLease | undefined;
   try {
-    memory = await acquireJudgingMemory();
     const zero = job.frozenResolution && job.frozenResolution.assessment !== "scored";
     const apiKey = zero ? "" : await requireModel(env, "gpt-6-luna");
     stage = "scoring";
     const { result, snapshot } = await scoreSubmissionDecisions(job, {
       ...budgetOptions(job.submissionId, job.callbackToken, env),
-      onSnapshotBytes: (bytes) => memory?.reduceForSnapshot(bytes),
+      onSnapshotBytes: (bytes) => memory.reduceForSnapshot(bytes),
       apiKey,
       effort: job.mode === "production" ? "medium" : job.effort
     });
@@ -44,18 +74,34 @@ async function executeScoring(job: LeaseJob, env: Env): Promise<void> {
     console.error(JSON.stringify({ event: "judging_failed", submissionId: job.submissionId, stage, message, diagnostic }));
     const response = await callback(internalRequest({ submissionId: job.submissionId, callbackToken: job.callbackToken, outcome: { kind: "failed", message } }), env);
     if (!response.ok && response.status !== 403 && response.status !== 409) throw new Error("Scoring finalization failed");
-  } finally {
-    memory?.release();
   }
 }
 
 export async function processExplanationMessage(value: unknown, env: Env): Promise<void> {
   if (!validExplanationMessage(value)) return;
-  const row = await claimExplanation(value, env);
-  if (!row) return;
-  let memory: JudgingMemoryLease | undefined;
+  const pending = await getRow(value.submissionId, env);
+  if (!pending || pending.event_id !== value.eventId || pending.status !== "processing" || pending.explanation_status !== "pending"
+    || pending.attempts !== value.attempt || pending.explanation_dispatches !== value.dispatch || !pending.result_json) return;
+  if (!workEnabled(env)) {
+    await claimExplanation(value, env);
+    return;
+  }
+  const memory = tryAcquireJudgingMemory();
+  if (!memory) {
+    await deferForMemory(value, pending, env);
+    return;
+  }
   try {
-    memory = await acquireJudgingMemory();
+    const row = await claimExplanation(value, env);
+    if (!row) return;
+    await executeExplanation(row, value, env, memory);
+  } finally {
+    memory.release();
+  }
+}
+
+async function executeExplanation(row: SubmissionRow, value: ExplanationQueueMessage, env: Env, memory: JudgingMemoryLease): Promise<void> {
+  try {
     if (!row.decisions_result_json || !row.callback_token) throw new Error("Missing evidence snapshot");
     const snapshot = await loadEvidenceSnapshot(row, env);
     if (!snapshot || snapshot.fullSource !== true) throw new Error("Missing complete source evidence snapshot");
@@ -69,9 +115,45 @@ export async function processExplanationMessage(value: unknown, env: Env): Promi
     await completeExplanation(row, result, snapshot, env);
   } catch (error) {
     await failExplanation(row, value.dispatch, failureMessage(error, "Explanation failed validation or generation. Scores are retained. Review and retry explanations manually."), env);
-  } finally {
-    memory?.release();
   }
+}
+
+async function deferForMemory(message: ScoringQueueMessage | RecoveryQueueMessage | ExplanationQueueMessage, row: SubmissionRow, env: Env): Promise<void> {
+  const deferralCount = message.memoryDeferrals ?? 0;
+  let failure = "Judging memory capacity stayed unavailable. Retry manually when capacity is available.";
+  if (deferralCount < MAX_MEMORY_DEFERRALS) {
+    try {
+      const deferred = { ...message, memoryDeferrals: deferralCount + 1 };
+      if ("type" in deferred && deferred.type === "explain_submission") {
+        await env.EXPLANATION_QUEUE.send(deferred, { delaySeconds: MEMORY_DEFERRAL_DELAY_SECONDS });
+      } else {
+        await env.SCORING_QUEUE.send(deferred, { delaySeconds: MEMORY_DEFERRAL_DELAY_SECONDS });
+      }
+    } catch {
+      failure = "Judging memory deferral delivery failed. Retry manually when queue delivery is available.";
+      await failMemoryDeferral(message, row, failure, deferralCount, env);
+      return;
+    }
+    const nextCount = deferralCount + 1;
+    if (nextCount === 1 || nextCount % 60 === 0 || nextCount === MAX_MEMORY_DEFERRALS) {
+      console.log(JSON.stringify({ event: "judging_memory_deferred", submissionId: message.submissionId, deferralCount: nextCount }));
+    }
+    return;
+  }
+  await failMemoryDeferral(message, row, failure, deferralCount, env);
+}
+
+async function failMemoryDeferral(message: ScoringQueueMessage | RecoveryQueueMessage | ExplanationQueueMessage, row: SubmissionRow, failure: string, deferralCount: number, env: Env): Promise<void> {
+  if ("type" in message && message.type === "explain_submission") {
+    const now = new Date().toISOString();
+    await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET explanation_status = 'failed', status = 'completed', failure_message = ?, result_json = json_set(result_json, '$.reviewRequired', json('true')), completed_at = ?, updated_at = ?, outcome_json = NULL WHERE id = ? AND event_id = ? AND status = 'processing' AND callback_token = ? AND attempts = ? AND explanation_dispatches = ? AND explanation_status = 'pending' AND result_json IS NOT NULL")
+      .bind(`${failure} Scores are retained; review and retry explanations manually.`, now, now, row.id, EVENT_ID, row.callback_token, row.attempts, message.dispatch).run();
+  } else {
+    const now = new Date().toISOString();
+    await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET status = 'failed', failure_message = ?, updated_at = ?, completed_at = ?, outcome_json = ? WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND result_json IS NULL AND attempts = ? AND dispatch_count = ? AND callback_token IS ? AND recovery_dispatch_count = ?")
+      .bind(failure, now, now, JSON.stringify({ kind: "failed", message: failure }), row.id, EVENT_ID, row.mode, row.attempts, row.dispatch_count, row.callback_token, row.recovery_dispatch_count).run();
+  }
+  console.error(JSON.stringify({ event: "judging_memory_deferral_failed", submissionId: message.submissionId, deferralCount }));
 }
 
 function budgetOptions(submissionId: string, callbackToken: string, env: Env, explanationDispatch?: number): Pick<ScoringOptions, "beforeCall" | "afterCall" | "beforeSnapshot"> {
