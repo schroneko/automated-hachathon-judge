@@ -5,7 +5,7 @@ import { validatePublicScoreResult } from "../shared/validation";
 import { createBatch, frozenBarrier, getBatch, listBatches, retryBatch } from "./batches";
 import { matchesFrozenResolution, retryExplanation } from "./explanations";
 import { normalizeDemoUrl, SUBMISSION_METADATA_BODY_LIMIT_BYTES } from "./submission-metadata";
-import type { BudgetReservationInput, BudgetUsage, FinalizePayload, LeaseJob, PublicScoreResult, PublicSubmissionRecord, RankingEntry, ScoringQueueMessage, SubmissionMode } from "../shared/types";
+import type { BudgetReservationInput, BudgetUsage, FinalizePayload, LeaseJob, PublicScoreResult, PublicSubmissionRecord, RankingEntry, RecoveryQueueMessage, ScoringQueueMessage, SubmissionMode } from "../shared/types";
 
 export interface SubmissionRow {
   explanation_status: "pending" | "processing" | "completed" | "failed" | null;
@@ -34,6 +34,10 @@ export interface SubmissionRow {
   status: "queued" | "processing" | "completed" | "failed";
   attempts: number;
   dispatch_count: number;
+  recovery_dispatch_count: number;
+  recovery_requested_at: string | null;
+  recovery_previous_started_at: string | null;
+  recovery_previous_updated_at: string | null;
   callback_token: string | null;
   created_at: string;
   updated_at: string;
@@ -46,7 +50,7 @@ export interface SubmissionRow {
 }
 
 const publicSubmissionFields = [
-  "id", "event_id", "repo_url", "repo_normalized", "repo_owner", "repo_name", "team_name", "demo_url", "mode", "effort", "scoring_effort", "status", "attempts", "dispatch_count", "created_at", "updated_at", "started_at", "completed_at", "pinned_sha", "failure_message", "result_json", "batch_id", "submitted_at", "frozen_at", "explanation_status", "explanation_dispatches", "scored_at"
+  "id", "event_id", "repo_url", "repo_normalized", "repo_owner", "repo_name", "team_name", "demo_url", "mode", "effort", "scoring_effort", "status", "attempts", "dispatch_count", "recovery_dispatch_count", "recovery_requested_at", "created_at", "updated_at", "started_at", "completed_at", "pinned_sha", "failure_message", "result_json", "batch_id", "submitted_at", "frozen_at", "explanation_status", "explanation_dispatches", "scored_at"
 ] as const;
 
 export const PUBLIC_SUBMISSION_COLUMNS = publicSubmissionFields.join(", ");
@@ -92,6 +96,9 @@ export async function handleApiRequest(request: Request, env: Env, _ctx: Executi
   }
   if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/retry$/.test(path)) {
     return retrySubmission(request, path.split("/")[3]!, env);
+  }
+  if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/recover$/.test(path)) {
+    return recoverSubmission(request, path.split("/")[3]!, env);
   }
   return jsonResponse({ error: "Not found" }, { status: 404 });
 }
@@ -185,6 +192,46 @@ async function retrySubmission(request: Request, id: string, env: Env): Promise<
     : jsonResponse({ error: "Retry is unavailable for this submission", code: "retry_unavailable" }, { status: 409 });
 }
 
+const recoverySafety = `result_json IS NULL AND decisions_result_json IS NULL
+  AND attempts BETWEEN 1 AND 3 AND callback_token IS NOT NULL AND length(callback_token) > 0
+  AND evidence_snapshot_json IS NULL
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE submission_id = devday_judge_submissions.id)
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_evidence_manifests WHERE submission_id = devday_judge_submissions.id)
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_evidence_chunks WHERE submission_id = devday_judge_submissions.id)
+  AND frozen_at IS NOT NULL AND frozen_resolution_json IS NOT NULL
+  AND EXISTS (SELECT 1 FROM devday_judge_batches AS batch WHERE batch.id = devday_judge_submissions.batch_id AND batch.event_id = devday_judge_submissions.event_id AND batch.mode = devday_judge_submissions.mode AND batch.status = 'scoring' AND batch.frozen_at IS NOT NULL)
+  AND NOT EXISTS (SELECT 1 FROM devday_judge_submissions AS sibling WHERE sibling.batch_id = devday_judge_submissions.batch_id AND (sibling.frozen_at IS NULL OR sibling.frozen_resolution_json IS NULL))`;
+
+async function recoverSubmission(request: Request, id: string, env: Env): Promise<Response> {
+  try {
+    const body = await readJson(request, API_BODY_LIMIT_BYTES);
+    if (!object(body) || Object.keys(body).length !== 1 || body.confirm !== true) throw new Error("Invalid recovery confirmation");
+  } catch (error) {
+    return invalid(error);
+  }
+  if (!workEnabled(env)) return disabled();
+  const unavailable = () => jsonResponse({ error: "Recovery is unavailable for this submission", code: "recovery_unavailable" }, { status: 409 });
+  const now = new Date().toISOString();
+  const staleBefore = new Date(Date.parse(now) - 5 * 60 * 1000).toISOString();
+  const predicate = `id = ? AND event_id = ? AND status = 'processing' AND updated_at <= ? AND recovery_dispatch_count = 0 AND ${recoverySafety}`;
+  const current = await env.JUDGE_DB.prepare(`SELECT * FROM devday_judge_submissions WHERE ${predicate}`).bind(id, EVENT_ID, staleBefore).first<SubmissionRow>();
+  if (!current) return unavailable();
+  const token = crypto.randomUUID();
+  const updated = await env.JUDGE_DB.prepare(`UPDATE devday_judge_submissions SET recovery_dispatch_count = recovery_dispatch_count + 1, recovery_requested_at = ?, recovery_previous_started_at = started_at, recovery_previous_updated_at = updated_at, callback_token = ?, status = 'queued', updated_at = ?, failure_message = NULL, completed_at = NULL WHERE ${predicate} AND callback_token = ? AND attempts = ? AND updated_at = ? RETURNING *`)
+    .bind(now, token, now, id, EVENT_ID, staleBefore, current.callback_token, current.attempts, current.updated_at).first<SubmissionRow>();
+  if (!updated) return unavailable();
+  const message: RecoveryQueueMessage = { type: "resume_submission", eventId: EVENT_ID, submissionId: updated.id, mode: updated.mode, attempt: updated.attempts, dispatch: 1, callbackToken: token };
+  try {
+    await env.SCORING_QUEUE.send(message);
+  } catch {
+    const failedAt = new Date().toISOString();
+    await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET status = 'failed', failure_message = ?, updated_at = ?, completed_at = ? WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND callback_token = ? AND attempts = ? AND recovery_dispatch_count = 1")
+      .bind("Recovery queue delivery failed. The one-time recovery has been consumed.", failedAt, failedAt, updated.id, EVENT_ID, updated.mode, token, updated.attempts).run();
+    return jsonResponse({ error: "Recovery queue send failed", code: "queue_send_failed" }, { status: 503 });
+  }
+  return jsonResponse({ submission: toPublic(updated) }, { status: 202 });
+}
+
 export async function getRow(id: string, env: Env): Promise<SubmissionRow | null> {
   return env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE id = ? AND event_id = ?").bind(id, EVENT_ID).first<SubmissionRow>();
 }
@@ -227,6 +274,8 @@ export function toPublic(row: PublicSubmissionRow): PublicSubmissionRecord {
     status: row.status,
     attempts: row.attempts,
     dispatches: row.dispatch_count,
+    recoveryDispatches: row.recovery_dispatch_count,
+    recoveryRequestedAt: row.recovery_requested_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     startedAt: row.started_at,
@@ -324,10 +373,30 @@ export function validQueueMessage(value: unknown): value is ScoringQueueMessage 
     && Number.isSafeInteger(value.dispatch) && Number(value.dispatch) >= 1 && Number(value.dispatch) <= 3;
 }
 
+export function validRecoveryMessage(value: unknown): value is RecoveryQueueMessage {
+  return object(value) && Object.keys(value).length === 7 && value.type === "resume_submission" && value.eventId === EVENT_ID
+    && shortString(value.submissionId, 100) && /^[A-Za-z0-9-]+$/.test(value.submissionId)
+    && (value.mode === "production" || value.mode === "validation")
+    && Number.isSafeInteger(value.attempt) && Number(value.attempt) >= 1 && Number(value.attempt) <= 3
+    && value.dispatch === 1 && shortString(value.callbackToken, 100) && /^[A-Za-z0-9-]+$/.test(value.callbackToken);
+}
+
+export async function claimRecoveryMessage(message: RecoveryQueueMessage, env: Env): Promise<LeaseJob | null> {
+  if (!validRecoveryMessage(message) || !workEnabled(env)) return null;
+  const predicate = `id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND callback_token = ? AND attempts = ? AND recovery_dispatch_count = 1 AND ${recoverySafety}`;
+  const values = [message.submissionId, EVENT_ID, message.mode, message.callbackToken, message.attempt];
+  const queued = await env.JUDGE_DB.prepare(`SELECT * FROM devday_judge_submissions WHERE ${predicate}`).bind(...values).first<SubmissionRow>();
+  if (!queued) return null;
+  const now = new Date().toISOString();
+  const row = await env.JUDGE_DB.prepare(`UPDATE devday_judge_submissions SET status = 'processing', started_at = ?, updated_at = ? WHERE ${predicate} RETURNING *`).bind(now, now, ...values).first<SubmissionRow>();
+  return row ? leaseJob(row) : null;
+}
+
 export async function claimQueueMessage(message: ScoringQueueMessage, env: Env): Promise<LeaseJob | null> {
   if (!validQueueMessage(message)) return null;
   const queued = await getRow(message.submissionId, env);
   if (!queued || queued.result_json || queued.mode !== message.mode || queued.status !== "queued" || queued.attempts !== message.attempt || queued.dispatch_count !== message.dispatch) return null;
+  if (queued.recovery_dispatch_count === 1 && queued.callback_token !== null) return null;
   if (!await frozenBarrier(queued, env)) return null;
   if (!workEnabled(env)) {
     const now = new Date().toISOString();
@@ -339,10 +408,14 @@ export async function claimQueueMessage(message: ScoringQueueMessage, env: Env):
   const token = crypto.randomUUID();
   const now = new Date().toISOString();
   const row = await env.JUDGE_DB.prepare(
-    "UPDATE devday_judge_submissions SET status = 'processing', callback_token = ?, started_at = ?, updated_at = ?, attempts = attempts + 1 WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND result_json IS NULL AND attempts = ? AND attempts < 3 AND dispatch_count = ? RETURNING *"
+    "UPDATE devday_judge_submissions SET status = 'processing', callback_token = ?, started_at = ?, updated_at = ?, attempts = attempts + 1 WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND result_json IS NULL AND attempts = ? AND attempts < 3 AND dispatch_count = ? AND (recovery_dispatch_count = 0 OR callback_token IS NULL) RETURNING *"
   ).bind(token, now, now, message.submissionId, EVENT_ID, message.mode, message.attempt, message.dispatch).first<SubmissionRow>();
   if (!row) return null;
-  const job: LeaseJob = {
+  return leaseJob(row);
+}
+
+function leaseJob(row: SubmissionRow): LeaseJob {
+  return {
     submissionId: row.id,
     repoUrl: row.repo_url,
     repo: { owner: row.repo_owner, repo: row.repo_name, normalized: row.repo_normalized, canonicalUrl: row.repo_url },
@@ -350,13 +423,12 @@ export async function claimQueueMessage(message: ScoringQueueMessage, env: Env):
     mode: row.mode,
     startedAt: row.started_at!,
     effort: row.mode === "production" ? "medium" : effectiveEffort(row),
-    callbackToken: token,
+    callbackToken: row.callback_token!,
     pinnedSha: row.pinned_sha,
     defaultBranch: row.default_branch,
     summary: `${row.repo_normalized} repository snapshot`,
     ...(row.frozen_resolution_json ? { frozenResolution: JSON.parse(row.frozen_resolution_json) } : {})
   };
-  return job;
 }
 
 export async function callback(request: Request, env: Env): Promise<Response> {

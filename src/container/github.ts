@@ -5,15 +5,19 @@ import { parseUploadPackResponse, type GitPackObject } from "./git-pack";
 
 const GITHUB_PUBLIC_BASE = "https://github.com";
 const EVIDENCE_TIMEOUT_MS = 45_000;
+const ACQUISITION_WAIT_TIMEOUT_MS = 120_000;
+const ACQUISITION_POLL_MS = 50;
 const MAX_REFS_BYTES = 256_000;
 const MAX_WIRE_BYTES = 16 * 1024 * 1024;
 const BLOB_BATCH_SIZE = 64;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const provenance = "固定コミットのGit追跡ソース全文を評価。";
-const deadlines = new WeakMap<AbortSignal, number>();
-let acquiring = false;
-const acquisitionQueue = new Set<() => void>();
+type EvidenceSignal = AbortSignal & { evidenceDeadline: number };
+let nextAcquisitionTicket = 0;
+let acquisitionOwner = 0;
+let acquisitionDeadline = 0;
+const acquisitionQueue = new Map<number, number>();
 
 export class RetryableGithubError extends Error {}
 
@@ -58,8 +62,9 @@ function requireCapabilities(refs: PublicRefs | null): void {
   }
 }
 
-async function fetchPinnedEvidence(repo: NormalizedRepo, pinnedSha: string, defaultBranch: string, summary: string, signal: AbortSignal): Promise<RepoEvidenceSnapshot> {
+async function fetchPinnedEvidence(repo: NormalizedRepo, pinnedSha: string, defaultBranch: string, summary: string, signal: EvidenceSignal): Promise<RepoEvidenceSnapshot> {
   const initial = await uploadPack(repo, [pinnedSha], true, signal);
+  checkDeadline(signal);
   const { candidates, entryCount } = enumerateSource(initial, pinnedSha, signal);
   initial.clear();
   if (candidates.length > MAX_EVIDENCE_FILES) throw new Error("GitHub evidence exceeds candidate file capacity");
@@ -83,6 +88,7 @@ async function fetchPinnedEvidence(repo: NormalizedRepo, pinnedSha: string, defa
     checkDeadline(signal);
     const batch = wants.slice(offset, offset + BLOB_BATCH_SIZE);
     const objects = await uploadPack(repo, batch, false, signal);
+    checkDeadline(signal);
     if (objects.size !== batch.length || [...objects].some(([oid, object]) => !batch.includes(oid) || object.oid !== oid || object.type !== "blob")) {
       throw new Error("GitHub upload-pack returned unexpected blob objects");
     }
@@ -139,7 +145,7 @@ function checkedSnapshot(snapshot: RepoEvidenceSnapshot): RepoEvidenceSnapshot {
   return snapshot;
 }
 
-async function uploadPack(repo: NormalizedRepo, wants: string[], filtered: boolean, signal: AbortSignal): Promise<Map<string, GitPackObject>> {
+async function uploadPack(repo: NormalizedRepo, wants: string[], filtered: boolean, signal: EvidenceSignal): Promise<Map<string, GitPackObject>> {
   const packets = wants.map((oid, index) => packet(`want ${oid}${index === 0 ? ` no-progress ofs-delta${filtered ? " filter" : ""}` : ""}\n`));
   if (filtered) packets.push(packet("deepen 1\n"), packet("filter blob:none\n"));
   packets.push(encoder.encode("0000"), packet("done\n"));
@@ -177,7 +183,7 @@ function packet(value: string): Uint8Array {
   return result;
 }
 
-function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string, signal: AbortSignal): { candidates: { path: string; oid: string }[]; entryCount: number } {
+function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string, signal: EvidenceSignal): { candidates: { path: string; oid: string }[]; entryCount: number } {
   const commit = objects.get(pinnedSha);
   if (commit?.type !== "commit" || commit.oid !== pinnedSha) throw new Error("GitHub upload-pack omitted the requested pinned commit");
   const root = /^tree ([0-9a-f]{40})\n$/.exec(String.fromCharCode(...commit.data.subarray(0, 46)))?.[1];
@@ -260,7 +266,7 @@ export function zeroResultForAssessment(snapshot: RepoEvidenceSnapshot) {
 
 type PublicRefs = ({ kind: "found"; branch: string; sha: string } | { kind: "empty" } | { kind: "no_default_branch" }) & { capabilities: string[] };
 
-async function fetchPublicRefs(repo: NormalizedRepo, signal: AbortSignal): Promise<PublicRefs | null> {
+async function fetchPublicRefs(repo: NormalizedRepo, signal: EvidenceSignal): Promise<PublicRefs | null> {
   const url = `${GITHUB_PUBLIC_BASE}/${repo.owner}/${repo.repo}.git/info/refs?service=git-upload-pack`;
   const response = await publicRequest(url, signal, { method: "GET", headers: { accept: "application/x-git-upload-pack-advertisement" } });
   try {
@@ -269,7 +275,9 @@ async function fetchPublicRefs(repo: NormalizedRepo, signal: AbortSignal): Promi
     if (isRetryableStatus(response.status)) throw new RetryableGithubError(`GitHub public refs failed with status ${response.status}`);
     if (response.status !== 200) throw new Error(`GitHub public refs failed with status ${response.status}`);
     assertMime(response, "application/x-git-upload-pack-advertisement", "GitHub public refs");
-    return parsePublicRefs(await readBoundedBytes(response, MAX_REFS_BYTES, signal, "GitHub public refs"));
+    const bytes = await readBoundedBytes(response, MAX_REFS_BYTES, signal, "GitHub public refs");
+    checkDeadline(signal);
+    return parsePublicRefs(bytes);
   } finally {
     cancelBody(response);
   }
@@ -360,7 +368,7 @@ function cancelBody(response: Response): void {
   if (response.body && !response.body.locked) void response.body.cancel().catch(() => undefined);
 }
 
-async function publicRequest(url: string, signal: AbortSignal, init: RequestInit): Promise<Response> {
+async function publicRequest(url: string, signal: EvidenceSignal, init: RequestInit): Promise<Response> {
   checkDeadline(signal);
   const request = fetch(url, { ...init, redirect: "manual", credentials: "omit", signal });
   void request.then((response) => { if (signal.aborted) cancelBody(response); }, () => undefined);
@@ -369,7 +377,7 @@ async function publicRequest(url: string, signal: AbortSignal, init: RequestInit
   return response;
 }
 
-async function readBoundedBytes(response: Response, limit: number, signal: AbortSignal, source: string): Promise<Uint8Array> {
+async function readBoundedBytes(response: Response, limit: number, signal: EvidenceSignal, source: string): Promise<Uint8Array> {
   const statedLength = response.headers.get("content-length");
   if (statedLength !== null && (!/^\d+$/.test(statedLength) || !Number.isSafeInteger(Number(statedLength)))) throw new Error(`${source} has an invalid content length`);
   if (statedLength !== null && Number(statedLength) > limit) throw new Error(`${source} exceeds ${limit} bytes`);
@@ -403,7 +411,7 @@ async function readBoundedBytes(response: Response, limit: number, signal: Abort
   return bytes;
 }
 
-function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+function abortable<T>(operation: Promise<T>, signal: EvidenceSignal): Promise<T> {
   checkDeadline(signal);
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(new RetryableGithubError("GitHub evidence collection timed out"));
@@ -412,17 +420,18 @@ function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-function checkDeadline(signal: AbortSignal): void {
-  if (signal.aborted || Date.now() >= (deadlines.get(signal) ?? Infinity)) throw new RetryableGithubError("GitHub evidence collection timed out");
+function checkDeadline(signal: EvidenceSignal): void {
+  if (signal.aborted || Date.now() >= signal.evidenceDeadline) throw new RetryableGithubError("GitHub evidence collection timed out");
 }
 
-async function withEvidenceDeadline<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+async function withEvidenceDeadline<T>(operation: (signal: EvidenceSignal) => Promise<T>, deadline = Date.now() + EVIDENCE_TIMEOUT_MS): Promise<T> {
   const controller = new AbortController();
-  deadlines.set(controller.signal, Date.now() + EVIDENCE_TIMEOUT_MS);
-  const timer = setTimeout(() => controller.abort(), EVIDENCE_TIMEOUT_MS);
+  const signal = Object.assign(controller.signal, { evidenceDeadline: deadline });
+  const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - Date.now()));
   try {
-    const result = await abortable(operation(controller.signal), controller.signal);
-    checkDeadline(controller.signal);
+    checkDeadline(signal);
+    const result = await abortable(operation(signal), signal);
+    checkDeadline(signal);
     return result;
   } catch (error) {
     if (controller.signal.aborted) throw new RetryableGithubError("GitHub evidence collection timed out");
@@ -434,28 +443,48 @@ async function withEvidenceDeadline<T>(operation: (signal: AbortSignal) => Promi
   }
 }
 
-async function withAcquisition<T>(operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
-  const release = await acquire();
+async function withAcquisition<T>(operation: (signal: EvidenceSignal) => Promise<T>): Promise<T> {
+  const { ticket, deadline } = await acquire();
   try {
-    return await withEvidenceDeadline(operation);
+    return await withEvidenceDeadline(operation, deadline);
   } finally {
-    release();
+    if (acquisitionOwner === ticket) {
+      acquisitionOwner = 0;
+      acquisitionDeadline = 0;
+    }
   }
 }
 
-function acquire(): Promise<() => void> {
-  const release = () => {
-    const next = acquisitionQueue.values().next().value;
-    if (next) {
-      acquisitionQueue.delete(next);
-      next();
-    } else acquiring = false;
-  };
-  if (!acquiring) {
-    acquiring = true;
-    return Promise.resolve(release);
+async function acquire(): Promise<{ ticket: number; deadline: number }> {
+  const ticket = ++nextAcquisitionTicket;
+  const waitDeadline = Date.now() + ACQUISITION_WAIT_TIMEOUT_MS;
+  acquisitionQueue.set(ticket, waitDeadline);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    while (true) {
+      const now = Date.now();
+      for (const [queued, deadline] of acquisitionQueue) {
+        if (now >= deadline) acquisitionQueue.delete(queued);
+      }
+      if (now >= waitDeadline) throw new RetryableGithubError("GitHub source acquisition admission timed out");
+      if (acquisitionOwner !== 0 && now >= acquisitionDeadline) {
+        acquisitionOwner = 0;
+        acquisitionDeadline = 0;
+      }
+      if (acquisitionOwner === 0 && acquisitionQueue.keys().next().value === ticket) {
+        acquisitionQueue.delete(ticket);
+        acquisitionOwner = ticket;
+        acquisitionDeadline = now + EVIDENCE_TIMEOUT_MS;
+        return { ticket, deadline: acquisitionDeadline };
+      }
+      await new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, Math.min(ACQUISITION_POLL_MS, waitDeadline - now));
+      });
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+    acquisitionQueue.delete(ticket);
   }
-  return new Promise((resolve) => acquisitionQueue.add(() => resolve(release)));
 }
 
 function isRetryableStatus(status: number): boolean {

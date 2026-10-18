@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CRITERIA, EVENT_ID } from "../src/shared/constants";
 import { implementationEligibility, prepareFullSourceSnapshot } from "../src/shared/validation";
-import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot, ScoringQueueMessage } from "../src/shared/types";
+import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, RecoveryQueueMessage, RepoEvidenceSnapshot, ScoringQueueMessage } from "../src/shared/types";
 import type { ScoringOptions } from "../src/container/scorer";
 import { processFreezeMessage } from "../src/worker/batches";
 
@@ -31,10 +31,11 @@ vi.mock("../src/container/scorer", () => ({
 }));
 vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async () => ({ assessment: "scored", pinnedSha: "a".repeat(40), defaultBranch: "main", summary: "snapshot" })) }));
 
-import { callback, handleApiRequest } from "../src/worker/api";
+import { callback, claimQueueMessage, claimRecoveryMessage, handleApiRequest, validRecoveryMessage } from "../src/worker/api";
 import type { SubmissionRow } from "../src/worker/api";
-import { processExplanationMessage, processScoringMessage } from "../src/worker/queue";
-import { loadEvidenceSnapshot } from "../src/worker/evidence-store";
+import { processExplanationMessage, processRecoveryMessage, processScoringMessage } from "../src/worker/queue";
+import { loadEvidenceSnapshot, persistEvidenceSnapshot } from "../src/worker/evidence-store";
+import { persistDecisions } from "../src/worker/explanations";
 import worker from "../src/worker/index";
 
 class SqliteD1 {
@@ -112,10 +113,11 @@ function setup() {
   const sent: ScoringQueueMessage[] = [];
   const controls: FreezeQueueMessage[] = [];
   const explanations: ExplanationQueueMessage[] = [];
+  const recoveries: RecoveryQueueMessage[] = [];
   let sendError = false;
   const env = {
     JUDGE_DB: database,
-    SCORING_QUEUE: { send: async (message: ScoringQueueMessage | FreezeQueueMessage) => { if ("type" in message) { controls.push(message); return; } sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
+    SCORING_QUEUE: { send: async (message: ScoringQueueMessage | FreezeQueueMessage | RecoveryQueueMessage) => { if ("type" in message && message.type === "freeze_batch") { controls.push(message); return; } if ("type" in message) recoveries.push(message); else sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
     EXPLANATION_QUEUE: { send: async (message: ExplanationQueueMessage) => { explanations.push(message); } },
     RUNNER_TOKEN: "organizer-secret",
     JUDGING_ENABLED: "true",
@@ -135,13 +137,157 @@ function setup() {
     const body = await response.json() as { submission?: { id: string } };
     return { response, id: body.submission?.id ?? "" };
   }
-  return { database, env, sent, explanations, api, create, setSendError: (value: boolean) => { sendError = value; } };
+  return { database, env, sent, explanations, recoveries, api, create, setSendError: (value: boolean) => { sendError = value; } };
+}
+
+async function queuedRecovery(attempt = 1, mode: "production" | "validation" = "production") {
+  const fixture = setup();
+  const { id } = await fixture.create("recovery", mode);
+  const original = (await claimQueueMessage(fixture.sent[0]!, fixture.env))!;
+  fixture.database.db.prepare("UPDATE devday_judge_submissions SET attempts = ?, dispatch_count = ?, updated_at = '2026-10-18T08:55:00.000Z' WHERE id = ?").run(attempt, attempt, id);
+  const response = await fixture.api(`/api/submissions/${id}/recover`, "POST", { confirm: true });
+  expect(response.status).toBe(202);
+  return { ...fixture, id, original, message: fixture.recoveries[0]! };
 }
 
 beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); scorer.scoreSubmissionDecisions.mockReset(); scorer.explainScoredSnapshot.mockReset(); });
 
 describe("cloud queue runtime", () => {
+  it("claims a recovery exactly once with the exact generation while leaving normal attempts unchanged", async () => {
+    const { database, env, id, original, message } = await queuedRecovery();
+    const before = database.changes();
+    const invalid = [null, {}, { ...message, extra: true }, { ...message, type: "other" }, { ...message, eventId: "other" }, { ...message, mode: "validation" }, { ...message, submissionId: "missing" }, { ...message, attempt: 0 }, { ...message, attempt: 4 }, { ...message, attempt: 2 }, { ...message, dispatch: 2 }, { ...message, callbackToken: original.callbackToken }, { ...message, callbackToken: "" }, { ...message, callbackToken: 1 }];
+    for (const value of invalid) await processRecoveryMessage(value, env);
+    expect(database.changes()).toBe(before);
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+    await processScoringMessage({ eventId: EVENT_ID, submissionId: id, mode: "production", attempt: 1, dispatch: 1 }, env);
+    expect(database.changes()).toBe(before);
+    const claims = await Promise.all([claimRecoveryMessage(message, env), claimRecoveryMessage(message, env)]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect(claims.find(Boolean)).toMatchObject({ callbackToken: message.callbackToken, pinnedSha: original.pinnedSha, frozenResolution: original.frozenResolution });
+    expect(database.row(id)).toMatchObject({ status: "processing", attempts: 1, dispatch_count: 1, recovery_dispatch_count: 1, started_at: new Date().toISOString() });
+    const claimed = database.changes();
+    await processRecoveryMessage(message, env);
+    expect(database.changes()).toBe(claimed);
+    expect(validRecoveryMessage(message)).toBe(true);
+  });
+
+  it.each(["reservation", "manifest", "inline", "chunk", "barrier", "scored"])("rechecks %s before recovery claim without writes", async (kind) => {
+    const { database, env, id, message } = await queuedRecovery();
+    if (kind === "reservation") database.db.prepare("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, actual_micro_usd, status, created_at) VALUES ('late', ?, 'old', 'production', 'decisions', 'gpt-6-luna', 1, 0, 1, 0, 'settled', 'before')").run(id);
+    if (kind === "manifest") database.db.prepare("INSERT INTO devday_judge_evidence_manifests VALUES (?, ?, 1, 'old', NULL, ?, 1, 1, 0)").run(id, EVENT_ID, "0".repeat(64));
+    if (kind === "chunk") {
+      database.db.exec("PRAGMA foreign_keys = OFF");
+      database.db.prepare("INSERT INTO devday_judge_evidence_chunks VALUES (?, ?, 1, 'old', 0, ?)").run(id, EVENT_ID, Buffer.from("x"));
+      database.db.exec("PRAGMA foreign_keys = ON");
+    }
+    if (kind === "inline") database.db.prepare("UPDATE devday_judge_submissions SET evidence_snapshot_json = '{}' WHERE id = ?").run(id);
+    if (kind === "scored") database.db.prepare("UPDATE devday_judge_submissions SET decisions_result_json = '{}' WHERE id = ?").run(id);
+    if (kind === "barrier") database.db.prepare("UPDATE devday_judge_batches SET status = 'freezing' WHERE id = ?").run(database.row(id).batch_id);
+    const before = database.changes();
+    expect(await claimRecoveryMessage(message, env)).toBeNull();
+    expect(database.changes()).toBe(before);
+  });
+
+  it("blocks recovery processing while paused and consumes ambiguous enqueue failure without replay", async () => {
+    const fixture = setup();
+    const { id } = await fixture.create("recovery-ambiguous");
+    await claimQueueMessage(fixture.sent[0]!, fixture.env);
+    fixture.database.db.prepare("UPDATE devday_judge_submissions SET updated_at = '2026-10-18T08:55:00.000Z' WHERE id = ?").run(id);
+    fixture.setSendError(true);
+    expect((await fixture.api(`/api/submissions/${id}/recover`, "POST", { confirm: true })).status).toBe(503);
+    expect(fixture.database.row(id)).toMatchObject({ status: "failed", attempts: 1, dispatch_count: 1, recovery_dispatch_count: 1, recovery_requested_at: new Date().toISOString() });
+    const before = fixture.database.changes();
+    await processRecoveryMessage(fixture.recoveries[0], fixture.env);
+    expect((await fixture.api(`/api/submissions/${id}/recover`, "POST", { confirm: true })).status).toBe(409);
+    expect(fixture.database.changes()).toBe(before);
+    expect(fixture.recoveries).toHaveLength(1);
+    const paused = await queuedRecovery();
+    for (const flag of ["SUBMISSIONS_OPEN", "JUDGING_ENABLED"] as const) {
+      paused.env[flag] = "false";
+      const unchanged = paused.database.changes();
+      await processRecoveryMessage(paused.message, paused.env);
+      expect(paused.database.changes()).toBe(unchanged);
+      paused.env[flag] = "true";
+    }
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+  });
+
+  it.each(["reservation", "manifest", "inline", "barrier", "token", "attempt", "status", "count"])("atomically fences a %s race at recovery claim", async (kind) => {
+    const { database, env, id, message } = await queuedRecovery();
+    const prepare = database.prepare.bind(database);
+    let injected = false;
+    let afterRace = 0;
+    vi.spyOn(database, "prepare").mockImplementation((sql) => {
+      const prepared = prepare(sql);
+      if (!sql.startsWith("UPDATE devday_judge_submissions SET status = 'processing', started_at")) return prepared;
+      return { bind(...values: unknown[]) {
+        const statement = prepared.bind(...values);
+        return { ...statement, async first<T>() {
+          injected = true;
+          if (kind === "reservation") database.db.prepare("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, actual_micro_usd, status, created_at) VALUES ('race', ?, 'old', 'production', 'decisions', 'gpt-6-luna', 1, 0, 1, 0, 'settled', 'before')").run(id);
+          if (kind === "manifest") database.db.prepare("INSERT INTO devday_judge_evidence_manifests VALUES (?, ?, 1, 'old', NULL, ?, 1, 1, 0)").run(id, EVENT_ID, "0".repeat(64));
+          if (kind === "inline") database.db.prepare("UPDATE devday_judge_submissions SET evidence_snapshot_json = '{}' WHERE id = ?").run(id);
+          if (kind === "barrier") database.db.exec("UPDATE devday_judge_batches SET frozen_at = NULL");
+          if (kind === "token") database.db.prepare("UPDATE devday_judge_submissions SET callback_token = 'other' WHERE id = ?").run(id);
+          if (kind === "attempt") database.db.prepare("UPDATE devday_judge_submissions SET attempts = 2 WHERE id = ?").run(id);
+          if (kind === "status") database.db.prepare("UPDATE devday_judge_submissions SET status = 'processing' WHERE id = ?").run(id);
+          if (kind === "count") database.db.prepare("UPDATE devday_judge_submissions SET recovery_dispatch_count = 0 WHERE id = ?").run(id);
+          afterRace = database.changes();
+          return statement.first<T>();
+        } };
+      } };
+    });
+    expect(await claimRecoveryMessage(message, env)).toBeNull();
+    expect(injected).toBe(true);
+    expect(database.changes()).toBe(afterRace);
+  });
+
+  it.each(["production", "validation"] as const)("retains the %s budget cap during recovery", async (mode) => {
+    const { database, env, id, message } = await queuedRecovery(3, mode);
+    const cap = mode === "production" ? 90_000_000 : 20_000_000;
+    database.db.prepare("UPDATE devday_judge_budget_accounts SET spent_micro_usd = ? WHERE mode = ?").run(cap, mode);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6-luna" }] })));
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: LeaseJob, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
+      throw new Error("Unexpected billable call");
+    });
+    await processRecoveryMessage(message, env);
+    expect(database.row(id)).toMatchObject({ status: "failed", failure_message: "Budget exhausted", attempts: 3, dispatch_count: 3, recovery_dispatch_count: 1 });
+    expect(database.account(mode)).toMatchObject({ limit_micro_usd: cap, spent_micro_usd: cap, reserved_micro_usd: 0 });
+    expect(database.db.prepare("SELECT COUNT(*) AS count FROM devday_judge_budget_reservations WHERE submission_id = ?").get(id)).toEqual({ count: 0 });
+  });
+
+  it("runs recovery through the cloud consumer with existing evidence-before-budget flow and rejects all old saves", async () => {
+    const { database, env, id, original, message, explanations } = await queuedRecovery(3);
+    const snapshot: RepoEvidenceSnapshot = { fullSource: true, repo: original.repo, pinnedSha: original.pinnedSha, defaultBranch: original.defaultBranch, summary: original.summary, assessment: "scored", files: [{ path: "src/main.ts", size: 8, content: "export{}", truncated: false }] };
+    const before = database.changes();
+    await expect(persistEvidenceSnapshot(snapshot, { ...database.row(id), callback_token: original.callbackToken }, env)).rejects.toThrow("Stale evidence lease");
+    expect(await persistDecisions(original, score(), snapshot, env)).toBeNull();
+    expect(database.changes()).toBe(before);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6-luna" }] })));
+    scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob, options: ScoringOptions) => {
+      expect(job.callbackToken).toBe(message.callbackToken);
+      expect(job.pinnedSha).toBe(original.pinnedSha);
+      const reservationId = await options.beforeCall!({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
+      expect(await loadEvidenceSnapshot(database.row(id), env)).not.toBeNull();
+      await options.afterCall!({ kind: "decisions", model: "gpt-6-luna", reservationId, inputTokens: 100, outputTokens: 0, cachedInputTokens: 0, costUsd: 0.00001 });
+      return score();
+    });
+    const ack = vi.fn();
+    await worker.queue({ messages: [{ body: message, ack }] } as unknown as MessageBatch<RecoveryQueueMessage>, env, {} as ExecutionContext);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+    expect(database.row(id)).toMatchObject({ attempts: 3, dispatch_count: 3, recovery_dispatch_count: 1, callback_token: message.callbackToken, pinned_sha: original.pinnedSha, explanation_status: "pending" });
+    expect(explanations).toHaveLength(1);
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 10, reserved_micro_usd: 0 });
+    const completed = database.changes();
+    await processRecoveryMessage(message, env);
+    expect(await persistDecisions(original, score(), snapshot, env)).toBeNull();
+    expect(database.changes()).toBe(completed);
+  });
+
   it("acknowledges a completed or skipped Queue delivery without requesting retry", async () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));

@@ -161,6 +161,12 @@ function blobWants(fetch: ReturnType<typeof stubGithub>): string[] {
     .flatMap(([, init]) => requestPackets(init).filter((line) => line.startsWith("want ")).map((line) => line.slice(5, 45)));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 describe("GitHub public authority", () => {
   it("freezes authority with a single bounded unauthenticated public GET", async () => {
     const data = fixture();
@@ -635,7 +641,47 @@ describe("GitHub upload HTTP bounds and deadlines", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("starts each acquisition deadline after its memory gate while authority freezing stays concurrent", async () => {
+  it("admits four source acquisitions in FIFO order with only one active through PACK processing", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const gates = Array.from({ length: 4 }, () => deferred<void>());
+    const order: number[] = [];
+    let active = 0;
+    let maximum = 0;
+    const repos = gates.map((_, index) => ({ ...repo, repo: `project-${index}`, normalized: `demo/project-${index}`, canonicalUrl: `https://github.com/demo/project-${index}` }));
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      const index = repos.findIndex((candidate) => url.startsWith(`${candidate.canonicalUrl}.git/`));
+      expect(index).toBeGreaterThanOrEqual(0);
+      if (init?.method === "GET") {
+        order.push(index);
+        maximum = Math.max(maximum, ++active);
+        init.signal!.addEventListener("abort", () => { active--; }, { once: true });
+        return canonical(refsResponse(advertisement(data.sha)), url);
+      }
+      if (requestPackets(init).includes("filter blob:none\n")) {
+        await gates[index]!.promise;
+        return canonical(packResponse([data.commit, ...data.trees]), url);
+      }
+      return canonical(packResponse([...data.blobs.values()]), url);
+    }));
+    const results = repos.map((candidate, index) => index % 2 === 0
+      ? fetchRepoEvidence(candidate, data.sha, "main", String(index))
+      : resolveRepoEvidence(candidate, String(index)));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(order).toEqual([0]);
+    for (let index = 0; index < gates.length; index++) {
+      expect(active).toBe(1);
+      gates[index]!.resolve();
+      expect((await results[index]!).files).toEqual([{ path: "src/main.ts", content: "tracked source", size: 14, truncated: false }]);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(order).toEqual(Array.from({ length: Math.min(index + 2, gates.length) }, (_, position) => position));
+    }
+    expect(maximum).toBe(1);
+    expect(active).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("starts each acquisition deadline after admission while authority freezing stays concurrent", async () => {
     vi.useFakeTimers();
     const data = fixture();
     const fetch = vi.fn((url: string) => url === refsUrl ? Promise.resolve(refsResponse(advertisement(data.sha))) : new Promise<Response>(() => undefined));
@@ -657,5 +703,129 @@ describe("GitHub upload HTTP bounds and deadlines", () => {
     expect(vi.getTimerCount()).toBe(0);
     stubGithub(data);
     expect((await fetchRepoEvidence(repo, data.sha, "main", "after timeout")).assessment).toBe("scored");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("times out admission at 120 seconds, removes expired tickets and admits a later live caller", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const fetch = stubGithub(data);
+    const respond = fetch.getMockImplementation()!;
+    let acquisitions = 0;
+    fetch.mockImplementation(async (url, init) => {
+      if (String(url) === refsUrl) acquisitions++;
+      if (String(url) === uploadUrl && requestPackets(init).includes("filter blob:none\n")) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 44_000));
+      }
+      return respond(url, init);
+    });
+    const admitted = Array.from({ length: 3 }, (_, index) => fetchRepoEvidence(repo, data.sha, "main", String(index)));
+    const expired = Array.from({ length: 2 }, () => fetchRepoEvidence(repo, data.sha, "main", "expires").catch((error: unknown) => error));
+    await vi.advanceTimersByTimeAsync(119_999);
+    expect(acquisitions).toBe(3);
+    expect(vi.getTimerCount()).toBe(4);
+    await vi.advanceTimersByTimeAsync(1);
+    for (const result of await Promise.all(expired)) {
+      expect(result).toBeInstanceOf(RetryableGithubError);
+      expect((result as Error).message).toBe("GitHub source acquisition admission timed out");
+    }
+    expect(acquisitions).toBe(3);
+    expect(vi.getTimerCount()).toBe(2);
+    fetch.mockImplementation(respond);
+    const later = fetchRepoEvidence(repo, data.sha, "main", "after expired waiters");
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect((await later).assessment).toBe("scored");
+    expect((await Promise.all(admitted)).every((snapshot) => snapshot.fullSource)).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("expires abandoned owner and waiting tickets without invoking their cancelled timers", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const fetch = stubGithub(data);
+    const respond = fetch.getMockImplementation()!;
+    fetch.mockImplementation((url, init) => String(url) === uploadUrl ? new Promise<Response>(() => undefined) : respond(url, init));
+    void fetchRepoEvidence(repo, data.sha, "main", "abandoned owner");
+    await vi.advanceTimersByTimeAsync(0);
+    void fetchRepoEvidence(repo, data.sha, "main", "abandoned waiter");
+    expect(vi.getTimerCount()).toBe(2);
+    vi.clearAllTimers();
+    await vi.advanceTimersByTimeAsync(1_000);
+    fetch.mockImplementation(respond);
+    const live = fetchRepoEvidence(repo, data.sha, "main", "live waiter");
+    await vi.advanceTimersByTimeAsync(118_999);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect((await live).assessment).toBe("scored");
+    expect(fetch).toHaveBeenCalledTimes(5);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("rejects a resumed expired owner before PACK processing and never releases a later owner", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const fetch = stubGithub(data);
+    const respond = fetch.getMockImplementation()!;
+    const stalePack = deferred<Response>();
+    const currentPack = deferred<Response>();
+    let initialRequests = 0;
+    fetch.mockImplementation((url, init) => {
+      if (String(url) === uploadUrl && requestPackets(init).includes("filter blob:none\n")) {
+        if (++initialRequests === 1) return stalePack.promise;
+        if (initialRequests === 2) return currentPack.promise;
+      }
+      return respond(url, init);
+    });
+    const stale = expect(fetchRepoEvidence(repo, data.sha, "main", "stale")).rejects.toThrow("GitHub evidence collection timed out");
+    await vi.advanceTimersByTimeAsync(0);
+    vi.clearAllTimers();
+    vi.setSystemTime(Date.now() + 45_000);
+    const current = fetchRepoEvidence(repo, data.sha, "main", "current");
+    await vi.advanceTimersByTimeAsync(0);
+    const later = fetchRepoEvidence(repo, data.sha, "main", "later");
+    const cancel = vi.fn();
+    stalePack.resolve(canonical(new Response(new ReadableStream({ cancel }), {
+      headers: { "content-type": "application/x-git-upload-pack-result" }
+    }), uploadUrl));
+    await stale;
+    await vi.advanceTimersByTimeAsync(50);
+    expect(initialRequests).toBe(2);
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(vi.getTimerCount()).toBe(2);
+    currentPack.resolve(packResponse([data.commit, ...data.trees]));
+    expect((await current).assessment).toBe("scored");
+    await vi.advanceTimersByTimeAsync(50);
+    expect((await later).assessment).toBe("scored");
+    expect(initialRequests).toBe(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("checks an admission's elapsed deadline before a suspended caller starts source I/O", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const fetch = stubGithub(data);
+    const expired = expect(fetchRepoEvidence(repo, data.sha, "main", "suspended")).rejects.toThrow("GitHub evidence collection timed out");
+    vi.setSystemTime(Date.now() + 45_000);
+    const current = fetchRepoEvidence(repo, data.sha, "main", "current");
+    await expired;
+    expect((await current).assessment).toBe("scored");
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("releases a failed owner and preserves FIFO for its successors", async () => {
+    vi.useFakeTimers();
+    const data = fixture();
+    const fetch = stubGithub(data);
+    fetch.mockRejectedValueOnce(new TypeError("request context cancelled"));
+    const failed = expect(fetchRepoEvidence(repo, data.sha, "main", "failed")).rejects.toThrow("GitHub evidence collection request failed");
+    const next = fetchRepoEvidence(repo, data.sha, "main", "next");
+    const last = resolveRepoEvidence(repo, "last");
+    await failed;
+    await vi.advanceTimersByTimeAsync(100);
+    expect((await next).summary).toBe(`next ${provenance}`);
+    expect((await last).summary).toBe(`last ${provenance}`);
+    expect(fetch).toHaveBeenCalledTimes(7);
+    expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -1,8 +1,8 @@
 import { explainScoredSnapshot, scoreSubmissionDecisions, type ScoringOptions } from "../container/scorer";
 import { acquireJudgingMemory, type JudgingMemoryLease } from "../shared/judging-memory";
 import { prepareFullSourceSnapshot } from "../shared/validation";
-import type { BudgetReservationInput, BudgetUsage } from "../shared/types";
-import { callback, claimQueueMessage, effectiveEffort, getRow, reserve, settle, validQueueMessage } from "./api";
+import type { BudgetReservationInput, BudgetUsage, LeaseJob } from "../shared/types";
+import { callback, claimQueueMessage, claimRecoveryMessage, effectiveEffort, getRow, reserve, settle, validQueueMessage, validRecoveryMessage } from "./api";
 import { claimExplanation, completeExplanation, failExplanation, persistDecisions, sendExplanation, validExplanationMessage } from "./explanations";
 import { loadEvidenceSnapshot, persistEvidenceSnapshot } from "./evidence-store";
 
@@ -10,6 +10,17 @@ export async function processScoringMessage(value: unknown, env: Env): Promise<v
   if (!validQueueMessage(value)) return;
   const job = await claimQueueMessage(value, env);
   if (!job) return;
+  await executeScoring(job, env);
+}
+
+export async function processRecoveryMessage(value: unknown, env: Env): Promise<void> {
+  if (!validRecoveryMessage(value)) return;
+  const job = await claimRecoveryMessage(value, env);
+  if (!job) return;
+  await executeScoring(job, env);
+}
+
+async function executeScoring(job: LeaseJob, env: Env): Promise<void> {
   let stage = "model_check";
   let memory: JudgingMemoryLease | undefined;
   try {

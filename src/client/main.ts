@@ -1035,6 +1035,10 @@ function retryAllowed(item: Submission): boolean {
   return item.result ? (explanationState(item) === "failed" || explanationStale(item)) && (item.explanationDispatches ?? 0) > 0 && (item.explanationDispatches ?? 0) < 3 : canRetry(item);
 }
 function renderRetryControls(item: Submission): void {
+  if (recoveryCandidate(item)) {
+    renderRecoveryControls(item);
+    return;
+  }
   if (item.result && (item.explanationDispatches ?? 0) === 0) return;
   const reasonRetry = !!item.result;
   const failed = reasonRetry ? explanationState(item) === "failed" || explanationStale(item) : item.status === "failed" || needsOrganizerReview(item);
@@ -1067,6 +1071,42 @@ function renderRetryControls(item: Submission): void {
     renderResults();
   });
   section.querySelector<HTMLButtonElement>("#retry-confirm")?.addEventListener("click", () => void retrySubmission(item.id));
+}
+function recoveryCandidate(item: Submission): boolean {
+  const started = Date.parse(item.startedAt || "");
+  return item.status === "processing" && !item.result && (item.recoveryDispatches ?? 0) === 0
+    && Number.isFinite(started) && Date.now() - started >= 5 * 60 * 1000;
+}
+function renderRecoveryControls(item: Submission): void {
+  const section = document.createElement("section");
+  section.className = "retry-controls";
+  const feedback = retryFeedback?.id === item.id ? retryFeedback : null;
+  section.innerHTML = `<h4>停止した審査を確認</h4><p>課金前に止まった審査だけを同じソースから続行できます。利用済みの審査費用がある場合は復旧を受け付けません。1件につき1回までです。</p>${feedback ? `<p role="${feedback.failed ? "alert" : "status"}">${esc(feedback.message)}</p>` : ""}<button type="button" class="dark"${posting ? " disabled" : ""}>${posting ? "確認中です" : "課金前の停止を復旧"}</button>`;
+  section.querySelector("button")?.addEventListener("click", () => void recoverSubmission(item));
+  el<HTMLElement>("detail").append(section);
+}
+async function recoverSubmission(item: Submission): Promise<void> {
+  if (posting || !recoveryCandidate(item)) return;
+  posting = true;
+  retryFeedback = null;
+  renderResults();
+  try {
+    const response = await fetch(`/api/submissions/${encodeURIComponent(item.id)}/recover`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }), signal: AbortSignal.timeout(20000)
+    });
+    const body = await response.json() as { submission?: Submission; error?: string };
+    if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+    if (!body.submission || body.submission.id !== item.id || body.submission.pinnedSha !== item.pinnedSha
+      || !["queued", "processing"].includes(body.submission.status)) throw new Error("復旧結果を確認できませんでした。手動更新で状態を確認してください。");
+    if (data) data.items = data.items.map((value) => value.id === item.id ? body.submission! : value);
+    retryFeedback = { id: item.id, failed: false, message: "課金前に停止した審査の続行を受け付けました。試行履歴と費用記録を保持しています。" };
+  } catch (error) {
+    retryFeedback = { id: item.id, failed: true, message: error instanceof Error ? error.message : "復旧を受け付けられませんでした。" };
+  } finally {
+    posting = false;
+    renderResults();
+    void refresh();
+  }
 }
 function preservesScores(previous: Submission, next: Submission): boolean {
   return !!previous.result && !!next.result && previous.result.total === next.result.total && previous.result.criteria.every((criterion) => next.result?.criteria.some((value) => value.key === criterion.key && value.score === criterion.score)) && previous.result.criteria.length === next.result.criteria.length;
@@ -1229,6 +1269,11 @@ function exportData(format: "csv" | "json"): void {
     explanationStatus: explanationState(item) ?? "",
     scoredAt: item.scoredAt ?? "",
     reviewRequired: reviewRequired(item),
+    eligibility: item.result?.eligibility ?? "",
+    fullSource: item.result?.usage?.fullSource ?? "",
+    sourceFiles: item.result?.usage?.sourceFiles ?? "",
+    sourceBytes: item.result?.usage?.sourceBytes ?? "",
+    sourceHash: item.result?.usage?.sourceHash ?? "",
     explanationModel: (item.result?.usage as { explanationModel?: string } | undefined)?.explanationModel ?? "",
     total: item.result?.total ?? "",
     technical:

@@ -16,7 +16,16 @@ export interface ExplanationQueueMessage {
   attempt: number;
   dispatch: number;
 }
-export type JudgeQueueMessage = ScoringQueueMessage | FreezeQueueMessage | ExplanationQueueMessage;
+export interface RecoveryQueueMessage {
+  type: "resume_submission";
+  eventId: string;
+  submissionId: string;
+  mode: SubmissionMode;
+  attempt: number;
+  dispatch: 1;
+  callbackToken: string;
+}
+export type JudgeQueueMessage = ScoringQueueMessage | FreezeQueueMessage | ExplanationQueueMessage | RecoveryQueueMessage;
 export interface PublicBatchRecord {
   id: string;
   eventId: string;
@@ -99,6 +108,8 @@ export interface RepoResolution {
 }
 
 export interface PublicSubmissionRecord {
+  recoveryDispatches?: number;
+  recoveryRequestedAt?: string | null;
   demoUrl?: string | null;
   explanationStatus?: ExplanationStatus;
   explanationDispatches?: number;

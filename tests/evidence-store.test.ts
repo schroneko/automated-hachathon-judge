@@ -149,6 +149,48 @@ describe("full source evidence store", () => {
     expect(peak).toBe(1);
   });
 
+  it("uses request-owned timer waits and skips a timed-out restoration ticket without blocking later reads", async () => {
+    const { database, env, row, snapshot } = setup();
+    await persistEvidenceSnapshot(snapshot, row, env);
+    const prepare = database.prepare.bind(database);
+    let started!: () => void;
+    let release!: () => void;
+    let held = false;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    vi.spyOn(database, "prepare").mockImplementation((sql) => {
+      const query = prepare(sql);
+      if (!sql.startsWith("SELECT chunk_index")) return query;
+      return { bind(...values) {
+        const statement = query.bind(...values);
+        return { ...statement, async first<T>() {
+          if (!held) {
+            held = true;
+            started();
+            await waiting;
+          }
+          return statement.first<T>();
+        } };
+      } };
+    });
+    vi.useFakeTimers();
+    const owner = loadEvidenceSnapshot(row, env);
+    try {
+      await ready;
+      const timedOut = expect(loadEvidenceSnapshot(row, env)).rejects.toThrow("Evidence restoration admission timed out");
+      await vi.advanceTimersByTimeAsync(120_001);
+      await timedOut;
+      expect(vi.getTimerCount()).toBe(0);
+      release();
+      expect(await owner).toEqual(snapshot);
+      expect(await loadEvidenceSnapshot(row, env)).toEqual(snapshot);
+    } finally {
+      release();
+      await owner;
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["status", "token", "attempt", "result", "sha"])("rejects stale %s leases before writes", async (field) => {
     const { database, env, row, snapshot } = setup();
     const updates: Record<string, string> = { status: "status = 'failed'", token: "callback_token = 'new-lease'", attempt: "attempts = 2", result: "result_json = '{}'", sha: "pinned_sha = 'changed'" };

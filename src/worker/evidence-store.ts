@@ -7,7 +7,9 @@ const CHUNK_BYTES = 512 * 1024;
 const MAX_CHUNKS = 8;
 const generation = "submission_id = ? AND event_id = ? AND attempt = ? AND callback_token = ?";
 const lease = "EXISTS (SELECT 1 FROM devday_judge_submissions WHERE id = ? AND event_id = ? AND attempts = ? AND callback_token = ? AND status = 'processing' AND result_json IS NULL AND pinned_sha IS ?)";
-let restorationTail = Promise.resolve();
+let restorationNextTicket = 0;
+let restorationServingTicket = 0;
+const cancelledRestorationTickets = new Set<number>();
 
 interface Manifest {
   submission_id: string;
@@ -64,11 +66,36 @@ async function manifestFor(row: SubmissionRow, env: Env): Promise<Manifest | nul
 }
 
 async function readStored(row: SubmissionRow, manifest: Manifest, env: Env): Promise<RepoEvidenceSnapshot> {
-  let release!: () => void;
-  const previous = restorationTail;
-  restorationTail = new Promise<void>((resolve) => { release = resolve; });
-  await previous;
+  const release = await acquireRestoration();
   try { return await restoreStored(row, manifest, env); } finally { release(); }
+}
+
+function advanceRestoration(): void {
+  restorationServingTicket++;
+  while (cancelledRestorationTickets.delete(restorationServingTicket)) restorationServingTicket++;
+}
+
+async function acquireRestoration(): Promise<() => void> {
+  const ticket = restorationNextTicket++;
+  const deadline = Date.now() + 120_000;
+  try {
+    while (true) {
+      if (Date.now() >= deadline) throw new Error("Evidence restoration admission timed out");
+      if (ticket === restorationServingTicket) {
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          advanceRestoration();
+        };
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    }
+  } catch (error) {
+    if (ticket === restorationServingTicket) advanceRestoration();
+    else cancelledRestorationTickets.add(ticket);
+    throw error;
+  }
 }
 
 async function restoreStored(row: SubmissionRow, manifest: Manifest, env: Env): Promise<RepoEvidenceSnapshot> {

@@ -77,7 +77,7 @@ function setup() {
     const response = await call("/api/batches", "POST", value);
     return { response, payload: await response.json() as Payload };
   };
-  const controls = () => messages.filter((message): message is FreezeQueueMessage => "type" in message);
+  const controls = () => messages.filter((message): message is FreezeQueueMessage => "type" in message && message.type === "freeze_batch");
   const scoring = () => messages.filter((message): message is ScoringQueueMessage => !("type" in message));
   return { database, env, messages, call, create, controls, scoring, onSend: (hook: typeof sendHook) => { sendHook = hook; } };
 }
@@ -440,6 +440,32 @@ describe("submission demo metadata", () => {
 });
 
 describe("freeze control and bounded recovery", () => {
+  it("requires the complete all-repository barrier for one-time recovery and retains batch history", async () => {
+    const { create, call, database, controls, env, messages } = setup();
+    const created = await create(input(2));
+    await processFreezeMessage(controls()[0]!, env);
+    const [first, second] = database.rows();
+    await claimQueueMessage({ eventId: String(first!.event_id), submissionId: String(first!.id), mode: "production", attempt: 0, dispatch: 1 }, env);
+    database.db.prepare("UPDATE devday_judge_submissions SET updated_at = '2026-10-18T08:55:00.000Z' WHERE id = ?").run(first!.id);
+    const path = `/api/submissions/${first!.id}/recover`;
+    const batch = database.db.prepare("SELECT * FROM devday_judge_batches WHERE id = ?").get(created.payload.batch.id);
+    for (const mutation of ["status = 'freezing'", "frozen_at = NULL"]) {
+      database.db.prepare(`UPDATE devday_judge_batches SET ${mutation} WHERE id = ?`).run(created.payload.batch.id);
+      const before = database.changes();
+      expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+      expect(database.changes()).toBe(before);
+      database.db.prepare("UPDATE devday_judge_batches SET status = 'scoring', frozen_at = ? WHERE id = ?").run(batch!.frozen_at, created.payload.batch.id);
+    }
+    database.db.prepare("UPDATE devday_judge_submissions SET frozen_resolution_json = NULL WHERE id = ?").run(second!.id);
+    const before = database.changes();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(database.changes()).toBe(before);
+    database.db.prepare("UPDATE devday_judge_submissions SET frozen_resolution_json = ? WHERE id = ?").run(second!.frozen_resolution_json, second!.id);
+    expect((await call(path, "POST", { confirm: true })).status).toBe(202);
+    expect(database.db.prepare("SELECT * FROM devday_judge_batches WHERE id = ?").get(created.payload.batch.id)).toEqual(batch);
+    expect(messages.at(-1)).toMatchObject({ type: "resume_submission", submissionId: first!.id, attempt: 1, dispatch: 1 });
+  });
+
   it("persists all thirty snapshots and consumes dispatches before the first scoring send within fifty queries", async () => {
     const { create, controls, scoring, env, onSend, database } = setup();
     await create(input(30));
@@ -659,6 +685,28 @@ describe("freeze control and bounded recovery", () => {
 });
 
 describe("backend compatibility", () => {
+  it("adds recovery audit columns without changing historical attempts, dispatches, fees, reservations or batches", () => {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec("PRAGMA foreign_keys = ON");
+      const base = new URL("../migrations/", import.meta.url);
+      for (const file of readdirSync(base).filter((name) => /^000[1-8]_.+\.sql$/.test(name)).sort()) database.exec(readFileSync(new URL(file, base), "utf8"));
+      database.exec("INSERT INTO devday_judge_batches (id, event_id, mode, effort, request_json, admission_key, status, created_at, frozen_at, freeze_dispatches) VALUES ('batch', 'devday-20261018', 'production', 'medium', '{}', 'key', 'scoring', 'before', 'frozen', 3)");
+      database.exec("INSERT INTO devday_judge_submissions (id, event_id, repo_url, repo_normalized, repo_owner, repo_name, team_name, mode, effort, status, attempts, dispatch_count, created_at, updated_at, started_at, callback_token, pinned_sha, batch_id, frozen_at, frozen_resolution_json) VALUES ('history', 'devday-20261018', 'https://github.com/a/b', 'a/b', 'a', 'b', 'old', 'production', 'high', 'processing', 3, 3, 'before', 'updated', 'started', 'old-token', 'fixed-sha', 'batch', 'frozen', '{}')");
+      database.exec("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, actual_micro_usd, status, created_at) VALUES ('reservation', 'history', 'old-token', 'production', 'decisions', 'gpt-6-luna', 1, 0, 9, 0, 'settled', 'before')");
+      database.exec("UPDATE devday_judge_budget_accounts SET spent_micro_usd = 123, reserved_micro_usd = 456 WHERE mode = 'production'");
+      const previous = database.prepare("SELECT * FROM devday_judge_submissions").get()!;
+      const tables = ["devday_judge_budget_accounts", "devday_judge_budget_reservations", "devday_judge_batches", "devday_judge_evidence_manifests", "devday_judge_evidence_chunks"];
+      const before = tables.map((table) => database.prepare(`SELECT * FROM ${table}`).all());
+      database.exec(readFileSync(new URL("0009_prepaid_recovery.sql", base), "utf8"));
+      expect(database.prepare("SELECT * FROM devday_judge_submissions").get()).toEqual({ ...previous, recovery_dispatch_count: 0, recovery_requested_at: null, recovery_previous_started_at: null, recovery_previous_updated_at: null });
+      expect(tables.map((table) => database.prepare(`SELECT * FROM ${table}`).all())).toEqual(before);
+      for (const count of [-1, 2]) expect(() => database.prepare("UPDATE devday_judge_submissions SET recovery_dispatch_count = ?").run(count)).toThrow();
+      expect(() => database.exec("UPDATE devday_judge_submissions SET recovery_dispatch_count = NULL")).toThrow();
+      expect(database.prepare("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally { database.close(); }
+  });
+
   it("runs real Decisions then reasons on a persisted snapshot with no GitHub reads during explanation", async () => {
     const { create, controls, scoring, call, env, database } = setup();
     const prepare = vi.spyOn(database, "prepare");

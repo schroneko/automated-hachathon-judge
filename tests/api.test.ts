@@ -9,7 +9,8 @@ vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async ()
 beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
 afterEach(() => { vi.useRealTimers(); });
 import { CRITERIA } from "../src/shared/constants";
-import { callback, claimQueueMessage, handleApiRequest, reserve, settle } from "../src/worker/api";
+import { callback, claimQueueMessage, claimRecoveryMessage, handleApiRequest, reserve, settle, validRecoveryMessage } from "../src/worker/api";
+import type { RecoveryQueueMessage } from "../src/shared/types";
 import { EVENT_ID } from "../src/shared/constants";
 
 class SqliteD1 {
@@ -114,6 +115,17 @@ async function claim(call: ReturnType<typeof setup>["call"], mode = "production"
   return response.status === 204 ? null : (await response.json() as { job: { submissionId: string; callbackToken: string; mode: string; pinnedSha: null } }).job;
 }
 
+async function recoveryFixture(attempt = 1, mode = "production") {
+  const fixture = setup();
+  await submit(fixture.call, "recovery", mode);
+  const job = (await claim(fixture.call, mode))!;
+  const previousStartedAt = "2026-10-18T08:50:00.000Z";
+  const previousUpdatedAt = "2026-10-18T08:55:00.000Z";
+  fixture.database.db.prepare("UPDATE devday_judge_submissions SET attempts = ?, dispatch_count = ?, started_at = ?, updated_at = ?, failure_message = 'old failure', completed_at = 'old completion' WHERE id = ?").run(attempt, attempt, previousStartedAt, previousUpdatedAt, job.submissionId);
+  const path = `/api/submissions/${job.submissionId}/recover`;
+  return { ...fixture, job, path, previousStartedAt, previousUpdatedAt };
+}
+
 function score(total: number) {
   const scores = total === 10 ? [4, 2, 2, 2] : total === 20 ? [6, 6, 4, 4] : [total / 4, total / 4, total / 4, total / 4];
   return {
@@ -128,6 +140,128 @@ function score(total: number) {
 }
 
 describe("D1 runtime API", () => {
+  it("recovers an uncharged third attempt exactly once without changing historical counters, frozen authority or spending", async () => {
+    const { call, env, database, sent, job, path, previousStartedAt, previousUpdatedAt } = await recoveryFixture(3);
+    const old = database.db.prepare("SELECT * FROM devday_judge_submissions WHERE id = ?").get(job.submissionId)!;
+    const accounts = database.db.prepare("SELECT * FROM devday_judge_budget_accounts").all();
+    const batches = database.db.prepare("SELECT * FROM devday_judge_batches").all();
+    const writes = database.changes();
+    const responses = await Promise.all([call(path, "POST", { confirm: true }), call(path, "POST", { confirm: true })]);
+    expect(responses.map((response) => response.status).sort()).toEqual([202, 409]);
+    expect(database.changes() - writes).toBe(1);
+    expect(sent).toHaveLength(2);
+    const message = sent.at(-1) as RecoveryQueueMessage;
+    expect(validRecoveryMessage(message)).toBe(true);
+    expect(message).toMatchObject({ type: "resume_submission", eventId: EVENT_ID, submissionId: job.submissionId, mode: "production", attempt: 3, dispatch: 1 });
+    expect(message.callbackToken).not.toBe(job.callbackToken);
+    expect(database.db.prepare("SELECT * FROM devday_judge_submissions WHERE id = ?").get(job.submissionId)).toEqual({ ...old, status: "queued", recovery_dispatch_count: 1, recovery_requested_at: new Date().toISOString(), recovery_previous_started_at: previousStartedAt, recovery_previous_updated_at: previousUpdatedAt, callback_token: message.callbackToken, updated_at: new Date().toISOString(), failure_message: null, completed_at: null });
+    expect(database.db.prepare("SELECT * FROM devday_judge_budget_accounts").all()).toEqual(accounts);
+    expect(database.db.prepare("SELECT * FROM devday_judge_batches").all()).toEqual(batches);
+    const publicItem = await (await call(`/api/submissions/${job.submissionId}`)).json();
+    expect(publicItem).toMatchObject({ recoveryDispatches: 1, recoveryRequestedAt: new Date().toISOString(), attempts: 3, dispatches: 3, pinnedSha: old.pinned_sha });
+    for (const key of ["callback_token", "callbackToken", "recovery_previous_started_at", "recovery_previous_updated_at", "recoveryPreviousStartedAt", "recoveryPreviousUpdatedAt"]) expect(publicItem).not.toHaveProperty(key);
+    expect(JSON.stringify(publicItem)).not.toContain(message.callbackToken);
+    const beforeReplay = database.changes();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(await claimQueueMessage({ eventId: EVENT_ID, submissionId: job.submissionId, mode: "production", attempt: 2, dispatch: 3 }, env)).toBeNull();
+    expect(database.changes()).toBe(beforeReplay);
+    const recovered = await claimRecoveryMessage(message, env);
+    expect(recovered).toMatchObject({ callbackToken: message.callbackToken, pinnedSha: old.pinned_sha, frozenResolution: JSON.parse(String(old.frozen_resolution_json)) });
+    expect(database.db.prepare("SELECT attempts, dispatch_count, recovery_dispatch_count FROM devday_judge_submissions WHERE id = ?").get(job.submissionId)).toEqual({ attempts: 3, dispatch_count: 3, recovery_dispatch_count: 1 });
+  });
+
+  it("requires strict confirmation, same-origin and enabled work without writes or sends", async () => {
+    const { call, env, database, sent, path } = await recoveryFixture();
+    const before = database.changes();
+    for (const body of [undefined, {}, { confirm: false }, { confirm: 1 }, { confirm: "true" }, { confirm: true, effort: "medium" }, [], "broken"]) expect((await call(path, "POST", body)).status).toBe(400);
+    expect((await handleApiRequest(new Request(`https://judge.example.com${path}`, { method: "POST", headers: { origin: "https://evil.example", "content-type": "application/json" }, body: JSON.stringify({ confirm: true }) }), env, {} as ExecutionContext)).status).toBe(403);
+    env.SUBMISSIONS_OPEN = "false";
+    expect((await call(path, "POST", { confirm: true })).status).toBe(410);
+    env.SUBMISSIONS_OPEN = "true";
+    env.JUDGING_ENABLED = "false";
+    expect((await call(path, "POST", { confirm: true })).status).toBe(410);
+    expect(database.changes()).toBe(before);
+    expect(sent).toHaveLength(1);
+  });
+
+  it.each([
+    "status = 'queued'", "status = 'failed'", "status = 'completed'", "result_json = '{}'", "decisions_result_json = '{}'",
+    "attempts = 0", "attempts = 4", "callback_token = NULL", "callback_token = ''", "recovery_dispatch_count = 1",
+    "updated_at = '2026-10-18T08:55:00.001Z'", "evidence_snapshot_json = '{}'", "evidence_snapshot_json = ''", "frozen_at = NULL", "frozen_resolution_json = NULL", "batch_id = NULL"
+  ])("refuses ineligible recovery with zero changes: %s", async (mutation) => {
+    const { call, database, sent, job, path } = await recoveryFixture();
+    database.db.prepare(`UPDATE devday_judge_submissions SET ${mutation} WHERE id = ?`).run(job.submissionId);
+    const before = database.changes();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(database.changes()).toBe(before);
+    expect(sent).toHaveLength(1);
+  });
+
+  it.each(["reserved", "settled"])("refuses any historical %s reservation even with zero actual cost", async (status) => {
+    const { call, database, job, path } = await recoveryFixture();
+    database.db.prepare("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, actual_micro_usd, status, created_at) VALUES ('history', ?, 'older-generation', 'production', 'decisions', 'gpt-6-luna', 1, 0, 1, 0, ?, 'before')").run(job.submissionId, status);
+    const before = database.changes();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(database.changes()).toBe(before);
+  });
+
+  it.each(["manifest", "complete", "orphan chunk"])("refuses any stored evidence including %s from an older generation", async (kind) => {
+    const { call, database, job, path } = await recoveryFixture();
+    if (kind === "orphan chunk") {
+      database.db.exec("PRAGMA foreign_keys = OFF");
+      database.db.prepare("INSERT INTO devday_judge_evidence_chunks VALUES (?, ?, 1, 'older-generation', 0, ?)").run(job.submissionId, EVENT_ID, Buffer.from("x"));
+      database.db.exec("PRAGMA foreign_keys = ON");
+    }
+    else database.db.prepare("INSERT INTO devday_judge_evidence_manifests VALUES (?, ?, 1, 'older-generation', NULL, ?, 1, 1, ?)").run(job.submissionId, EVENT_ID, "0".repeat(64), Number(kind === "complete"));
+    const before = database.changes();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(database.changes()).toBe(before);
+  });
+
+  it("rotates tokens before delivery so old consumers cannot reserve or finalize", async () => {
+    const { call, database, job, path } = await recoveryFixture();
+    expect((await call(path, "POST", { confirm: true })).status).toBe(202);
+    const before = database.changes();
+    expect((await call("/internal/budget/reserve", "POST", { submissionId: job.submissionId, callbackToken: job.callbackToken, reservationId: "late", reservation: { kind: "decisions", model: "gpt-6-luna", maxInputTokens: 1, maxOutputTokens: 0, reservedUsd: 1 } })).status).toBe(403);
+    expect((await call("/internal/scoring-callback", "POST", { submissionId: job.submissionId, callbackToken: job.callbackToken, outcome: { kind: "completed", result: score(32) } })).status).toBe(403);
+    expect(database.changes()).toBe(before);
+  });
+
+  it.each([
+    "status = 'completed'", "result_json = '{}'", "decisions_result_json = '{}'", "attempts = 2", "attempts = 0", "callback_token = 'changed'", "callback_token = NULL",
+    "recovery_dispatch_count = 1", "updated_at = '2026-10-18T08:59:59.000Z'", "evidence_snapshot_json = '{}'", "frozen_at = NULL", "frozen_resolution_json = NULL",
+    "reservation", "manifest", "chunk", "batch"
+  ])("atomically refuses a recovery eligibility race: %s", async (mutation) => {
+    const { call, database, sent, job, path } = await recoveryFixture();
+    const prepare = database.prepare.bind(database);
+    let injected = false;
+    let afterRace = 0;
+    vi.spyOn(database, "prepare").mockImplementation((sql) => {
+      const prepared = prepare(sql);
+      if (!sql.startsWith("UPDATE devday_judge_submissions SET recovery_dispatch_count")) return prepared;
+      return { bind(...values: unknown[]) {
+        const statement = prepared.bind(...values);
+        return { ...statement, async first<T>() {
+          injected = true;
+          if (mutation === "reservation") database.db.prepare("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, actual_micro_usd, status, created_at) VALUES ('race', ?, 'old', 'production', 'decisions', 'gpt-6-luna', 1, 0, 1, 0, 'settled', 'before')").run(job.submissionId);
+          else if (mutation === "manifest") database.db.prepare("INSERT INTO devday_judge_evidence_manifests VALUES (?, ?, 1, 'old', NULL, ?, 1, 1, 0)").run(job.submissionId, EVENT_ID, "0".repeat(64));
+          else if (mutation === "chunk") {
+            database.db.exec("PRAGMA foreign_keys = OFF");
+            database.db.prepare("INSERT INTO devday_judge_evidence_chunks VALUES (?, ?, 1, 'old', 0, ?)").run(job.submissionId, EVENT_ID, Buffer.from("x"));
+            database.db.exec("PRAGMA foreign_keys = ON");
+          } else if (mutation === "batch") database.db.exec("UPDATE devday_judge_batches SET status = 'freezing'");
+          else database.db.prepare(`UPDATE devday_judge_submissions SET ${mutation} WHERE id = ?`).run(job.submissionId);
+          afterRace = database.changes();
+          return statement.first<T>();
+        } };
+      } };
+    });
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
+    expect(injected).toBe(true);
+    expect(database.changes()).toBe(afterRace);
+    expect(sent).toHaveLength(1);
+  });
+
   it("preserves existing rows and counts pre-migration claims as one attempt", () => {
     const database = new DatabaseSync(":memory:");
     try {

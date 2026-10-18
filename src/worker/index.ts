@@ -1,6 +1,6 @@
-import { handleApiRequest } from "./api";
+import { handleApiRequest, validRecoveryMessage } from "./api";
 import { JudgeState } from "./judge-state";
-import { processExplanationMessage, processScoringMessage } from "./queue";
+import { processExplanationMessage, processRecoveryMessage, processScoringMessage } from "./queue";
 import { validExplanationMessage } from "./explanations";
 import { processFreezeMessage, validFreezeMessage } from "./batches";
 import type { JudgeQueueMessage } from "../shared/types";
@@ -20,6 +20,7 @@ export default {
       try {
         if (validFreezeMessage(message.body)) await processFreezeMessage(message.body, env);
         else if (validExplanationMessage(message.body)) await processExplanationMessage(message.body, env);
+        else if (validRecoveryMessage(message.body)) await processRecoveryMessage(message.body, env);
         else await processScoringMessage(message.body, env);
       } finally {
         message.ack();
