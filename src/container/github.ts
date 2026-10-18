@@ -2,6 +2,7 @@ import { MAX_EVIDENCE_FILES, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_TOTAL_BYTES, 
 import { buildZeroScoreResult } from "../shared/scoring";
 import type { NormalizedRepo, RepoAssessmentKind, RepoEvidenceSnapshot, RepoResolution } from "../shared/types";
 import { parseUploadPackResponse, type GitPackObject } from "./git-pack";
+import { isReviewedAsset } from "./reviewed-assets";
 
 const GITHUB_PUBLIC_BASE = "https://github.com";
 const EVIDENCE_TIMEOUT_MS = 45_000;
@@ -65,7 +66,7 @@ function requireCapabilities(refs: PublicRefs | null): void {
 async function fetchPinnedEvidence(repo: NormalizedRepo, pinnedSha: string, defaultBranch: string, summary: string, signal: EvidenceSignal): Promise<RepoEvidenceSnapshot> {
   const initial = await uploadPack(repo, [pinnedSha], true, signal);
   checkDeadline(signal);
-  const { candidates, entryCount } = enumerateSource(initial, pinnedSha, signal);
+  const { candidates, entryCount } = enumerateSource(initial, pinnedSha, signal, repo);
   initial.clear();
   if (candidates.length > MAX_EVIDENCE_FILES) throw new Error("GitHub evidence exceeds candidate file capacity");
   const snapshot: RepoEvidenceSnapshot = {
@@ -183,7 +184,7 @@ function packet(value: string): Uint8Array {
   return result;
 }
 
-function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string, signal: EvidenceSignal): { candidates: { path: string; oid: string }[]; entryCount: number } {
+function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string, signal: EvidenceSignal, repo: NormalizedRepo): { candidates: { path: string; oid: string }[]; entryCount: number } {
   const commit = objects.get(pinnedSha);
   if (commit?.type !== "commit" || commit.oid !== pinnedSha) throw new Error("GitHub upload-pack omitted the requested pinned commit");
   const root = /^tree ([0-9a-f]{40})\n$/.exec(String.fromCharCode(...commit.data.subarray(0, 46)))?.[1];
@@ -229,7 +230,7 @@ function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string,
       offset = nul + 21;
       if (mode === "40000") walk(childOid, path, depth + 1);
       else if (mode === "100644" || mode === "100755") {
-        if (isEvidencePath(path)) candidates.push({ path, oid: childOid });
+        if (isEvidencePath(path) && !isReviewedAsset(repo.normalized, pinnedSha, path)) candidates.push({ path, oid: childOid });
       } else if (mode !== "120000" && mode !== "160000") throw new Error("Git tree has an unsupported mode");
     }
     stack.delete(oid);
@@ -244,6 +245,13 @@ function enumerateSource(objects: Map<string, GitPackObject>, pinnedSha: string,
 function isEvidencePath(path: string): boolean {
   const parts = path.toLowerCase().split("/");
   const name = parts[parts.length - 1]!;
+  if (parts.slice(0, -1).some((part) => /^(?:tests?|__tests__|specs?|__specs__|e2e|__e2e__|cypress|playwright)$/.test(part))) return false;
+  if (/\.(?:tests?|specs?)\.[^./]+$/.test(name)
+    || /_tests?\.(?:go|py|rs|rb|php)$/.test(name)
+    || /^test_[^/]+\.py$/.test(name)
+    || /^(?:test|spec)\.(?:[cm]?[jt]sx?|py|rb|php|go|rs)$/.test(name)
+    || name === "conftest.py") return false;
+  if (/(?:Test|Tests|Spec|Specs)\.(?:java|kt|kts|cs|swift)$/.test(path.split("/").at(-1)!)) return false;
   if (parts.slice(0, -1).some((part) => /^(?:node_modules|vendor|\.venv|venv|site-packages|dist|build|target|coverage|\.git|\.next|\.nuxt|generated|__generated__|cache|\.cache|__pycache__|\.ssh|\.aws|\.azure)$/.test(part))) return false;
   if (/^(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.ya?ml|yarn\.lock|bun\.lockb?|cargo\.lock|go\.sum|gemfile\.lock|composer\.lock|poetry\.lock|pipfile\.lock|uv\.lock|pdm\.lock|packages\.lock\.json|flake\.lock|mix\.lock|pubspec\.lock|gradle\.lockfile|.*\.lock)$/.test(name)) return false;
   if (/^(?:\.env(?:\..*)?|\.npmrc|\.pypirc|\.netrc|_netrc|id_(?:rsa|dsa|ecdsa|ed25519)(?:\..*)?)$/.test(name)) return false;

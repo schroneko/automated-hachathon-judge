@@ -2,7 +2,7 @@ import type { CriterionKey } from "./types";
 
 export const CONDITION_PROBABILITY_THRESHOLD = 0.8;
 
-export const SOURCE_EVIDENCE = "提示された固定ソースだけで独立に判定する。実装されたテスト・利用例や実行経路につながる宣言的登録も根拠にできる。README・設定・文書の主張だけでは満たさず、実行の観測や外部調査は要求しない。";
+export const SOURCE_EVIDENCE = "提示された固定ソースだけで独立に判定する。テストコード・テスト結果は評価対象外とし、同一ファイル内のテスト部分も根拠にしない。製品の利用例や実行経路につながる宣言的登録は根拠にできる。README・設定・文書の主張だけでは満たさず、実行の観測や外部調査は要求しない。";
 
 export const DECISION_CONDITIONS = [
   {

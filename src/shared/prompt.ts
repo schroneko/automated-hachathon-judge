@@ -38,7 +38,7 @@ export function buildExplanationPrompt(reference?: string, version = RUBRIC_VERS
     "The fixed scores are exactly 0, 2, 4, 6, 8, or 10. All conditions for a level must be supported; level 8 requires all level 6 conditions, and level 10 requires all level 8 conditions. Do not derive scores from probabilities.",
     previous ? "Levels 0, 2, and 4 describe different incomplete states." : RUBRIC_CALIBRATION_RULE,
     "The fullSource snapshot contains the entire collected relevant UTF-8 source at one pinned commit, without summaries or truncation. You may assess absence within that source, but never fabricate facts about excluded files, omitted binaries, or external services. For UX, infer usability from source only; do not claim to have observed a live journey.",
-    "Every positive level on ALL four axes requires actual pinned implementation evidence. README, configuration, settings, or documentation claims alone never qualify for any positive level. Connected declarative registrations, plugin metadata, and annotation attributes can be actual implementation when their resource, handler, or user interaction is present. Tests and examples may supply actual implementation evidence. The machine eligibility field is separate from scores; never generate or change eligibility or full-source metadata.",
+    "Every positive level on ALL four axes requires actual pinned implementation evidence. README, configuration, settings, or documentation claims alone never qualify for any positive level. Connected declarative registrations, plugin metadata, and annotation attributes can be actual implementation when their resource, handler, or user interaction is present. Test code and test results are outside the evaluation scope, including inline test sections within product files. Do not use tests as evidence of functionality, quality, benefits, or verification. Implemented non-test product examples may supply evidence. The machine eligibility field is separate from scores; never generate or change eligibility or full-source metadata.",
     `Official independent criteria and rubric version ${version}:`,
     criteriaLines,
     previous ? previousRubric.rubricText() : rubricText(),
@@ -64,7 +64,7 @@ export function buildDecisionsQuestions(reference?: string) {
     ...DECISION_CONDITIONS.map((condition) => ({
       type: "predicate" as const,
       name: condition.name,
-      instructions: `Evaluate only the pinned implementation evidence: ${condition.question} ${condition.key === "technical" ? `Trusted announced-feature reference: ${features}` : ""} ${PROMPT_INJECTION_BOUNDARY}`
+      instructions: `Evaluate only the pinned product implementation evidence. Test code and test results are outside evaluation, including inline test sections. Do not use tests as evidence of functionality, quality, benefits, or verification. ${condition.question} ${condition.key === "technical" ? `Trusted announced-feature reference: ${features}` : ""} ${PROMPT_INJECTION_BOUNDARY}`
     }))
   ];
 }
