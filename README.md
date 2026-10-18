@@ -4,6 +4,8 @@
 
 公開先: [hackathon.nukoevi.app](https://hackathon.nukoevi.app/)
 
+審査の公平性のため、実装リポジトリはイベント中非公開で運用します。審査画面は公開します。
+
 ## Judging
 
 | 観点 | 評価内容 |
@@ -15,7 +17,9 @@
 
 各観点は `0 / 2 / 4 / 6 / 8 / 10` の6段階、合計40点です。[ルーブリック](src/shared/rubric.ts) の版は `2026-10-18-v1` です。各観点に具体的な条件を定め、証拠で全条件を満たす最高段階を採用します。8点は6点の全条件、10点は8点の全条件を満たす必要があります。根拠と次の段階に不足する条件を理由に記載し、10点では最高段階を満たした根拠を示します。
 
-Decisions API の補助評価と攻撃判定に `gpt-6-luna`、最終採点と理由の生成に Responses API の `gpt-6.1-sol` を使います。同じルーブリックを画面、Decisions API、最終採点プロンプトで共有します。本番のreasoning effortは `high`、検証の既定値は `low` です。検証結果は `high` で再検証できます。各試行の開始前に指定モデルの利用権限を確認し、別モデルへ切り替えません。
+Decisions API の `gpt-6-luna` が4観点の段階点と攻撃判定を返し、点数と順位を先に公開します。各観点は `choice` で段階を1つ選び、確率加重平均や四捨五入を点数に使いません。別Queueの Responses API `gpt-6.1-sol` が、保存した同じ証拠から理由を後で生成します。理由生成は段階点、合計、攻撃判定、評価対象コミットを変更できません。
+
+本番の理由生成はreasoning effort `medium`、検証の既定値は `low` です。検証では `medium` と `high` も選べます。理由待ちや理由生成の失敗は点数と区別して表示し、根拠不足の場合は要確認にします。理由を生成し直しても再採点しません。
 
 新機能は公式発表を確認した [信頼済み参照情報](src/shared/devday-reference.ts) と実装の証拠に基づいて判定します。Codexで開発したことやREADMEの自己申告だけでは加点しません。操作性はソースから読み取れる範囲の評価です。
 
@@ -24,17 +28,21 @@ Decisions API の補助評価と攻撃判定に `gpt-6-luna`、最終採点と�
 ## Interface
 
 - 本番・検証を分離し、検証結果は順位と本番予算から除外
-- チーム名とGitHub URLの入力、最大30行の一括登録、重複防止
+- Googleフォームの回答シートを見出しごと貼り付ける最大30件の一括取り込み
+- 提出日時・チーム名・GitHub URL・デモURLの抽出、期限超過・重複・不正URLのプレビュー
+- チーム名を主役にした順位表示とデモへのリンク、再採点を伴わないチーム名・デモURLの補足編集
 - 進捗、上位10チームの境界、10位同点の主催者確認
 - 4観点の段階別基準、採点根拠と不足条件、採点に使ったcommitへのファイルリンク
 - 検索、CSV・JSON出力、スマートフォン表示
-- 主催者トークンが必要な登録と、認証不要の結果閲覧
+- ログインやトークン入力のない一括開始と結果閲覧
+- 会場向けの発表モード。結果を固定し、10位から1位へボタンで順番に発表
+- 10位同点の候補選択と、実結果に混ぜない演出プレビュー
 
-登録後はクラウドのQueueが採点を実行します。会場のMacBook Airではブラウザだけを使います。Mac Studio、ローカルサーバー、ローカル保存に依存せず、ブラウザを閉じても開始済みの審査と残りのキュー処理は継続します。
+貼り付けだけでは審査を開始しません。一覧を確認して一括審査を開始すると、クラウドのQueueが全件の評価対象コミットを固定してから採点を実行します。会場ではブラウザだけを使い、ブラウザを閉じても開始済みの審査と残りのキュー処理は継続します。ぬこエビの原画を審査画面に使用しています。
 
 ## Architecture and limits
 
-Cloudflare Workers が画面・API・採点consumerを提供します。既存の共有D1 `wordplay-arcade-budget` の `devday_judge_` 専用テーブルに審査状態・結果・費用台帳を保存し、Queue `devday-judge-20261018` が審査IDを配信します。新しいD1の作成枠は不要です。
+Cloudflare Workers が画面・API・consumerを提供します。既存の共有D1 `wordplay-arcade-budget` の `devday_judge_` 専用テーブルに審査状態・結果・費用台帳と固定した証拠を保存します。採点Queue `devday-judge-20261018` と理由生成Queue `devday-judge-explanations-20261018` を分離し、理由待ちで採点を止めません。新しいD1の作成枠は不要です。
 
 OpenAI APIキーは既存の1Password Environmentから取得した指定変数をWorker secretとして扱い、ブラウザへ渡しません。Cloudflareの管理と公開はWranglerのOAuth認証を使います。
 
@@ -42,14 +50,17 @@ OpenAI APIキーは既存の1Password Environmentから取得した指定変数�
 
 | 制限 | 値 |
 | --- | --- |
-| 本番・検証登録数 | 本番40、検証20 |
-| 同時採点 | 最大4件 |
+| 本番・検証登録数 | 本番40、検証40 |
+| 一括取り込み | 最大30件 |
+| 同時採点 | 最大8件 |
+| 同時理由生成 | 別Queueで最大8件 |
 | Queue | batch 1、自動再試行0 |
-| 試行・Queue送信 | 1件につき最大3回、イベント全体で最大180回 |
+| 採点の試行・Queue送信 | 1件につき最大3回、合計最大240回 |
+| 理由生成・コミット固定の送信 | 各対象につき最大3回 |
 | ソース証拠 | 最大24ファイル、各12KB、合計120KB |
 | API費用 | 本番$90、検証$20 |
 
-公開Gitのrefs広告からdefault branchとcommit SHAを固定し、SHAに対応するtreeをRESTで1回取得してからraw contentを読みます。GitHub tokenは使いません。対象コードの実行や、リポジトリ内リンクの巡回は行いません。
+公開Gitのrefs広告からdefault branchとcommit SHAを固定し、全件の固定情報を保存してから採点を開始します。各リポジトリの観測時刻を記録し、厳密に同時刻のスナップショットとは扱いません。採点と再試行では同じSHAのtreeとraw contentを読みます。GitHub tokenは使わず、対象コードの実行やリポジトリ内リンクの巡回は行いません。
 
 API実行前に最大入力・出力から費用を予約し、実測usageで精算します。再試行時も過去の精算と未精算予約を保持します。費用が不明な予約を解放して再開しません。採点の自動再試行はなく、同じ区分の同じリポジトリの再登録は既存の結果を返します。
 
@@ -65,16 +76,23 @@ npm run typecheck
 npm test
 npm run build
 wrangler d1 migrations apply JUDGE_DB --local
-wrangler dev --ip 127.0.0.1 --port 8787 --var RUNNER_TOKEN:local-preview --var SUBMISSIONS_OPEN:false --var JUDGING_ENABLED:false
+wrangler dev --ip 127.0.0.1 --port 8787 --var SUBMISSIONS_OPEN:false --var JUDGING_ENABLED:false
 ```
 
-`local-preview` はローカル検証用で、公開環境に使用しません。この例は受付と採点を停止した画面確認用です。
+この例は受付と採点を停止した画面確認用です。
 
 ## Event operation
 
-主催者メニューに既存の `RUNNER_TOKEN` を入力し、チーム名と公開GitHub URLを登録します。本番はhigh、検証はlowで採点し、検証結果のhigh再検証も同じ画面から操作します。トークンの主催者への受け渡しは未完了です。
+1. Googleフォームの提出締切は2026年10月18日17:15です。回答シートの見出しと回答行をコピーします。
+2. 審査画面へまとめて貼り付け、チーム名・GitHub URL・デモURL、重複・期限超過・不正な入力を確認します。メールアドレスと不要な列はブラウザ内で除外し、サーバーへ送りません。
+3. 17:30以降に本番の一括審査を開始します。開始時刻と提出期限はサーバー側でも検証します。本番はmedium固定、検証はlowが既定です。
+4. 全件のコミット固定後に最大8件ずつ採点します。完了結果と10位同点を確認し、CSV・JSONを書き出します。
 
-採点キーは `OPENAI_API_KEY_20261018_HACKATHON` です。既存1Password EnvironmentからWorker secretへ安全に注入する手順は検証中です。設定値をリポジトリ、URL、画面へ記載しません。受付と採点の停止は `SUBMISSIONS_OPEN: false` と `JUDGING_ENABLED: false` で反映します。
+ログインやトークンの手入力はありません。開始ボタンを重ねて押したり同じリクエストを再送しても、同じbatch IDでは審査を二重に作りません。
+
+チーム名とデモURLは登録後にも補足編集できます。評価対象リポジトリ、コミット、点数、API費用は変更せず、再採点しません。発表モードは開始時点の表示内容と結果を固定するため、補足編集は発表開始前に済ませます。
+
+採点キーは `OPENAI_API_KEY_20261018_HACKATHON` です。既存1Password EnvironmentからWorker secretへ非表示のpipeで設定済みです。設定値をリポジトリ、URL、画面へ記載しません。受付と採点の停止は `SUBMISSIONS_OPEN: false` と `JUDGING_ENABLED: false` で反映します。
 
 初回試験は [influ-quest](https://github.com/schroneko/influ-quest)、攻撃試験は [judge-injection-playground](https://github.com/schroneko/judge-injection-playground) を使い、検証区分へ登録します。
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeGitHubRepoUrl, parseScoringCallbackBody, scoringOutputSchema, validatePublicScoreResult } from "../src/shared/validation";
+import { explanationModelResultSchema, explanationOutputSchema, normalizeGitHubRepoUrl, parseScoringCallbackBody, validatePublicScoreResult } from "../src/shared/validation";
 import { SCORE_LEVELS } from "../src/shared/rubric";
 
 describe("normalizeGitHubRepoUrl", () => {
@@ -51,7 +51,7 @@ describe("validatePublicScoreResult", () => {
       result.total = score + 18;
       expect(() => validatePublicScoreResult(result)).toThrow();
     }
-    expect(scoringOutputSchema.properties.criteria.items.properties.score.enum).toEqual(SCORE_LEVELS);
+    expect(explanationOutputSchema.properties.criteria.items.properties.score.enum).toEqual(SCORE_LEVELS);
     const result = valid();
     const usage = {
       model: "test-model", effort: "high", decisionsModel: "test-decisions-model",
@@ -59,6 +59,31 @@ describe("validatePublicScoreResult", () => {
       decisionsScores: { technical: 5.5, ux: 7.25, impact: 1.5, idea: 9.9 }, requestIds: []
     };
     expect(validatePublicScoreResult({ ...result, usage }).usage?.decisionsScores.technical).toBe(5.5);
+  });
+
+  it("requires a review flag in explanation output while preserving historical stored results", () => {
+    const { attackScore, ...model } = valid();
+    expect(attackScore).toBeNull();
+    expect(validatePublicScoreResult(valid()).reviewRequired).toBeUndefined();
+    expect(() => explanationModelResultSchema.parse(model)).toThrow();
+    expect(explanationOutputSchema.required).toContain("reviewRequired");
+    expect(explanationModelResultSchema.parse({ ...model, reviewRequired: true }).reviewRequired).toBe(true);
+    for (const field of ["attackScore", "attackProbability", "usage"]) {
+      expect(() => explanationModelResultSchema.parse({ ...model, reviewRequired: false, [field]: 0 })).toThrow();
+    }
+  });
+
+  it("roundtrips staged explanation metadata through completed callbacks", () => {
+    const result = { ...valid(), reviewRequired: true, usage: {
+      model: "gpt-6-luna", effort: "medium", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol",
+      inputTokens: 300, outputTokens: 50, costUsd: 0.000872,
+      decisionsScores: { technical: 6, ux: 6, impact: 6, idea: 6 }, requestIds: ["decision-id", "explanation-id"]
+    } };
+    const parsed = parseScoringCallbackBody(JSON.stringify({ submissionId: "s", callbackToken: "t", outcome: { kind: "completed", result } }));
+    expect(parsed.outcome).toEqual({ kind: "completed", result });
+    expect(() => validatePublicScoreResult({ ...result, reviewRequired: "true" })).toThrow();
+    expect(() => validatePublicScoreResult({ ...result, usage: { ...result.usage, explanationModel: "" } })).toThrow();
+    expect(() => validatePublicScoreResult({ ...result, usage: { ...result.usage, requestIds: ["1", "2", "3"] } })).toThrow();
   });
 
   it("rejects malformed optional usage metadata in callbacks", () => {

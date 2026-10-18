@@ -1,6 +1,6 @@
 import { MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_FILES, MAX_EVIDENCE_TOTAL_BYTES } from "../shared/constants";
 import { buildZeroScoreResult } from "../shared/scoring";
-import type { NormalizedRepo, RepoAssessmentKind, RepoEvidenceFile, RepoEvidenceSnapshot } from "../shared/types";
+import type { NormalizedRepo, RepoAssessmentKind, RepoEvidenceFile, RepoEvidenceSnapshot, RepoResolution } from "../shared/types";
 
 const GITHUB_API_BASE = "https://api.github.com";
 const GITHUB_PUBLIC_BASE = "https://github.com";
@@ -11,23 +11,35 @@ const MAX_TREE_BYTES = 2_000_000;
 
 export class RetryableGithubError extends Error {}
 
+export async function resolveRepoAuthority(repo: NormalizedRepo, summary: string): Promise<RepoResolution> {
+  validateRepoIdentity(repo);
+  return withEvidenceDeadline(async (signal) => resolvePublicAuthority(repo, summary, signal));
+}
+
 export async function resolveRepoEvidence(repo: NormalizedRepo, summary: string): Promise<RepoEvidenceSnapshot> {
   validateRepoIdentity(repo);
   return withEvidenceDeadline(async (signal) => resolvePublicEvidence(repo, summary, signal));
 }
 
-async function resolvePublicEvidence(repo: NormalizedRepo, summary: string, signal: AbortSignal): Promise<RepoEvidenceSnapshot> {
+async function resolvePublicAuthority(repo: NormalizedRepo, summary: string, signal: AbortSignal): Promise<RepoResolution & { assessment: RepoEvidenceSnapshot["assessment"] }> {
   const authority = await fetchPublicRefs(repo, signal);
-  if (!authority) {
-    return missingSnapshot(repo, summary, "missing_or_private");
+  if (authority?.kind === "found") {
+    return { assessment: "scored", pinnedSha: authority.sha, defaultBranch: authority.branch, summary };
   }
-  if (authority.kind === "empty") {
-    return missingSnapshot(repo, summary, "empty_repository");
+  return {
+    assessment: !authority ? "missing_or_private" : authority.kind === "empty" ? "empty_repository" : "no_default_branch",
+    pinnedSha: null,
+    defaultBranch: null,
+    summary
+  };
+}
+
+async function resolvePublicEvidence(repo: NormalizedRepo, summary: string, signal: AbortSignal): Promise<RepoEvidenceSnapshot> {
+  const authority = await resolvePublicAuthority(repo, summary, signal);
+  if (authority.pinnedSha === null || authority.defaultBranch === null) {
+    return { repo, ...authority, files: [] };
   }
-  if (authority.kind === "no_default_branch") {
-    return missingSnapshot(repo, summary, "no_default_branch");
-  }
-  return fetchPinnedEvidence(repo, authority.sha, authority.branch, summary, signal);
+  return fetchPinnedEvidence(repo, authority.pinnedSha, authority.defaultBranch, authority.summary, signal);
 }
 
 export async function fetchRepoEvidence(repo: NormalizedRepo, pinnedSha: string, defaultBranch: string, summary: string): Promise<RepoEvidenceSnapshot> {
@@ -39,15 +51,6 @@ export async function fetchRepoEvidence(repo: NormalizedRepo, pinnedSha: string,
     const authority = await fetchPublicRefs(repo, signal);
     if (!authority) {
       return missingSnapshot(repo, summary, "missing_or_private");
-    }
-    if (authority.kind === "empty") {
-      return missingSnapshot(repo, summary, "empty_repository");
-    }
-    if (authority.kind === "no_default_branch") {
-      return missingSnapshot(repo, summary, "no_default_branch");
-    }
-    if (authority.branch !== defaultBranch) {
-      throw new Error("Pinned default branch does not match public repository refs");
     }
     return fetchPinnedEvidence(repo, pinnedSha, defaultBranch, summary, signal);
   });

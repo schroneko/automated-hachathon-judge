@@ -1,6 +1,40 @@
 export type CriterionKey = "technical" | "ux" | "impact" | "idea";
 export type SubmissionStatus = "queued" | "processing" | "completed" | "failed";
 export type SubmissionMode = "production" | "validation";
+export type BatchStatus = "queued" | "freezing" | "scoring" | "completed" | "failed";
+export interface FreezeQueueMessage {
+  type: "freeze_batch";
+  eventId: string;
+  batchId: string;
+  dispatch: number;
+}
+export type ExplanationStatus = "pending" | "processing" | "completed" | "failed";
+export interface ExplanationQueueMessage {
+  type: "explain_submission";
+  eventId: string;
+  submissionId: string;
+  attempt: number;
+  dispatch: number;
+}
+export type JudgeQueueMessage = ScoringQueueMessage | FreezeQueueMessage | ExplanationQueueMessage;
+export interface PublicBatchRecord {
+  id: string;
+  eventId: string;
+  mode: SubmissionMode;
+  effort: "low" | "medium" | "high";
+  status: BatchStatus;
+  createdAt: string;
+  startedAt: string | null;
+  frozenAt: string | null;
+  completedAt: string | null;
+  failureMessage: string | null;
+  counts: Record<SubmissionStatus | "total", number>;
+  frozenCount: number;
+  scoredCount?: number;
+  freezeRequestedAt?: string | null;
+  freezeDispatches?: number;
+  maxFreezeDispatches?: number;
+}
 export interface ScoringQueueMessage {
   eventId: string;
   submissionId: string;
@@ -27,7 +61,8 @@ export interface ScoreItem {
 
 export interface ScoreUsage {
   model: string;
-  effort: "low" | "high";
+  explanationModel?: string;
+  effort: "low" | "medium" | "high";
   decisionsModel: string;
   inputTokens: number;
   outputTokens: number;
@@ -39,6 +74,7 @@ export interface ScoreUsage {
 }
 
 export interface PublicScoreResult {
+  reviewRequired?: boolean;
   summary: string;
   publicReason: string;
   repoAssessment: RepoAssessmentKind;
@@ -58,13 +94,21 @@ export interface RepoResolution {
 }
 
 export interface PublicSubmissionRecord {
+  demoUrl?: string | null;
+  explanationStatus?: ExplanationStatus;
+  explanationDispatches?: number;
+  scoredAt?: string | null;
+  batchId?: string;
+  submittedAt?: string;
+  pinnedSha?: string | null;
+  frozenAt?: string | null;
   id: string;
   eventId: string;
   repoUrl: string;
   repo: NormalizedRepo;
   teamName: string;
   mode: SubmissionMode;
-  effort: "low" | "high";
+  effort: "low" | "medium" | "high";
   status: SubmissionStatus;
   attempts: number;
   dispatches: number;
@@ -82,12 +126,13 @@ export interface SubmissionRecord extends PublicSubmissionRecord {
 }
 
 export interface LeaseJob {
+  frozenResolution?: RepoResolution;
   submissionId: string;
   repoUrl: string;
   repo: NormalizedRepo;
   teamName: string;
   mode: SubmissionMode;
-  effort: "low" | "high";
+  effort: "low" | "medium" | "high";
   startedAt: string;
   callbackToken: string;
   pinnedSha: string | null;
@@ -105,6 +150,7 @@ export interface FinalizePayload {
 }
 
 export interface RankingEntry {
+  demoUrl?: string | null;
   submissionId: string;
   repo: string;
   repoUrl: string;

@@ -1,6 +1,13 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { processFreezeMessage } from "../src/worker/batches";
+import type { FreezeQueueMessage } from "../src/shared/types";
+
+vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async () => ({ assessment: "scored", pinnedSha: "a".repeat(40), defaultBranch: "main", summary: "snapshot" })) }));
+
+beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
+afterEach(() => { vi.useRealTimers(); });
 import { CRITERIA } from "../src/shared/constants";
 import { callback, claimQueueMessage, handleApiRequest, reserve, settle } from "../src/worker/api";
 import { EVENT_ID } from "../src/shared/constants";
@@ -66,9 +73,10 @@ class SqliteD1 {
 function setup() {
   const database = new SqliteD1();
   const sent: unknown[] = [];
+  const controls: FreezeQueueMessage[] = [];
   const env = {
     JUDGE_DB: database,
-    SCORING_QUEUE: { send: async (message: unknown) => { sent.push(message); } },
+    SCORING_QUEUE: { send: async (message: unknown) => { if ((message as FreezeQueueMessage).type === "freeze_batch") controls.push(message as FreezeQueueMessage); else sent.push(message); } },
     RUNNER_TOKEN: "runner-secret",
     JUDGING_ENABLED: "true",
     SUBMISSIONS_OPEN: "true",
@@ -90,13 +98,15 @@ function setup() {
     if (path === "/internal/scoring-callback") return callback(request, env);
     if (path === "/internal/budget/reserve") return reserve(request, env);
     if (path === "/internal/budget/settle") return settle(request, env);
-    return handleApiRequest(request, env, {} as ExecutionContext);
+    const response = await handleApiRequest(request, env, {} as ExecutionContext);
+    if (path === "/api/submissions" && response.status === 202) await processFreezeMessage(controls.at(-1)!, env);
+    return response;
   }
   return { database, env, call, sent };
 }
 
 async function submit(call: ReturnType<typeof setup>["call"], name: string, mode = "production") {
-  return call("/api/submissions", "POST", { repoUrl: `https://github.com/Example/${name}`, teamName: name, mode }, true);
+  return call("/api/submissions", "POST", { repoUrl: `https://github.com/Example/${name}`, teamName: name, mode, submittedAt: "2026-10-18T08:15:00.000Z" }, true);
 }
 
 async function claim(call: ReturnType<typeof setup>["call"], mode = "production") {
@@ -138,9 +148,9 @@ describe("D1 runtime API", () => {
     }
   });
 
-  it("authenticates submissions, keeps duplicate rows unchanged, and stops new work while paused", async () => {
+  it("allows public submissions, keeps duplicate rows unchanged, and stops new work while paused", async () => {
     const { call, database, env, sent } = setup();
-    expect((await call("/api/submissions", "POST", { repoUrl: "https://github.com/a/b", mode: "production" })).status).toBe(401);
+    expect((await call("/api/submissions", "POST", { repoUrl: "https://github.com/a/b", mode: "production" })).status).toBe(400);
     const first = await submit(call, "demo");
     expect(first.status).toBe(202);
     expect(sent).toHaveLength(1);
@@ -170,7 +180,7 @@ describe("D1 runtime API", () => {
       expect((await submit(call, `production-${index}`)).status).toBe(202);
     }
     expect((await submit(call, "overflow")).status).toBe(429);
-    for (let index = 0; index < 20; index += 1) {
+    for (let index = 0; index < 40; index += 1) {
       expect((await submit(call, `validation-${index}`, "validation")).status).toBe(202);
     }
     expect((await submit(call, "validation-overflow", "validation")).status).toBe(429);
@@ -194,7 +204,7 @@ describe("D1 runtime API", () => {
     const { call, database } = setup();
     await submit(call, "one");
     const job = await claim(call);
-    expect(job?.pinnedSha).toBeNull();
+    expect(job?.pinnedSha).toBe("a".repeat(40));
     expect(await claim(call)).toBeNull();
     const publicItem = await call(`/api/submissions/${job!.submissionId}`);
     const publicBody = await publicItem.json() as { attempts: number };
@@ -210,13 +220,13 @@ describe("D1 runtime API", () => {
     expect((await call("/internal/scoring-callback", "POST", { ...payload, outcome: { kind: "failed", message: "changed" } }, true)).status).toBe(409);
   });
 
-  it("requires organizer authentication and explicit confirmation for manual retry", async () => {
+  it("requires explicit confirmation for public manual retry", async () => {
     const { call, database } = setup();
     const created = await submit(call, "retry-auth");
     const id = (await created.json() as { submission: { id: string } }).submission.id;
     const path = `/api/submissions/${id}/retry`;
     const before = database.changes();
-    expect((await call(path, "POST", { confirm: true })).status).toBe(401);
+    expect((await call(path, "POST", { confirm: true })).status).toBe(409);
     for (const body of [{}, { confirm: false }, { confirm: true, extra: true }, null]) {
       expect((await call(path, "POST", body, true)).status).toBe(400);
     }
@@ -257,7 +267,7 @@ describe("D1 runtime API", () => {
     expect(submission.createdAt).toBe(original.createdAt);
     expect(database.account("production")).toEqual(budgetBefore);
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM devday_judge_budget_reservations WHERE submission_id = ?").get(original.id)).toMatchObject({ count: 1 });
-    expect(database.db.prepare("SELECT callback_token, started_at, completed_at, pinned_sha, failure_message, result_json, outcome_json FROM devday_judge_submissions WHERE id = ?").get(original.id)).toMatchObject({ callback_token: null, started_at: null, completed_at: null, pinned_sha: null, failure_message: null, result_json: null, outcome_json: null });
+    expect(database.db.prepare("SELECT callback_token, started_at, completed_at, pinned_sha, failure_message, result_json, outcome_json FROM devday_judge_submissions WHERE id = ?").get(original.id)).toMatchObject({ callback_token: null, started_at: null, completed_at: null, pinned_sha: "a".repeat(40), failure_message: null, result_json: null, outcome_json: null });
     const staleCallback = { submissionId: original.id, callbackToken: firstJob!.callbackToken, outcome: { kind: "failed", message: "late" } };
     expect((await call("/internal/scoring-callback", "POST", staleCallback, true)).status).toBe(403);
     const secondJob = await claim(call);
@@ -270,11 +280,10 @@ describe("D1 runtime API", () => {
     expect(database.account("production").reserved_micro_usd).toBe(2_000_000);
   });
 
-  it("allows failed submissions while intake is closed and stops after three claims", async () => {
+  it("allows failed submissions to retry while enabled and stops after three claims", async () => {
     const { call, env, database } = setup();
     const created = await submit(call, "failed-retry");
     const id = (await created.json() as { submission: { id: string } }).submission.id;
-    env.SUBMISSIONS_OPEN = "false";
     for (let attempt = 1; attempt <= 3; attempt += 1) {
       const job = await claim(call);
       expect(job?.submissionId).toBe(id);
@@ -292,11 +301,12 @@ describe("D1 runtime API", () => {
     expect(database.db.prepare("SELECT attempts, status FROM devday_judge_submissions WHERE id = ?").get(id)).toMatchObject({ attempts: 3, status: "failed" });
     database.db.prepare("UPDATE devday_judge_submissions SET status = 'queued' WHERE id = ?").run(id);
     expect(await claim(call)).toBeNull();
+    env.SUBMISSIONS_OPEN = "false";
     const completed = await submit(call, "closed-new");
     expect(completed.status).toBe(403);
   });
 
-  it("never retries a completed submission", async () => {
+  it("preserves completed history and returns an actionable conflict when its Decisions snapshot is missing", async () => {
     const { call, database } = setup();
     await submit(call, "complete-retry");
     const job = await claim(call);
@@ -304,7 +314,7 @@ describe("D1 runtime API", () => {
     const before = database.changes();
     const response = await call(`/api/submissions/${job!.submissionId}/retry`, "POST", { confirm: true }, true);
     expect(response.status).toBe(409);
-    expect((await response.json() as { code: string }).code).toBe("retry_unavailable");
+    expect((await response.json() as { code: string }).code).toBe("explanation_snapshot_missing");
     expect(database.changes()).toBe(before);
   });
 

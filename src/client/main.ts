@@ -1,14 +1,21 @@
 import "./style.css";
+import { capturePresentation, demoPresentation, selectPresentation, rankLabel, revealState, acceptsAdvance, type PresentationSnapshot, type RevealState } from "./presentation";
 import type {
-  PublicSubmissionRecord as Submission,
+  PublicSubmissionRecord,
+  PublicBatchRecord,
   RankingEntry as Rank,
   SubmissionMode as Mode,
   SubmissionStatus as Status,
 } from "../shared/types";
-import { CRITERIA } from "../shared/constants";
+import { importSourceSignature, restorePendingImport, normalizeRepository, normalizeDemoUrl, formatTimestampJst, type ImportResult } from "./submission-import";
+import { CRITERIA, JUDGING_START_ISO } from "../shared/constants";
 import { RUBRIC_VERSION, rubricLevels } from "../shared/rubric";
-type Effort = "low" | "high";
+type Effort = "low" | "medium" | "high";
+type ExplanationState = "pending" | "processing" | "completed" | "failed";
+type Submission = PublicSubmissionRecord;
+type Batch = PublicBatchRecord;
 type Dashboard = {
+  batches?: Batch[];
   event: {
     id: string;
     name: string;
@@ -29,16 +36,6 @@ type Dashboard = {
   cutoff: { score: number | null; tied: boolean; tiedCount: number };
   runner: { online: boolean; lastSeenAt: string | null };
 };
-type Draft = {
-  line: string;
-  teamName: string;
-  repoUrl: string;
-  key: string;
-  state: "ready" | "duplicate" | "invalid";
-  message: string;
-};
-type RowResult = { line: string; state: "success" | "failed"; message: string };
-
 const axes = CRITERIA;
 const rubricMarkup = axes
   .map(
@@ -67,29 +64,12 @@ root.innerHTML = `
         <p class="hero-copy">公開 GitHub ソースをもとに、約30チームから決勝進出10チームを選出します。</p>
         <div class="hero-links"><a class="hero-link primary" href="#results-title">審査結果を見る <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M4 14 14 4M4 4h10v10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a><a class="hero-link secondary" href="#overview-title">進行状況 <svg aria-hidden="true" focusable="false" viewBox="0 0 18 18"><path d="M9 3v12m-5-5 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a></div>
       </div>
-      <div class="hero-art" aria-hidden="true">
-        <span class="art-sticker sticker-one">FINAL<br>10</span>
-        <span class="art-sticker sticker-two">LET'S<br>GO!</span>
-        <svg class="mascot" viewBox="0 0 460 420" focusable="false" xmlns="http://www.w3.org/2000/svg">
-          <ellipse cx="234" cy="375" rx="146" ry="23" fill="#090c1b" opacity=".5"/>
-          <path d="M75 209C87 108 179 65 278 84c83 16 132 79 114 160-17 80-94 131-193 119C111 353 65 294 75 209Z" fill="#23294a" stroke="#d9fa5c" stroke-width="4"/>
-          <path d="M103 224C111 130 184 92 272 104c78 10 119 64 105 139-13 74-84 117-173 107-82-9-108-60-101-126Z" fill="#d9fa5c"/>
-          <path d="M140 161c29-39 94-54 151-37" fill="none" stroke="#f3ffb6" stroke-width="17" stroke-linecap="round" opacity=".67"/>
-          <path d="M110 269c-31-15-46-6-42 12 5 19 27 33 56 30M366 265c31-17 47-9 44 9-3 19-25 35-54 34" fill="#d9fa5c" stroke="#23294a" stroke-width="5" stroke-linejoin="round"/>
-          <path d="M162 343c-4 22-1 34 19 38 21 5 37-7 38-25M276 351c2 21 15 29 33 26 20-3 24-17 17-37" fill="#d9fa5c" stroke="#23294a" stroke-width="5"/>
-          <path d="M209 85c-4-36 0-52 14-61 10-6 19-1 22 8 5 16-10 32-24 38" fill="none" stroke="#d9fa5c" stroke-width="11" stroke-linecap="round"/>
-          <circle cx="222" cy="22" r="13" fill="#ffb8d4" stroke="#23294a" stroke-width="4"/>
-          <ellipse cx="174" cy="223" rx="18" ry="26" fill="#15192e"/>
-          <ellipse cx="282" cy="219" rx="18" ry="26" fill="#15192e"/>
-          <circle cx="179" cy="213" r="6" fill="#fff8e9"/>
-          <circle cx="287" cy="209" r="6" fill="#fff8e9"/>
-          <ellipse cx="135" cy="251" rx="24" ry="13" fill="#ffb8d4" opacity=".88"/>
-          <ellipse cx="326" cy="248" rx="24" ry="13" fill="#ffb8d4" opacity=".88"/>
-          <path d="M206 259c9 18 36 19 48-1" fill="none" stroke="#15192e" stroke-width="6" stroke-linecap="round"/>
-          <path d="M346 322l12-22 25 1-15-20 9-24-23 9-19-16-1 25-23 12 25 6Z" fill="#ffb8d4" stroke="#23294a" stroke-width="5" stroke-linejoin="round"/>
-          <path d="M45 95l7-18 7 18 18 7-18 7-7 18-7-18-18-7ZM388 70l5-13 5 13 13 5-13 5-5 13-5-13-13-5Z" fill="#fff8e9"/>
-          <circle cx="76" cy="159" r="4" fill="#ffb8d4"/><circle cx="411" cy="184" r="5" fill="#d9fa5c"/>
-        </svg>
+      <div class="hero-art">
+        <p class="character-bubble">アイデアの光るところ、<br>じっくり見つけるね。</p>
+        <figure class="character-portrait">
+          <img class="character-image" src="/images/nukoevi-original.jpg" width="886" height="886" alt="茶色の巻き髪と猫耳、オレンジ色のエビのニット帽、琥珀色の瞳のぬこエビ">
+          <figcaption class="character-caption"><span>ぬこエビ</span><span>JUDGE COMPANION</span></figcaption>
+        </figure>
       </div>
       <div class="hero-facts">
         <div><span>審査対象</span><strong>約30<small> チーム</small></strong></div>
@@ -123,26 +103,17 @@ root.innerHTML = `
       <div id="progress"></div>
     </section>
     <details class="organizer">
-      <summary>主催者メニュー</summary>
+      <summary>まとめて審査する</summary>
       <div class="organizer-body">
         <div class="section-head">
-          <div><h2>提出管理</h2><p>トークンはこのタブを閉じると破棄されます。</p></div>
+          <div><h2>提出管理</h2><p>回答を貼り付け、内容を確認して一括審査を開始します。</p></div>
           <p id="runner"></p>
         </div>
-        <div class="connect">
-          <label class="field">
-            <span>主催者トークン</span>
-            <input id="token" type="password" autocomplete="off" placeholder="トークンを入力">
-          </label>
-          <button id="connect" type="button" class="dark">接続</button>
-          <button id="disconnect" type="button" class="subtle" hidden>切断</button>
-        </div>
-        <p id="token-state" role="status" class="note"></p>
         <div id="budget" class="budget"></div>
         <fieldset id="controls">
           <legend class="sr-only">審査キューへの登録</legend>
           <div class="section-head">
-            <div><h3>審査キューへの追加</h3><p>登録するとクラウド審査へ自動で追加されます。タブを閉じてもサーバー上の実行は継続します。</p></div>
+            <div><h3>一括審査</h3><p>内容を確認して一括開始すると、全件のコミット固定後に採点します。貼り付けやプレビューでは審査費用は発生しません。開始後はタブを閉じても継続します。</p></div>
             <label class="field">
               <span>登録先</span>
               <select id="mode"><option value="production">本番審査</option><option value="validation">検証</option></select>
@@ -150,25 +121,19 @@ root.innerHTML = `
           </div>
           <div class="submission-options">
             <label id="effort-field" class="field" hidden>
-              <span>検証の推論強度</span>
-              <select id="effort"><option value="low">low（軽量）</option><option value="high">high（本番と同じ）</option></select>
+              <span>理由生成の推論強度</span>
+              <select id="effort"><option value="low">low（軽量）</option><option value="medium">medium（本番と同じ）</option><option value="high">high</option></select>
             </label>
-            <p id="mode-note" class="note">本番審査のみ決勝候補に含まれ、推論強度は high 固定です。</p>
+            <p id="mode-note" class="note">本番審査のみ決勝候補に含まれ、理由生成の推論強度は medium 固定です。</p>
           </div>
-          <form id="single" class="single">
-            <label class="field"><span>チーム名</span><input id="team" maxlength="100" placeholder="チーム名（任意）"></label>
-            <label class="field"><span>GitHub リポジトリ</span><input id="repo" type="url" required placeholder="https://github.com/owner/repo"></label>
-            <button type="submit" class="dark">審査キューに追加</button>
-          </form>
-          <p id="single-result" role="status" class="note"></p>
           <div class="batch">
             <label class="field">
-              <span>まとめて追加</span>
-              <textarea id="batch" rows="5" placeholder="チーム名, https://github.com/owner/repo&#10;https://github.com/owner/other-repo"></textarea>
+              <span>1. 回答シートを貼り付け</span>
+              <textarea id="batch" rows="7" placeholder="Google Forms の回答を見出し行ごと貼り付けてください"></textarea>
             </label>
-            <p class="note">1行に1チーム、最大30行。URLだけでも登録できます。</p>
+            <p class="note">最大30回答。提出日時・チーム名・GitHub リポジトリURL・デモURLを取り込み、メールや不要な列はブラウザ内で破棄します。GitHubの公開状態はサーバーで確認します。</p><p class="note">本番の提出締切: 10/18 17:15:00 日本時間（締切時刻を含む）。開始: 17:30 日本時間。全件のソース版を保存後、最大8並列で審査します。検証は今すぐ開始できます。</p><button id="import-review" type="button" class="subtle">2. 内容を確認</button>
             <div id="preview"></div>
-            <button id="batch-submit" type="button" class="dark">有効な行を審査キューに追加</button>
+            <button id="batch-submit" type="button" class="dark">3. 対象の回答を一括審査</button>
             <div id="batch-results" role="status" aria-live="polite"></div>
           </div>
         </fieldset>
@@ -179,6 +144,7 @@ root.innerHTML = `
         <div><p class="kicker">RESULTS</p><h2 id="results-title">審査結果</h2></div>
         <p id="cutoff"></p>
       </div>
+      <div class="presentation-launch"><div><button id="presentation-real" type="button" class="dark" disabled aria-describedby="presentation-readiness">発表モード</button><button id="presentation-demo" type="button" class="subtle">演出プレビュー</button></div><p id="presentation-readiness" role="status">本番結果を読み込んでいます。</p></div>
       <div class="toolbar">
         <div class="tabs" role="tablist" aria-label="審査モード">
           <button id="tab-production" role="tab" aria-selected="true" aria-controls="panel" type="button">本番審査 <span id="production-count"></span></button>
@@ -206,35 +172,31 @@ const el = <T extends HTMLElement>(id: string) =>
 let data: Dashboard | null = null;
 let mode: Mode = "production";
 let selected: string | null = null;
-let token = sessionStorage.getItem("organizerToken") || "";
 let posting = false;
 let refreshing = false;
 let automatic = false;
 let timer: number | null = null;
-let rowResults: RowResult[] = [];
+let importResult: ImportResult | null = null;
+let pendingBatch: { signature: string; sourceSignature: string; payload: string; acknowledged: boolean } | null = null;
+let batchMessage = "";
+let startTimer: number | null = null;
 let retryReviewId: string | null = null;
-let retryRequestedEffort: "high" | null = null;
+let retryRequestedEffort: "medium" | "high" | null = null;
+let freezeReviewId: string | null = null;
+let freezeFeedback: { id: string; message: string } | null = null;
+type MetadataDraft = { teamName: string; demoUrl: string; saving: boolean; error: string };
+const metadataDrafts = new Map<string, MetadataDraft>();
+const metadataFeedback = new Map<string, string>();
 let retryFeedback: { id: string; message: string; failed: boolean } | null =
   null;
 
-el<HTMLInputElement>("token").value = token;
-el<HTMLInputElement>("token").addEventListener("input", organizer);
-el<HTMLButtonElement>("connect").addEventListener("click", () => {
-  token = el<HTMLInputElement>("token").value.trim();
-  if (token) sessionStorage.setItem("organizerToken", token);
-  organizer();
-  renderResults();
+el<HTMLButtonElement>("presentation-real").addEventListener("click", (event) => {
+  if (!data) return;
+  const snapshot = capturePresentation(data.items);
+  if (snapshot.ready) openPresentation(snapshot, event.currentTarget as HTMLElement);
 });
-el<HTMLButtonElement>("disconnect").addEventListener("click", () => {
-  token = "";
-  sessionStorage.removeItem("organizerToken");
-  el<HTMLInputElement>("token").value = "";
-  retryReviewId = null;
-  retryRequestedEffort = null;
-  retryFeedback = null;
-  organizer();
-  renderResults();
-});
+el<HTMLButtonElement>("presentation-demo").addEventListener("click", (event) => openPresentation(demoPresentation(), event.currentTarget as HTMLElement));
+
 el<HTMLButtonElement>("refresh").addEventListener(
   "click",
   () => void refresh(),
@@ -244,6 +206,7 @@ el<HTMLInputElement>("auto").addEventListener("change", (event) => {
   schedule();
 });
 document.addEventListener("visibilitychange", () => {
+  preview();
   if (!document.hidden && (!data || automatic || active())) void refresh();
   else schedule();
 });
@@ -273,22 +236,25 @@ for (const value of ["production", "validation"] as const) {
 el<HTMLInputElement>("search").addEventListener("input", renderResults);
 el<HTMLSelectElement>("mode").addEventListener("change", () => {
   updateSubmissionOptions();
-  rowResults = [];
   preview();
 });
 el<HTMLSelectElement>("effort").addEventListener("change", () => {
-  rowResults = [];
   updateSubmissionOptions();
   preview();
 });
 el<HTMLTextAreaElement>("batch").addEventListener("input", () => {
-  rowResults = [];
   preview();
 });
-el<HTMLFormElement>("single").addEventListener(
-  "submit",
-  (event) => void submitSingle(event),
-);
+el<HTMLButtonElement>("import-review").addEventListener("click", sanitizeInput);
+el<HTMLTextAreaElement>("batch").addEventListener("paste", (event) => {
+  if (!event.clipboardData) return;
+  event.preventDefault();
+  const field = el<HTMLTextAreaElement>("batch");
+  const parsed = parseInput(event.clipboardData.getData("text/plain"));
+  field.value = parsed.sanitized;
+  importResult = parsed;
+  preview(false);
+});
 el<HTMLButtonElement>("batch-submit").addEventListener(
   "click",
   () => void submitBatch(),
@@ -299,6 +265,7 @@ el<HTMLButtonElement>("json").addEventListener("click", () =>
 );
 organizer();
 updateSubmissionOptions();
+preview();
 void refresh();
 
 function selectedSubmissionOptions(): { mode: Mode; effort: Effort } {
@@ -307,7 +274,7 @@ function selectedSubmissionOptions(): { mode: Mode; effort: Effort } {
     mode: selectedMode,
     effort:
       selectedMode === "production"
-        ? "high"
+        ? "medium"
         : (el<HTMLSelectElement>("effort").value as Effort),
   };
 }
@@ -316,8 +283,8 @@ function updateSubmissionOptions(): void {
   el<HTMLElement>("effort-field").hidden = selection.mode === "production";
   el<HTMLElement>("mode-note").textContent =
     selection.mode === "production"
-      ? "本番審査のみ決勝候補に含まれ、推論強度は high 固定です。"
-      : `検証結果は決勝候補に含まれません。推論強度は ${selection.effort} です。`;
+      ? "本番審査のみ決勝候補に含まれ、理由生成の推論強度は medium 固定です。"
+      : `検証結果は決勝候補に含まれません。理由生成の推論強度は ${selection.effort} です。見出し付き回答のほか、チーム名とURLの2列、チーム名とURLのカンマ区切り、URLのみも使えます。提出日時は任意です。`;
 }
 
 function esc(value: unknown): string {
@@ -332,7 +299,7 @@ function esc(value: unknown): string {
 function status(value: Status): string {
   return {
     queued: "待機中",
-    processing: "審査中",
+    processing: "採点中",
     completed: "完了",
     failed: "失敗",
   }[value];
@@ -349,7 +316,30 @@ function needsOrganizerReview(item: Submission): boolean {
   return Number.isFinite(parsedAt) && Date.now() - parsedAt > 30 * 60 * 1000;
 }
 function statusLabel(item: Submission): string {
+  const stage = explanationState(item);
+  if (explanationStale(item)) return "採点済み・理由を要確認";
+  if (stage) return { pending: "採点済み・理由待ち", processing: "採点済み・理由生成中", completed: "採点済み・理由完了", failed: "理由を要確認" }[stage];
   return needsOrganizerReview(item) ? "主催者確認" : status(item.status);
+}
+function explanationState(item: Submission): ExplanationState | null {
+  if (!item.result) return null;
+  if (item.explanationStatus && ["pending", "processing", "completed", "failed"].includes(item.explanationStatus)) return item.explanationStatus;
+  if (item.status === "completed") return "completed";
+  if (item.status === "failed") return "failed";
+  return item.status === "processing" ? "processing" : "pending";
+}
+function explanationStale(item: Submission): boolean {
+  const stage = explanationState(item);
+  if (stage !== "pending" && stage !== "processing") return false;
+  const updatedAt = Date.parse(item.updatedAt);
+  return Number.isFinite(updatedAt) && Date.now() - updatedAt > 30 * 60 * 1000;
+}
+function reviewRequired(item: Submission): boolean {
+  return !!(item.result as (NonNullable<Submission["result"]> & { reviewRequired?: boolean }) | null)?.reviewRequired;
+}
+function stageCounts(items: Submission[]) {
+  const count = (stage: ExplanationState) => items.filter((item) => explanationState(item) === stage).length;
+  return { scored: items.filter((item) => !!item.result).length, pending: count("pending"), processing: count("processing"), completed: count("completed"), failed: count("failed") };
 }
 function money(value: number): string {
   return Number.isFinite(value) ? `$${value.toFixed(2)}` : "--";
@@ -367,29 +357,7 @@ function date(value: string | null): string {
       }).format(parsed);
 }
 function repo(value: string): { url: string; key: string } | null {
-  try {
-    const url = new URL(value.trim());
-    if (
-      url.protocol !== "https:" ||
-      url.hostname !== "github.com" ||
-      url.username ||
-      url.password ||
-      url.port ||
-      url.search ||
-      url.hash
-    )
-      return null;
-    const match = /^\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+?)(?:\.git)?\/*$/.exec(
-      url.pathname,
-    );
-    if (!match || match[2] === "." || match[2] === "..") return null;
-    return {
-      url: `https://github.com/${match[1]}/${match[2]}`,
-      key: `${match[1]}/${match[2]}`.toLowerCase(),
-    };
-  } catch {
-    return null;
-  }
+  return normalizeRepository(value);
 }
 function source(url: string, sha: string | null, path: string): string | null {
   const base = repo(url);
@@ -416,7 +384,7 @@ function attack(value: number | null | undefined): string {
     : "";
 }
 function active(): boolean {
-  return !!data?.items.some(
+  return !!data?.batches?.some((batch) => ["queued", "freezing", "scoring"].includes(batch.status)) || !!data?.items.some(
     (item) => item.status === "queued" || item.status === "processing",
   );
 }
@@ -452,6 +420,7 @@ function isDashboard(value: unknown): value is Dashboard {
         !!item &&
         typeof item.id === "string" &&
         typeof item.teamName === "string" &&
+        (item.demoUrl == null || typeof item.demoUrl === "string") &&
         typeof item.repoUrl === "string" &&
         typeof item.repo?.normalized === "string" &&
         typeof item.createdAt === "string" &&
@@ -525,28 +494,82 @@ function render(): void {
 function stats(): void {
   if (!data) return;
   const items = data.items.filter((item) => item.mode === "production");
-  const count = (value: Status) =>
-    items.filter((item) => item.status === value).length;
-  const done = count("completed"),
-    total = items.length;
+  const stages = stageCounts(items);
+  const done = stages.scored, total = items.length;
   el<HTMLElement>("stats").innerHTML =
-    `<div><span>本番登録</span><strong>${total}<small> / ${data.event.targetTeams}</small></strong></div><div><span>審査完了</span><strong>${done}</strong></div><div><span>待機・審査中</span><strong>${count("queued") + count("processing")}</strong></div><div><span>失敗</span><strong>${count("failed")}</strong></div>`;
+    `<div><span>本番登録</span><strong>${total}<small> / ${data.event.targetTeams}</small></strong></div><div><span>採点済み</span><strong>${done}</strong></div><div><span>未採点</span><strong>${total - done}</strong></div><div><span>理由完了</span><strong>${stages.completed}</strong></div>`;
   el<HTMLElement>("progress").innerHTML =
-    `<div class="progress-label"><span>審査進捗</span><span>${total ? Math.round((done / total) * 100) : 0}%</span></div><progress max="${Math.max(total, 1)}" value="${done}">${done} / ${total}</progress><p>${done} / ${total} 件の審査が完了</p>`;
+    `<div class="progress-label"><span>本番の採点進捗</span><span>${total ? Math.round((done / total) * 100) : 0}%</span></div><progress max="${Math.max(total, 1)}" value="${done}">${done} / ${total}</progress><p>本番 ${done} / ${total} 件を採点済み · 理由完了 ${stages.completed} / ${total} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由要確認 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}</p>${renderBatches()}`;
+}
+function renderBatches(): string {
+  const labels = { queued: "待機中", freezing: "ソース版を固定中", scoring: "審査中", completed: "完了", failed: "失敗" };
+  const markup = (data?.batches || []).map((batch) => {
+    const items = (data?.items || []).filter((item) => (item as Submission & { batchId?: string }).batchId === batch.id);
+    const stages = stageCounts(items);
+    const scored = batch.scoredCount ?? stages.scored;
+    const stageSummary = `採点済み ${scored} / ${batch.counts.total} · 採点中 ${items.filter((item) => !item.result && item.status === "processing").length} · 理由待ち ${stages.pending} · 理由生成中 ${stages.processing} · 理由完了 ${stages.completed} · 理由要確認 ${stages.failed} · 採点失敗 ${items.filter((item) => !item.result && item.status === "failed").length}`;
+    const dispatches = batch.freezeDispatches ?? 1;
+    const limit = batch.maxFreezeDispatches ?? 3;
+    const recoverable = needsFreezeRetry(batch);
+    const beforeStart = batch.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO);
+    const disabled = posting || beforeStart;
+    const controls = recoverable ? `<div class="freeze-retry"><p>コミット固定の登録・再送 ${esc(dispatches)} / ${esc(limit)} 回</p>${dispatches >= limit ? `<p>コミット固定の登録・再送の上限に達しています。</p>` : freezeReviewId === batch.id ? `<p>コミット固定を再開します。全件のSHAを保存してから最大8並列で審査します。確認すると登録・再送を1回消費します（最大${esc(limit)}回）。審査にはAPI費用が発生します。</p><div class="retry-actions"><button type="button" class="dark" data-freeze-confirm="${esc(batch.id)}"${disabled ? " disabled" : ""}>確認してコミット固定を再試行</button><button type="button" class="subtle" data-freeze-cancel="${esc(batch.id)}"${posting ? " disabled" : ""}>キャンセル</button></div>` : `<button type="button" class="subtle" data-freeze-prepare="${esc(batch.id)}"${disabled ? " disabled" : ""}>コミット固定を再試行</button>`}${beforeStart ? `<p>本番審査は10/18 17:30 日本時間から再試行できます。</p>` : ""}</div>` : "";
+    return `<section class="batch-progress"><h3>${batch.mode === "production" ? "本番" : "検証"} · ${esc(labels[batch.status])}</h3><p>受付ID: ${esc(batch.id)}</p><p>ソース版固定 ${esc(batch.frozenCount)} / ${esc(batch.counts.total)} 件 · 待機 ${esc(batch.counts.queued)}</p><p>${esc(stageSummary)}</p><p>全件のSHAを保存してから最大8並列で採点します。</p>${batch.failureMessage ? `<p role="alert">${esc(batch.failureMessage)}</p>` : ""}${freezeFeedback?.id === batch.id ? `<p role="status">${esc(freezeFeedback.message)}</p>` : ""}${controls}</section>`;
+  }).join("");
+  return markup;
+}
+function needsFreezeRetry(batch: Batch): boolean {
+  if (batch.frozenAt !== null) return false;
+  if (batch.status === "failed") return true;
+  const timestamp = batch.status === "queued" ? batch.freezeRequestedAt : batch.status === "freezing" ? batch.startedAt : null;
+  if (!timestamp) return false;
+  const time = Date.parse(timestamp);
+  return Number.isFinite(time) && Date.now() - time >= 30 * 60 * 1000;
+}
+function canFreezeRetry(batch: Batch): boolean {
+  return needsFreezeRetry(batch) && (batch.freezeDispatches ?? 1) < (batch.maxFreezeDispatches ?? 3) && (batch.mode !== "production" || Date.now() >= Date.parse(JUDGING_START_ISO));
+}
+el<HTMLElement>("progress").addEventListener("click", (event) => {
+  const button = (event.target as HTMLElement).closest<HTMLButtonElement>("button");
+  if (!button || posting) return;
+  if (button.dataset.freezeCancel) { freezeReviewId = null; stats(); return; }
+  const id = button.dataset.freezePrepare || button.dataset.freezeConfirm;
+  const batch = data?.batches?.find((item) => item.id === id);
+  if (!batch || !canFreezeRetry(batch)) return;
+  if (button.dataset.freezePrepare) { freezeReviewId = batch.id; stats(); }
+  else if (freezeReviewId === batch.id) void retryFreeze(batch.id);
+});
+async function retryFreeze(id: string): Promise<void> {
+  const batch = data?.batches?.find((item) => item.id === id);
+  if (posting || freezeReviewId !== id || !batch || !canFreezeRetry(batch)) return;
+  posting = true;
+  freezeFeedback = null;
+  render();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(`/api/batches/${encodeURIComponent(id)}/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ confirm: true }), signal: controller.signal });
+    const body = await response.json() as { batch?: Batch; submissions?: Submission[]; message?: string };
+    if (response.status !== 202) throw new Error(body.message || `HTTP ${response.status}`);
+    if (body.batch?.id !== id || !Array.isArray(body.submissions)) throw new Error("登録結果を確認できませんでした。手動更新で確認してください。");
+    if (data) {
+      data.batches = [...(data.batches || []).filter((item) => item.id !== id), body.batch];
+      const incoming = body.submissions;
+      data.items = [...data.items.filter((item) => !incoming.some((value) => value.id === item.id)), ...incoming];
+    }
+    freezeFeedback = { id, message: "コミット固定の再試行を受け付けました。" };
+  } catch (error) {
+    freezeFeedback = { id, message: error instanceof Error ? error.message : "コミット固定の再試行を登録できませんでした。" };
+  } finally {
+    clearTimeout(timeout);
+    posting = false;
+    freezeReviewId = null;
+    render();
+    void refresh();
+  }
 }
 function organizer(): void {
-  const connected = !!token;
-  el<HTMLButtonElement>("connect").hidden = connected;
-  el<HTMLButtonElement>("connect").disabled =
-    !el<HTMLInputElement>("token").value.trim();
-  el<HTMLButtonElement>("disconnect").hidden = !connected;
-  el<HTMLButtonElement>("disconnect").disabled = posting;
-  el<HTMLInputElement>("token").hidden = connected;
-  el<HTMLElement>("token-state").textContent = connected
-    ? "トークンをこのタブに保持中。認証は登録時に確認されます。"
-    : "登録操作には主催者トークンが必要です。";
-  el<HTMLFieldSetElement>("controls").disabled =
-    !connected || posting || data?.open === false;
+  el<HTMLFieldSetElement>("controls").disabled = posting || data?.open === false;
   if (data) {
     const budget = data.budget;
     el<HTMLElement>("budget").innerHTML =
@@ -554,9 +577,7 @@ function organizer(): void {
     el<HTMLElement>("runner").textContent = data.runner.online
       ? "クラウド自動審査: 有効"
       : "クラウド自動審査: 停止中（再開待ち）";
-    if (!data.open)
-      el<HTMLElement>("token-state").textContent +=
-        " 現在、登録受付は停止しています。";
+
   }
 }
 function entries(): Array<{ item: Submission; position: number | null }> {
@@ -580,8 +601,8 @@ function entries(): Array<{ item: Submission; position: number | null }> {
     .filter((item) => !used.has(item.id))
     .sort(
       (a, b) =>
-        (a.status === "completed" ? 0 : 1) -
-          (b.status === "completed" ? 0 : 1) ||
+        (a.result ? 0 : 1) -
+          (b.result ? 0 : 1) ||
         b.createdAt.localeCompare(a.createdAt),
     )
     .map((item) => ({ item, position: null }));
@@ -589,6 +610,9 @@ function entries(): Array<{ item: Submission; position: number | null }> {
 }
 function renderResults(): void {
   if (!data) return;
+  const presentation = capturePresentation(data.items);
+  el<HTMLButtonElement>("presentation-real").disabled = !presentation.ready;
+  el<HTMLElement>("presentation-readiness").textContent = presentation.ready && presentation.candidates.length ? `発表設定で同点候補${presentation.candidates.length}チームから${presentation.remaining}チームを選択してください。` : presentation.message;
   const all = entries();
   const query = el<HTMLInputElement>("search").value.trim().toLocaleLowerCase();
   const visible = all.filter(({ item }) =>
@@ -610,10 +634,10 @@ function renderResults(): void {
   el<HTMLElement>("panel").setAttribute("aria-labelledby", `tab-${mode}`);
   const production = data.items.filter((item) => item.mode === "production");
   const provisional =
-    production.filter((item) => item.status === "completed").length <
+    production.filter((item) => !!item.result).length <
       data.event.targetTeams ||
     production.some(
-      (item) => item.status === "queued" || item.status === "processing",
+      (item) => !item.result,
     );
   el<HTMLElement>("cutoff").textContent =
     mode === "validation"
@@ -651,7 +675,7 @@ function renderResults(): void {
               `<span class="axis-score"><span class="axis-label">${esc(axis.label)}</span>${esc(item.result?.criteria.find((value) => value.key === axis.key)?.score ?? "--")}</span>`,
           )
           .join("");
-        return `<button type="button" class="result-row${selected === item.id ? " selected" : ""}${atCutoff ? " cutoff-row" : ""}" data-id="${esc(item.id)}" aria-pressed="${selected === item.id}" aria-controls="detail"><span class="row-primary"><span class="rank">${position === null ? "--" : String(position).padStart(2, "0")}</span><span class="team-block"><strong>${esc(item.teamName || item.repo.normalized)}</strong><small>${esc(item.repo.normalized)}</small></span></span>${scores}<span class="total">${item.result ? `${esc(item.result.total)}<small>/40</small>` : "--"}${attack(item.result?.attackScore)}</span><span class="status ${item.status}">${statusLabel(item)}</span></button>`;
+        return `<div class="result-entry"><button type="button" class="result-row${selected === item.id ? " selected" : ""}${atCutoff ? " cutoff-row" : ""}" data-id="${esc(item.id)}" aria-pressed="${selected === item.id}" aria-controls="detail"><span class="row-primary"><span class="rank">${position === null ? "--" : String(position).padStart(2, "0")}</span><span class="team-block"><strong>${esc(item.teamName || "チーム名未設定")}</strong><small>${esc(item.repo.normalized)}</small></span></span>${scores}<span class="total">${item.result ? `${esc(item.result.total)}<small>/40</small>` : "--"}${attack(item.result?.attackScore)}</span><span class="status ${item.status}">${esc(statusLabel(item))}${reviewRequired(item) ? `<small class="review-badge">根拠不足・要確認</small>` : ""}</span></button><div class="result-demo">${demoLink(item.demoUrl)}</div></div>`;
       })
       .join("");
   el<HTMLElement>("list")
@@ -677,7 +701,12 @@ function detail(
   position: number | null,
   provisional: boolean,
 ): void {
+  const existingEditor = el<HTMLElement>("detail").querySelector<HTMLElement>(".metadata-editor");
+  const editorFocus = existingEditor?.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
   const result = item.result;
+  const explanation = explanationState(item);
+  const reasonsComplete = explanation === "completed";
+  const reasonText = explanationStale(item) ? "理由の処理が30分以上更新されていません" : explanation === "failed" ? "理由を確認してください" : "理由を生成中です";
   const qualification =
     mode === "production" &&
     position !== null &&
@@ -702,15 +731,15 @@ function detail(
     unjudgeable: "評価対象外",
   };
   el<HTMLElement>("detail").innerHTML =
-    `<div class="detail-head"><p class="kicker">SUBMISSION DETAIL</p><span class="status ${item.status}">${statusLabel(item)}</span></div><h3>${esc(item.teamName || item.repo.normalized)}</h3><p class="detail-repo">${safe ? `<a href="${esc(safe.url)}" target="_blank" rel="noopener noreferrer">${esc(item.repo.normalized)}</a>` : esc(item.repo.normalized)}</p>${qualification ? `<p class="qualification">${qualification}</p>` : ""}<dl class="metadata"><div><dt>審査区分</dt><dd>${item.mode === "production" ? "本番審査" : "検証"}</dd></div><div><dt>推論強度</dt><dd>${esc(recordedEffort(item) || "--")}</dd></div><div><dt>登録</dt><dd>${date(item.createdAt)}</dd></div><div><dt>完了</dt><dd>${date(item.completedAt)}</dd></div><div><dt>評価した版</dt><dd class="sha">${pinned ? `<a href="${esc(pinned)}" target="_blank" rel="noopener noreferrer">${esc(result!.pinnedSha!.slice(0, 12))}</a>` : "--"}</dd></div></dl>${
+    `<div class="detail-head"><p class="kicker">SUBMISSION DETAIL</p><span class="status ${item.status}">${statusLabel(item)}</span></div><h3>${esc(item.teamName || "チーム名未設定")}</h3><p class="detail-repo">${safe ? `<a href="${esc(safe.url)}" target="_blank" rel="noopener noreferrer">${esc(item.repo.normalized)}</a>` : esc(item.repo.normalized)}</p><p class="detail-demo">${demoLink(item.demoUrl)}</p><div id="metadata-editor-host"></div>${qualification ? `<p class="qualification">${qualification}</p>` : ""}<dl class="metadata"><div><dt>審査区分</dt><dd>${item.mode === "production" ? "本番審査" : "検証"}</dd></div><div><dt>理由生成の推論強度</dt><dd>${esc(recordedEffort(item) || "--")}</dd></div><div><dt>登録</dt><dd>${date(item.createdAt)}</dd></div><div><dt>理由完了</dt><dd>${date(item.completedAt)}</dd></div><div><dt>評価した版</dt><dd class="sha">${pinned ? `<a href="${esc(pinned)}" target="_blank" rel="noopener noreferrer">${esc(result!.pinnedSha!.slice(0, 12))}</a>` : "--"}</dd></div></dl>${
       result
-        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p><p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
+        ? `<div class="detail-total"><span>総合点</span><strong>${esc(result.total)}<small> / 40</small></strong></div>${attack(result.attackScore)}${typeof result.attackScore === "number" && result.attackScore >= 80 ? `<p class="note">攻撃評価は独立した指標で、40点満点の総合点には含まれません。</p>` : ""}${reviewRequired(item) ? `<p class="review-badge">根拠不足・要確認</p><p class="note">根拠が不足しているため、主催者による確認が必要です。この表示によって点数・順位は変わりません。</p>` : ""}${reasonsComplete ? `<h4>評価概要</h4><p>${esc(result.summary)}</p><h4>公開コメント</h4><p>${esc(result.publicReason)}</p>` : `<div class="explanation-stage" role="status"><h4>${esc(statusLabel(item))}</h4><p>${reasonText}。この採点結果は確定済みです。理由の生成で点数は変わりません。</p>${explanation === "failed" && item.failureMessage ? `<p>${esc(item.failureMessage)}</p>` : ""}</div>`}<p class="note">${esc(assessments[result.repoAssessment] || "リポジトリの評価結果")}</p><div class="criteria">${axes
             .map((axis) => {
               const criterion = result.criteria.find(
                 (value) => value.key === axis.key,
               );
-              return `<section><div class="criterion-head"><h5>${esc(axis.label)}</h5><strong>${criterion ? esc(criterion.score) : "--"}<small> / 10</small></strong></div><p>${esc(criterion?.reason || "評価理由はありません。")}</p><div class="evidence"><span>根拠ファイル</span>${
-                criterion?.evidencePaths.length
+              return `<section><div class="criterion-head"><h5>${esc(axis.label)}</h5><strong>${criterion ? esc(criterion.score) : "--"}<small> / 10</small></strong></div><p>${reasonsComplete ? esc(criterion?.reason || "評価理由はありません。") : reasonText}</p><div class="evidence"><span>根拠ファイル</span>${
+                !reasonsComplete ? "<p>理由と根拠は生成後に表示します</p>" : criterion?.evidencePaths.length
                   ? `<ul>${criterion.evidencePaths
                       .map((path) => {
                         const url = source(
@@ -729,8 +758,241 @@ function detail(
           ? `<div class="pending" role="status"><h4>主催者確認</h4><p>${item.status === "queued" ? "クラウド実行待ちのまま30分以上経過しています。原因はまだ確定していません。自動で再審査しません。" : "クラウド審査中のまま30分以上経過しています。原因はまだ確定していません。自動で再審査しません。"}</p></div>`
           : `<div class="pending"><h4>${item.status === "failed" ? "審査できませんでした" : item.status === "processing" ? "クラウド審査中です" : "クラウド実行待ちです"}</h4><p>${esc(item.failureMessage || (item.status === "queued" ? "クラウド審査キューに登録済みです。タブを閉じてもサーバー上の実行は継続します。" : "結果が届くまでお待ちください。"))}</p></div>`
     }`;
+  renderMetadataEditor(item, existingEditor);
+  if (editorFocus?.isConnected) editorFocus.focus({ preventScroll: true });
+  const metadata = item as Submission & { submittedAt?: string; pinnedSha?: string | null; frozenAt?: string | null };
+  const extra = document.createElement("dl");
+  extra.className = "metadata";
+  const stages = document.createElement("dl");
+  stages.className = "metadata";
+  stages.innerHTML = `<div><dt>採点確定日時</dt><dd>${date(item.scoredAt ?? null)}</dd></div><div><dt>採点モデル</dt><dd>${esc(result?.usage?.decisionsModel || result?.usage?.model || "gpt-6-luna")}</dd></div><div><dt>理由生成</dt><dd>${explanation ? esc(statusLabel(item)) : "採点後に開始"}（GPT-6.1 Sol）</dd></div>`;
+  el<HTMLElement>("detail").append(stages);
+  extra.innerHTML = `${metadata.submittedAt ? `<div><dt>提出日時</dt><dd>${esc(formatTimestampJst(metadata.submittedAt))}</dd></div>` : ""}${metadata.frozenAt ? `<div><dt>ソース版固定日時</dt><dd>${esc(formatTimestampJst(metadata.frozenAt))}</dd></div>` : ""}${metadata.pinnedSha && /^[a-fA-F0-9]{40}$/.test(metadata.pinnedSha) ? `<div><dt>固定済みSHA</dt><dd class="sha">${esc(metadata.pinnedSha)}</dd></div>` : ""}`;
+  el<HTMLElement>("detail").append(extra);
   renderRetryControls(item);
 }
+
+function demoLink(value?: string | null, missing = "デモ未設定"): string {
+  const url = normalizeDemoUrl(value || "");
+  return url ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">デモを見る</a>` : `<span class="demo-missing">${esc(missing)}</span>`;
+}
+
+function renderMetadataEditor(item: Submission, previous: HTMLElement | null): void {
+  const host = el<HTMLElement>("metadata-editor-host");
+  const draft = metadataDrafts.get(item.id);
+  if (draft && previous?.dataset.recordId === item.id && previous.querySelector("form")) {
+    host.append(previous);
+    updateMetadataEditor(previous, draft);
+    return;
+  }
+  const section = document.createElement("section");
+  section.className = "metadata-editor";
+  section.dataset.recordId = item.id;
+  section.innerHTML = draft ? `<form novalidate><label>チーム名<textarea name="teamName" maxlength="100" rows="2" required>${esc(draft.teamName)}</textarea></label><label>デモURL<input name="demoUrl" maxlength="2048" value="${esc(draft.demoUrl)}" inputmode="url"></label><p class="note">表示情報だけを変更します。再審査やAPI費用は発生しません。</p><p class="metadata-error" role="alert"></p><div class="metadata-actions"><button type="submit" class="subtle">表示情報を保存</button><button type="button" class="subtle" data-cancel>キャンセル</button></div></form>` : `<button type="button" class="subtle" data-edit>表示情報を編集</button><p role="status">${esc(metadataFeedback.get(item.id) || "")}</p>`;
+  host.append(section);
+  section.querySelector("[data-edit]")?.addEventListener("click", () => {
+    metadataDrafts.set(item.id, { teamName: item.teamName || "", demoUrl: item.demoUrl || "", saving: false, error: "" });
+    metadataFeedback.delete(item.id);
+    renderResults();
+  });
+  if (!draft) return;
+  updateMetadataEditor(section, draft);
+  section.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>("input, textarea").forEach((input) => input.addEventListener("input", () => {
+    if (input.name === "teamName") draft.teamName = input.value;
+    else draft.demoUrl = input.value;
+    draft.error = "";
+    updateMetadataEditor(section, draft);
+  }));
+  section.querySelector("[data-cancel]")?.addEventListener("click", () => {
+    if (draft.saving) return;
+    metadataDrafts.delete(item.id);
+    renderResults();
+  });
+  section.querySelector("form")!.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveMetadata(item.id, draft, section);
+  });
+}
+
+function updateMetadataEditor(section: HTMLElement, draft: MetadataDraft): void {
+  section.querySelectorAll<HTMLButtonElement | HTMLInputElement | HTMLTextAreaElement>("button, input, textarea").forEach((control) => { control.disabled = draft.saving; });
+  const alert = section.querySelector<HTMLElement>(".metadata-error");
+  if (alert) alert.textContent = draft.error;
+  const save = section.querySelector<HTMLButtonElement>("button[type='submit']");
+  if (save) save.textContent = draft.saving ? "保存中" : "表示情報を保存";
+}
+
+async function saveMetadata(id: string, draft: MetadataDraft, section: HTMLElement): Promise<void> {
+  if (draft.saving) return;
+  const teamName = draft.teamName.trim();
+  const demoUrl = normalizeDemoUrl(draft.demoUrl);
+  if (!teamName || teamName.length > 100) draft.error = "チーム名は100文字以内で入力してください。";
+  else if (!demoUrl && (draft.demoUrl.trim() || /[\u0000-\u001f\u007f-\u009f\\]/.test(draft.demoUrl))) draft.error = "デモURLは認証情報を含まないHTTP・HTTPSのURLを2048文字以内で入力してください。";
+  else draft.error = "";
+  if (draft.error) { updateMetadataEditor(section, draft); return; }
+  draft.saving = true;
+  updateMetadataEditor(section, draft);
+  try {
+    const response = await fetch(`/api/submissions/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teamName, demoUrl }) });
+    if (response.status !== 200) throw new Error("save failed");
+    const body: unknown = await response.json();
+    const saved = (body as { submission?: Partial<Submission> } | null)?.submission;
+    if (!saved || saved.id !== id || typeof saved.teamName !== "string" || !saved.teamName.trim() || saved.teamName !== saved.teamName.trim() || saved.teamName.length > 100 || (saved.demoUrl != null && (typeof saved.demoUrl !== "string" || normalizeDemoUrl(saved.demoUrl) !== saved.demoUrl))) throw new Error("invalid response");
+    const metadata = { teamName: saved.teamName, demoUrl: saved.demoUrl ?? null };
+    if (data) {
+      data.items = data.items.map((item) => item.id === id ? { ...item, ...metadata } : item);
+      data.ranking = data.ranking.map((entry) => entry.submissionId === id ? { ...entry, ...metadata } : entry);
+    }
+    metadataDrafts.delete(id);
+    metadataFeedback.set(id, "表示情報を保存しました。");
+    renderResults();
+  } catch {
+    draft.error = "保存できませんでした。入力を保持しています。もう一度保存してください。";
+  } finally {
+    draft.saving = false;
+    updateMetadataEditor(section, draft);
+    const currentEditor = el<HTMLElement>("detail").querySelector<HTMLElement>(".metadata-editor");
+    if (currentEditor?.dataset.recordId === id) updateMetadataEditor(currentEditor, draft);
+  }
+}
+let presentationOpen = false;
+
+function openPresentation(snapshot: PresentationSnapshot, opener: HTMLElement): void {
+  if (presentationOpen) return;
+  presentationOpen = true;
+  const dialog = document.createElement("section");
+  dialog.className = `presentation-overlay${snapshot.mode === "demo" ? " presentation-demo" : ""}`;
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  dialog.setAttribute("aria-labelledby", "presentation-title");
+  dialog.tabIndex = -1;
+  const previousOverflow = document.body.style.overflow;
+  const background = Array.from(document.body.children).filter((node): node is HTMLElement => node instanceof HTMLElement).map((node) => ({ node, inert: node.inert }));
+  background.forEach(({ node }) => { node.inert = true; });
+  document.body.style.overflow = "hidden";
+  document.body.append(dialog);
+  let pending: number | null = null;
+  let lastAdvanceAt = -Infinity;
+  let state: RevealState = { revealed: 0, busy: false };
+  let selection = selectPresentation(snapshot);
+  let started = false;
+  const chosen = new Set<string>();
+  const badge = snapshot.mode === "demo" ? "DEMO / 架空データ・演出プレビュー" : "REAL / 本番結果";
+  dialog.innerHTML = `<div class="presentation-inner"><header class="presentation-header"><div><p class="presentation-badge">${badge}</p><h2 id="presentation-title">次のステージへ。</h2></div><button type="button" id="stage-close">閉じる <span aria-hidden="true">×</span></button></header><p class="presentation-local">開始時の結果で固定します。</p><div id="stage-setup" class="presentation-setup"><p class="presentation-eyebrow">BEFORE THE SPOTLIGHT</p><h3>10チームの発表を準備</h3><p>低い点数から順に、1チームずつ発表します。同点は実際の同率順位で表示します。</p>${snapshot.warnings.map((warning) => `<p class="presentation-warning">${esc(warning)}</p>`).join("")}${snapshot.candidates.length ? `<fieldset class="presentation-candidates"><legend>通過ライン ${esc(snapshot.cutoff)}点: ${snapshot.remaining}チームを選択</legend><p>上位${snapshot.automatic.length}チームは確定枠です。選択はこの発表にだけ反映され、審査点数と同率順位は変わりません。同点候補は自動選択しません。</p>${snapshot.candidates.map((entry, index) => `<label><input type="checkbox" value="${index}"><span><strong>${esc(entry.teamName)}</strong><span>${esc(entry.repo)}</span><span>${rankLabel(entry)} · ${esc(entry.total)} / 40点${entry.reviewRequired ? " · 主催者確認" : ""}</span></span></label>`).join("")}</fieldset>` : ""}<p id="stage-selection" role="status"></p><button type="button" id="stage-start">発表画面へ</button></div><div id="stage-show" hidden><div id="stage-card" class="presentation-card"></div><div class="presentation-controls"><button type="button" id="stage-back">戻る</button><button type="button" id="stage-next" class="presentation-next">一つ発表</button><button type="button" id="stage-restart">最初から</button><span id="stage-progress"></span></div><p class="presentation-keyboard">Space / → 次へ · ← 戻る · Escape 閉じる</p></div><ol id="stage-slots" class="presentation-slots" aria-label="発表済みチームと未発表の枠"></ol><p id="stage-live" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p></div>`;
+  const get = <T extends HTMLElement>(id: string) => dialog.querySelector<T>(`#${id}`)!;
+  get("presentation-title").textContent = "トップ10 発表ステージ";
+  const cancel = () => {
+    if (pending !== null) window.clearTimeout(pending);
+    pending = null;
+  };
+  const updateSelection = () => {
+    selection = selectPresentation(snapshot, [...chosen]);
+    get("stage-selection").textContent = selection.message;
+    get<HTMLButtonElement>("stage-start").disabled = !selection.valid;
+  };
+  const renderStage = () => {
+    const entry = state.revealed ? selection.order[state.revealed - 1] : null;
+    const card = get("stage-card");
+    card.className = `presentation-card${state.busy ? " is-anticipating" : ""}${!state.busy && entry?.rank === 1 ? " is-winner" : ""}`;
+    card.innerHTML = state.busy ? `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>NEXT SPOTLIGHT</p><h3>次のアイデアに、光を。</h3><p>まもなく発表</p></div>` : entry ? `<div class="presentation-reveal"><p class="presentation-rank">${rankLabel(entry)}</p><h3 class="presentation-team">${esc(entry.teamName)}</h3><p class="presentation-demo-link">${demoLink(entry.demoUrl, snapshot.mode === "demo" ? "デモ未設定（架空データ）" : "デモ未設定")}</p><p class="presentation-score">${esc(entry.total)}<span> / 40</span></p><dl class="presentation-axes">${axes.map((axis) => `<div><dt>${esc(axis.label)}</dt><dd>${esc(entry.criteria.find((criterion) => criterion.key === axis.key)?.score ?? "--")}<small> / 10</small></dd></div>`).join("")}</dl>${entry.rank === 1 ? `<div class="presentation-celebration" aria-hidden="true">${Array.from({ length: 12 }, (_, index) => `<i style="--ray:${index}"></i>`).join("")}</div>` : ""}</div><figure class="presentation-mascot"><img src="/images/nukoevi-original.jpg" width="886" height="886" alt="発表を見守るぬこエビ"><figcaption>YOUR NEXT STAGE</figcaption></figure>` : `<div class="presentation-covered"><span class="presentation-spark" aria-hidden="true"></span><p>10 IDEAS / ONE NEXT STAGE</p><h3>そのアイデアに、<br>スポットライトを。</h3><p>チーム名と点数は発表までお楽しみに。</p></div>`;
+    get("stage-slots").innerHTML = Array.from({ length: 10 }, (_, index) => {
+      const revealed = index < state.revealed ? selection.order[index] : null;
+      return revealed ? `<li class="is-revealed"><span>${rankLabel(revealed)}</span><strong>${esc(revealed.teamName)}</strong><span>${esc(revealed.total)} / 40</span></li>` : `<li><span>発表枠 ${index + 1}</span><strong>未発表</strong><span aria-hidden="true">•••</span></li>`;
+    }).join("");
+    get<HTMLButtonElement>("stage-next").disabled = state.busy || state.revealed === 10;
+    get("stage-next").textContent = state.revealed === 10 ? "完了" : state.busy ? "発表中…" : state.revealed === 0 ? "一つ発表" : "次を発表";
+    get<HTMLButtonElement>("stage-back").disabled = state.busy || state.revealed === 0;
+    get("stage-progress").textContent = `${state.revealed} / 10 発表済み`;
+  };
+  const advance = (event: { detail?: number; repeat?: boolean }) => {
+    if (!started || !acceptsAdvance(state, { detail: event.detail ?? 0, repeat: event.repeat ?? false, elapsedMs: Date.now() - lastAdvanceAt })) return;
+    lastAdvanceAt = Date.now();
+    state = revealState(state, "begin");
+    renderStage();
+    dialog.focus({ preventScroll: true });
+    let reduced = false;
+    try { reduced = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false; } catch { reduced = false; }
+    pending = window.setTimeout(() => {
+      pending = null;
+      state = revealState(state, "complete");
+      renderStage();
+      const entry = selection.order[state.revealed - 1]!;
+      get("stage-live").textContent = `${snapshot.mode === "demo" ? "架空データ。" : ""}${rankLabel(entry)}、${entry.teamName}、${entry.total}点、40点満点。`;
+    }, reduced ? 60 : 650);
+  };
+  const back = () => {
+    if (!started || state.busy) return;
+    lastAdvanceAt = -Infinity;
+    state = revealState(state, "back");
+    get("stage-live").textContent = "";
+    renderStage();
+    dialog.focus({ preventScroll: true });
+  };
+  const close = () => {
+    cancel();
+    document.removeEventListener("focusin", containFocus);
+    dialog.remove();
+    background.forEach(({ node, inert }) => { node.inert = inert; });
+    document.body.style.overflow = previousOverflow;
+    presentationOpen = false;
+    if (opener.isConnected) opener.focus({ preventScroll: true });
+  };
+  const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), a[href], [tabindex='0']")).filter((node) => !node.closest("[hidden]") && node.tabIndex >= 0);
+  const containFocus = (event: FocusEvent) => {
+    if (!dialog.contains(event.target as Node)) (focusable()[0] ?? dialog).focus({ preventScroll: true });
+  };
+  document.addEventListener("focusin", containFocus);
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); close(); return; }
+    if (event.key === "Tab") {
+      const nodes = focusable();
+      const first = nodes[0] ?? dialog;
+      const last = nodes[nodes.length - 1] ?? dialog;
+      if (event.shiftKey && (document.activeElement === first || document.activeElement === dialog)) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialog)) { event.preventDefault(); first.focus(); }
+      return;
+    }
+    const target = event.target as HTMLElement;
+    if (target.closest("input, select, textarea, a, [contenteditable]")) return;
+    if (event.repeat) { if ([" ", "Enter", "ArrowRight", "ArrowLeft"].includes(event.key)) event.preventDefault(); return; }
+    if (event.key === " " && target.closest("button")) return;
+    if ([" ", "ArrowRight", "ArrowLeft"].includes(event.key)) {
+      event.preventDefault();
+      if (event.key === "ArrowLeft") back(); else advance(event);
+    }
+  });
+  get("stage-close").addEventListener("click", close);
+  get("stage-start").addEventListener("click", () => {
+    if (!selection.valid || started) return;
+    started = true;
+    dialog.classList.add("is-presenting");
+    dialog.querySelector(".presentation-local")?.remove();
+    get("stage-setup").remove();
+    get("stage-show").hidden = false;
+    renderStage();
+    dialog.focus({ preventScroll: true });
+  });
+  dialog.querySelectorAll<HTMLInputElement>(".presentation-candidates input").forEach((input) => input.addEventListener("change", () => {
+    const entry = snapshot.candidates[Number(input.value)];
+    if (!entry) return;
+    if (input.checked) chosen.add(entry.id); else chosen.delete(entry.id);
+    updateSelection();
+  }));
+  get("stage-next").addEventListener("click", advance);
+  get("stage-back").addEventListener("click", back);
+  get("stage-restart").addEventListener("click", () => {
+    cancel();
+    lastAdvanceAt = -Infinity;
+    state = revealState(state, "restart");
+    get("stage-live").textContent = "";
+    renderStage();
+    dialog.focus({ preventScroll: true });
+  });
+  updateSelection();
+  renderStage();
+  get("stage-close").focus({ preventScroll: true });
+}
+
 function retryAttempts(item: Submission): number {
   return "attempts" in item && typeof item.attempts === "number"
     ? item.attempts
@@ -754,64 +1016,62 @@ function canRetry(item: Submission): boolean {
   );
 }
 function recordedEffort(item: Submission): Effort | null {
-  return "effort" in item && (item.effort === "low" || item.effort === "high")
+  return "effort" in item && (item.effort === "low" || item.effort === "medium" || item.effort === "high")
     ? item.effort
     : item.result?.usage?.effort || null;
 }
-function isCompletedLowValidation(item: Submission): boolean {
-  return item.mode === "validation" && item.status === "completed" && recordedEffort(item) === "low";
+function unfrozenBatch(item: Submission): Batch | undefined {
+  return data?.batches?.find((batch) => batch.id === (item as Submission & { batchId?: string }).batchId && !batch.frozenAt);
 }
-function canHighRecheck(item: Submission): boolean {
-  return isCompletedLowValidation(item) && retryAttempts(item) < 3 && retryDispatches(item) < 3;
+function retryAllowed(item: Submission): boolean {
+  if (unfrozenBatch(item) || (item.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO))) return false;
+  return item.result ? (explanationState(item) === "failed" || explanationStale(item)) && (item.explanationDispatches ?? 0) > 0 && (item.explanationDispatches ?? 0) < 3 : canRetry(item);
 }
 function renderRetryControls(item: Submission): void {
-  if (!token) return;
-  const highRecheck = isCompletedLowValidation(item);
-  const eligible = canRetry(item) || canHighRecheck(item);
-  const limitMessage = retryLimitMessage(item);
+  if (item.result && (item.explanationDispatches ?? 0) === 0) return;
+  const reasonRetry = !!item.result;
+  const failed = reasonRetry ? explanationState(item) === "failed" || explanationStale(item) : item.status === "failed" || needsOrganizerReview(item);
   const feedback = retryFeedback?.id === item.id ? retryFeedback : null;
-  if (
-    !eligible &&
-    !feedback &&
-    item.status !== "failed" &&
-    !needsOrganizerReview(item) &&
-    !highRecheck
-  )
-    return;
+  if (!failed && !feedback) return;
   const section = document.createElement("section");
   section.className = "retry-controls";
-  section.innerHTML = `<h4>${highRecheck ? "highでの再検証" : "主催者による再審査"}</h4>${feedback ? `<p role="${feedback.failed ? "alert" : "status"}">${esc(feedback.message)}</p>` : ""}${eligible ? (retryReviewId === item.id ? `<p>${retryRequestedEffort === "high" ? "推論強度をlowからhighへ上げて、同じリポジトリを再検証します。" : "新しいクラウド審査をキューへ追加します。"}未確定の費用予約は保持され、追加のAPI費用が発生します。</p><div class="retry-actions"><button id="retry-confirm" type="button" class="dark"${posting ? " disabled" : ""}>${posting ? "登録中です" : retryRequestedEffort === "high" ? "費用を確認してhighで再検証" : "費用を確認して再審査"}</button><button id="retry-cancel" type="button" class="subtle"${posting ? " disabled" : ""}>キャンセル</button></div>` : `<p>審査実行 ${retryAttempts(item)} / 3回、登録・再送 ${retryDispatches(item)} / 3回。各最大3回です。</p><button id="retry-prepare" type="button" class="dark"${posting ? " disabled" : ""}>${highRecheck ? "highで再検証を準備" : "再審査を準備"}</button>`) : limitMessage && (item.status === "failed" || needsOrganizerReview(item) || highRecheck) ? `<p>${esc(limitMessage)}</p>` : ""}`;
+  const beforeStart = item.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO);
+  const frozen = unfrozenBatch(item);
+  const eligible = retryAllowed(item);
+  const disabled = posting || beforeStart;
+  const limit = reasonRetry ? (item.explanationDispatches ?? 0) >= 3 ? "理由生成の登録・再送の上限（3回）に達しています。" : "" : retryLimitMessage(item);
+  section.innerHTML = `<h4>${reasonRetry ? "評価理由を再生成" : "主催者による再審査"}</h4>${feedback ? `<p role="${feedback.failed ? "alert" : "status"}">${esc(feedback.message)}</p>` : ""}${frozen ? "<p>この提出は一括審査のコミット固定待ちです。進行状況からコミット固定を再試行してください。</p>" : beforeStart ? "<p>本番審査は10/18 17:30 日本時間から再試行できます。</p>" : eligible ? retryReviewId === item.id ? `${reasonRetry && item.mode === "validation" ? `<label class="field"><span>理由生成の推論強度</span><select id="retry-effort"${posting ? " disabled" : ""}><option value=""${retryRequestedEffort === null ? " selected" : ""}>記録済みの強度を維持</option><option value="medium"${retryRequestedEffort === "medium" ? " selected" : ""}>medium</option><option value="high"${retryRequestedEffort === "high" ? " selected" : ""}>high</option></select></label>` : ""}<p>${reasonRetry ? "点数・順位は変えず、理由だけを生成します。追加API費用が発生します" : "記録済みの理由生成の推論強度で、新しいクラウド審査をキューへ追加します。未確定の費用予約は保持され、追加のAPI費用が発生します。"}${reasonRetry && item.mode === "production" ? "。理由生成の推論強度は medium 固定です。" : ""}</p><div class="retry-actions"><button id="retry-confirm" type="button" class="dark"${disabled ? " disabled" : ""}>${posting ? "登録中です" : reasonRetry ? "費用を確認して評価理由を再生成" : "費用を確認して再審査"}</button><button id="retry-cancel" type="button" class="subtle"${posting ? " disabled" : ""}>キャンセル</button></div>` : `<p>${reasonRetry ? `理由生成の登録・再送 ${item.explanationDispatches ?? 0} / 3回` : `審査実行 ${retryAttempts(item)} / 3回、登録・再送 ${retryDispatches(item)} / 3回`}</p><button id="retry-prepare" type="button" class="dark"${disabled ? " disabled" : ""}>${reasonRetry ? "評価理由を再生成" : "再審査を準備"}</button>` : `<p>${esc(limit)}</p>`}`;
   el<HTMLElement>("detail").append(section);
-  section
-    .querySelector<HTMLButtonElement>("#retry-prepare")
-    ?.addEventListener("click", () => {
-      if (posting || !token || !(canRetry(item) || canHighRecheck(item))) return;
-      retryReviewId = item.id;
-      retryRequestedEffort = canHighRecheck(item) ? "high" : null;
-      renderResults();
-      el<HTMLButtonElement>("retry-confirm").focus({ preventScroll: true });
-    });
-  section
-    .querySelector<HTMLButtonElement>("#retry-cancel")
-    ?.addEventListener("click", () => {
-      retryReviewId = null;
-      retryRequestedEffort = null;
-      renderResults();
-      el<HTMLButtonElement>("retry-prepare").focus({ preventScroll: true });
-    });
-  section
-    .querySelector<HTMLButtonElement>("#retry-confirm")
-    ?.addEventListener("click", () => void retrySubmission(item.id));
+  section.querySelector<HTMLButtonElement>("#retry-prepare")?.addEventListener("click", () => {
+    if (posting || !retryAllowed(item)) return;
+    retryReviewId = item.id;
+    retryRequestedEffort = null;
+    renderResults();
+  });
+  section.querySelector<HTMLSelectElement>("#retry-effort")?.addEventListener("change", (event) => {
+    if (posting) return;
+    const value = (event.currentTarget as HTMLSelectElement).value;
+    retryRequestedEffort = value === "high" ? "high" : value === "medium" ? "medium" : null;
+    renderResults();
+  });
+  section.querySelector<HTMLButtonElement>("#retry-cancel")?.addEventListener("click", () => {
+    retryReviewId = null;
+    retryRequestedEffort = null;
+    renderResults();
+  });
+  section.querySelector<HTMLButtonElement>("#retry-confirm")?.addEventListener("click", () => void retrySubmission(item.id));
+}
+function preservesScores(previous: Submission, next: Submission): boolean {
+  return !!previous.result && !!next.result && previous.result.total === next.result.total && previous.result.criteria.every((criterion) => next.result?.criteria.some((value) => value.key === criterion.key && value.score === criterion.score)) && previous.result.criteria.length === next.result.criteria.length;
 }
 async function retrySubmission(id: string): Promise<void> {
   const current = data?.items.find((item) => item.id === id);
-  const highRecheck = retryRequestedEffort === "high";
+  const effortRecheck = retryRequestedEffort;
   if (
-    !token ||
     posting ||
     retryReviewId !== id ||
     !current ||
-    !(highRecheck ? canHighRecheck(current) : canRetry(current))
+    !retryAllowed(current)
   )
     return;
   posting = true;
@@ -828,9 +1088,8 @@ async function retrySubmission(id: string): Promise<void> {
         method: "POST",
         headers: {
           "content-type": "application/json",
-          Authorization: `Bearer ${token}`,
         },
-        body: JSON.stringify({ confirm: true, ...(highRecheck ? { effort: "high" } : {}) }),
+        body: JSON.stringify({ confirm: true, ...(current.result && current.mode === "production" ? { effort: "medium" } : effortRecheck ? { effort: effortRecheck } : {}) }),
         signal: controller.signal,
       },
     );
@@ -843,7 +1102,9 @@ async function retrySubmission(id: string): Promise<void> {
     if (
       !body.submission ||
       body.submission.id !== id ||
-      body.submission.status !== "queued"
+      (current.result
+        ? !preservesScores(current, body.submission) || !["pending", "processing"].includes(explanationState(body.submission) || "")
+        : body.submission.status !== "queued")
     )
       throw new Error(
         "登録結果を確認できませんでした。手動更新で状態を確認してください。",
@@ -854,7 +1115,7 @@ async function retrySubmission(id: string): Promise<void> {
       );
     retryFeedback = {
       id,
-      message: "再審査をクラウド審査キューに追加しました。タブを閉じてもサーバー上の実行は継続します。",
+      message: current.result ? "評価理由の再生成を受け付けました。点数・順位は変わりません。" : "再審査をクラウド審査キューに追加しました。タブを閉じてもサーバー上の実行は継続します。",
       failed: false,
     };
     retryReviewId = null;
@@ -878,205 +1139,73 @@ async function retrySubmission(id: string): Promise<void> {
     void refresh();
   }
 }
-function draft(line: string): Draft {
-  const comma = line.indexOf(",");
-  const teamName = comma < 0 ? "" : line.slice(0, comma).trim();
-  const input = comma < 0 ? line.trim() : line.slice(comma + 1).trim();
-  const parsed = repo(input);
-  return !parsed || (comma >= 0 && !teamName)
-    ? {
-        line,
-        teamName,
-        repoUrl: input,
-        key: "",
-        state: "invalid",
-        message: "GitHub URL またはチーム名を確認してください。",
-      }
-    : {
-        line,
-        teamName,
-        repoUrl: parsed.url,
-        key: parsed.key,
-        state: "ready",
-        message: "追加可能",
-      };
-}
-function drafts(): Draft[] {
-  const lines = el<HTMLTextAreaElement>("batch")
-    .value.split(/\r?\n/)
-    .filter((line) => line.trim());
-  const seen = new Set<string>();
-  const existing = new Set(
-    (data?.items || [])
-      .filter((item) => item.mode === el<HTMLSelectElement>("mode").value)
-      .map((item) => repo(item.repoUrl)?.key),
-  );
-  return lines.map((line, index) => {
-    const item = draft(line);
-    if (index >= 30)
-      return {
-        ...item,
-        state: "invalid",
-        message: "一度に追加できるのは30行までです。",
-      };
-    if (
-      item.state === "ready" &&
-      (seen.has(item.key) || existing.has(item.key))
-    )
-      return {
-        ...item,
-        state: "duplicate",
-        message: "同じ区分に登録済み、または入力内で重複しています。",
-      };
-    if (item.state === "ready") seen.add(item.key);
-    return item;
-  });
-}
-function preview(): void {
-  const items = drafts();
+function parseInput(input = el<HTMLTextAreaElement>("batch").value): ImportResult {
   const selection = selectedSubmissionOptions();
-  el<HTMLElement>("preview").innerHTML = items.length
-    ? `<p>${items.filter((item) => item.state === "ready").length} 件追加可能 / ${items.filter((item) => item.state === "duplicate").length} 件重複 / ${items.filter((item) => item.state === "invalid").length} 件要確認 <span class="preview-effort">推論強度 ${esc(selection.effort)}</span></p><ol>${items.map((item) => `<li><span class="preview-${item.state}">${item.state === "ready" ? "追加可能" : item.state === "duplicate" ? "重複" : "要確認"}</span><span>${esc(item.line)}</span><small>${esc(item.message)}</small></li>`).join("")}</ol>`
-    : "";
-  el<HTMLButtonElement>("batch-submit").disabled =
-    !token ||
-    posting ||
-    data?.open === false ||
-    !items.some((item) => item.state === "ready");
-  el<HTMLElement>("batch-results").innerHTML = rowResults.length
-    ? `<ol>${rowResults.map((item) => `<li class="${item.state}">${esc(item.line)}: ${esc(item.message)}</li>`).join("")}</ol>`
-    : "";
+  const existingKeys = new Set((data?.items || []).filter((item) => item.mode === selection.mode).flatMap((item) => {
+    const parsed = normalizeRepository(item.repoUrl);
+    return parsed ? [parsed.key] : [];
+  }));
+  return restorePendingImport(input, selection, existingKeys, pendingBatch);
 }
-async function post(
-  repoUrl: string,
-  teamName: string,
-  selectedMode: Mode,
-  selectedEffort: Effort,
-): Promise<Submission> {
+function sanitizeInput(): void {
+  const parsed = parseInput();
+  el<HTMLTextAreaElement>("batch").value = parsed.sanitized;
+  importResult = parsed;
+  preview(false);
+}
+function preview(reparse = true): void {
+  if (reparse || !importResult) importResult = parseInput();
+  const parsed = importResult;
+  const selection = selectedSubmissionOptions();
+  const signature = JSON.stringify({ ...selection, items: parsed.items });
+  const acknowledged = pendingBatch?.acknowledged && pendingBatch.sourceSignature === importSourceSignature(el<HTMLTextAreaElement>("batch").value, selection);
+  const beforeStart = selection.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO);
+  const reasons: Record<string, string> = { ready: "対象", duplicate: "重複", late: "締切後", missing_timestamp: "提出日時なし", invalid_timestamp: "提出日時が不正", invalid_url: "リポジトリURLが不正", invalid_demo: "デモURLが不正・対象外", over_limit: "31件目以降は対象外", invalid_team: "チーム名を確認", missing_headers: "見出しが不足・重複" };
+  el<HTMLElement>("preview").innerHTML = `<h3>2. 対象を確認</h3><p>対象 ${parsed.items.length} 件 / 除外 ${parsed.rows.length - parsed.items.length} 件 · 理由生成の推論強度 ${esc(selection.effort)}</p>${parsed.error ? `<p role="alert">${esc(parsed.error)}</p>` : ""}<ol>${parsed.rows.map((row) => `<li><span class="preview-${row.reason === "ready" ? "ready" : "invalid"}">${esc(reasons[row.reason])}</span><span>${esc(row.teamName || "名称未入力")}<br>${esc(row.repoUrl)}<br>${row.reason === "invalid_demo" ? "デモURLを修正してください（対象外）" : demoLink(row.demoUrl)}</span><small>${row.submittedAt ? esc(formatTimestampJst(row.submittedAt)) : row.timestamp ? "提出日時を修正してください" : "提出日時なし"}</small></li>`).join("")}</ol><p>${acknowledged ? "この内容は受付済みです。進行状況を確認してください。" : beforeStart ? "本番審査は10/18 17:30 日本時間から開始できます。" : parsed.items.length ? "対象の回答だけを送信します。除外理由を確認して開始してください。" : "入力と除外理由を確認してください。"}</p>`;
+  el<HTMLButtonElement>("batch-submit").disabled = posting || data?.open === false || !!parsed.error || !parsed.items.length || beforeStart || !!acknowledged;
+  el<HTMLElement>("batch-results").textContent = batchMessage;
+  if (startTimer !== null) clearTimeout(startTimer);
+  startTimer = beforeStart ? window.setTimeout(() => preview(), Math.min(2147483647, Math.max(1, Date.parse(JUDGING_START_ISO) - Date.now()))) : null;
+}
+async function submitBatch(): Promise<void> {
+  if (posting || data?.open === false) return;
+  sanitizeInput();
+  const selection = selectedSubmissionOptions();
+  const items = importResult!.items.map((item) => ({ ...item }));
+  if (importResult!.error || !items.length || (selection.mode === "production" && Date.now() < Date.parse(JUDGING_START_ISO))) return;
+  const signature = JSON.stringify({ ...selection, items });
+  const sourceSignature = importSourceSignature(el<HTMLTextAreaElement>("batch").value, selection);
+  if (pendingBatch?.sourceSignature === sourceSignature && pendingBatch.acknowledged) return;
+  if (!pendingBatch || pendingBatch.sourceSignature !== sourceSignature)
+    pendingBatch = { signature, sourceSignature, payload: JSON.stringify({ id: crypto.randomUUID(), ...selection, items }), acknowledged: false };
+  const request = pendingBatch;
+  posting = true;
+  batchMessage = "一括審査を登録中です。";
+  organizer(); preview(false); renderResults();
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), 20000);
   try {
-    const response = await fetch("/api/submissions", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        repoUrl,
-        teamName: teamName || undefined,
-        mode: selectedMode,
-        effort: selectedEffort,
-      }),
-      signal: controller.signal,
-    });
-    const body: unknown = await response.json().catch(() => ({}));
-    if (!response.ok)
-      throw new Error(
-        body && typeof body === "object" && "message" in body
-          ? String(body.message)
-          : `HTTP ${response.status}`,
-      );
-    if (!body || typeof body !== "object" || !("submission" in body))
-      throw new Error("登録結果を確認できませんでした。");
-    return (body as { submission: Submission }).submission;
+    const response = await fetch("/api/batches", { method: "POST", headers: { "content-type": "application/json" }, body: request.payload, signal: controller.signal });
+    if (response.status !== 202) {
+      batchMessage = response.status === 409 ? "受付内容が競合しています。手動更新で確認してください。" : `受付に失敗しました（HTTP ${response.status}）。再試行は同じ受付IDを使用します。`;
+      return;
+    }
+    const body = await response.json() as { batch: Batch; submissions: Submission[] };
+    if (!body.batch || body.batch.id !== JSON.parse(request.payload).id || !Array.isArray(body.submissions)) throw new Error("invalid response");
+    request.acknowledged = true;
+    batchMessage = `一括審査を受け付けました。受付ID: ${body.batch.id}。ソース版の固定と審査状況を確認できます。`;
+    if (data) {
+      data.items = [...data.items.filter((item) => !body.submissions.some((incoming) => incoming.id === item.id)), ...body.submissions];
+      data.batches = [...(data.batches || []).filter((batch) => batch.id !== body.batch.id), body.batch];
+    }
+    render(); schedule();
+  } catch {
+    batchMessage = "受付結果を確認できませんでした。再試行は同じ受付IDと内容を使うため、別の一括審査は作成しません。";
   } finally {
     clearTimeout(timeout);
-  }
-}
-function addLocal(item: Submission): void {
-  if (data && !data.items.some((value) => value.id === item.id))
-    data.items = [...data.items, item];
-  render();
-  schedule();
-}
-async function submitSingle(event: Event): Promise<void> {
-  event.preventDefault();
-  if (!token || posting || data?.open === false) return;
-  const selection = selectedSubmissionOptions();
-  const input = el<HTMLInputElement>("repo"),
-    team = el<HTMLInputElement>("team").value.trim(),
-    parsed = repo(input.value),
-    output = el<HTMLElement>("single-result");
-  if (!parsed) {
-    output.textContent = "GitHub のリポジトリ URL を確認してください。";
-    return;
-  }
-  if (
-    data?.items.some(
-      (item) =>
-        item.mode === selection.mode &&
-        repo(item.repoUrl)?.key === parsed.key,
-    )
-  ) {
-    output.textContent = "同じ区分に登録済みです。";
-    return;
-  }
-  posting = true;
-  organizer();
-  preview();
-  output.textContent = "登録中です。";
-  try {
-    const item = await post(parsed.url, team, selection.mode, selection.effort);
-    addLocal(item);
-    input.value = "";
-    el<HTMLInputElement>("team").value = "";
-    output.textContent =
-      "審査キューに追加しました。審査完了は結果一覧で確認できます。";
-    void refresh();
-  } catch (error) {
-    output.textContent =
-      error instanceof Error ? error.message : "登録に失敗しました。";
-  } finally {
     posting = false;
-    organizer();
-    preview();
+    organizer(); preview(false); renderResults(); schedule();
   }
-}
-async function submitBatch(): Promise<void> {
-  if (!token || posting || data?.open === false) return;
-  const initial = drafts();
-  const pending = initial.filter((item) => item.state === "ready");
-  if (!pending.length) return;
-  const selection = selectedSubmissionOptions();
-  posting = true;
-  rowResults = [];
-  organizer();
-  preview();
-  const retained = initial
-    .filter((item) => item.state === "invalid")
-    .map((item) => item.line);
-  for (const item of pending) {
-    try {
-      addLocal(
-        await post(
-          item.repoUrl,
-          item.teamName,
-          selection.mode,
-          selection.effort,
-        ),
-      );
-      rowResults.push({
-        line: item.line,
-        state: "success",
-        message: "キューに追加しました。",
-      });
-    } catch (error) {
-      retained.push(item.line);
-      rowResults.push({
-        line: item.line,
-        state: "failed",
-        message:
-          error instanceof Error ? error.message : "登録に失敗しました。",
-      });
-    }
-    preview();
-  }
-  el<HTMLTextAreaElement>("batch").value = retained.join("\n");
-  posting = false;
-  organizer();
-  preview();
-  void refresh();
 }
 function csvCell(value: unknown): string {
   const text = String(value ?? "");
@@ -1086,9 +1215,14 @@ function exportData(format: "csv" | "json"): void {
   const rows = entries().map(({ item, position }) => ({
     rank: position ?? "",
     teamName: item.teamName,
+    demoUrl: normalizeDemoUrl(item.demoUrl || "") || "",
     repo: item.repo.normalized,
     repoUrl: repo(item.repoUrl)?.url || "",
-    status: status(item.status),
+    status: statusLabel(item),
+    explanationStatus: explanationState(item) ?? "",
+    scoredAt: item.scoredAt ?? "",
+    reviewRequired: reviewRequired(item),
+    explanationModel: (item.result?.usage as { explanationModel?: string } | undefined)?.explanationModel ?? "",
     total: item.result?.total ?? "",
     technical:
       item.result?.criteria.find((value) => value.key === "technical")?.score ??
@@ -1104,8 +1238,8 @@ function exportData(format: "csv" | "json"): void {
       item.result.attackScore >= 80
         ? item.result.attackScore
         : "",
-    summary: item.result?.summary ?? "",
-    publicReason: item.result?.publicReason ?? "",
+    summary: explanationState(item) === "completed" ? item.result?.summary ?? "" : "",
+    publicReason: explanationState(item) === "completed" ? item.result?.publicReason ?? "" : "",
     pinnedSha: item.result?.pinnedSha ?? "",
     failureMessage: item.failureMessage ?? "",
   }));

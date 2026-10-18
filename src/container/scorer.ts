@@ -1,16 +1,16 @@
 import { CRITERIA, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_FILES, MAX_EVIDENCE_TOTAL_BYTES } from "../shared/constants";
 import { visibleAttackScore, validateAttackProbability } from "../shared/attack-score";
-import { buildDecisionsQuestions, buildScoringPrompt, DECISION_SCORE_LEVELS } from "../shared/prompt";
+import { buildDecisionsQuestions, buildExplanationPrompt, DECISION_SCORE_LEVELS } from "../shared/prompt";
 import { DEVDAY_REFERENCE_VERSION } from "../shared/devday-reference";
 import { RUBRIC_VERSION } from "../shared/rubric";
-import { scoringModelResultSchema, scoringOutputSchema, validatePublicScoreResult } from "../shared/validation";
+import { explanationModelResultSchema, explanationOutputSchema, validatePublicScoreResult } from "../shared/validation";
 import type { ApiReservation, ApiUsage, CriterionKey, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot } from "../shared/types";
 import { fetchRepoEvidence, resolveRepoEvidence, RetryableGithubError, zeroResultForAssessment } from "./github";
 
 export type { ApiReservation, ApiUsage } from "../shared/types";
 
 export interface ScoringOptions {
-  effort?: "low" | "high";
+  effort?: "low" | "medium" | "high";
   apiKey?: string;
   trustedFeatureReference?: string;
   fetch?: typeof globalThis.fetch;
@@ -25,35 +25,46 @@ const RESPONSES_MODEL = "gpt-6.1-sol";
 const TIMEOUT_MS = 180_000;
 const MAX_INPUT_TOKENS = 272_000;
 
-export async function scoreSubmission(job: LeaseJob, options: ScoringOptions = {}): Promise<PublicScoreResult> {
+export async function scoreSubmissionDecisions(job: LeaseJob, options: ScoringOptions = {}): Promise<{ result: PublicScoreResult; snapshot: RepoEvidenceSnapshot }> {
   let snapshot: RepoEvidenceSnapshot;
   try {
-    snapshot = job.pinnedSha && job.defaultBranch
-      ? await fetchRepoEvidence(job.repo, job.pinnedSha, job.defaultBranch, job.summary)
-      : await resolveRepoEvidence(job.repo, job.summary);
+    const frozen = job.frozenResolution;
+    if (frozen?.assessment === "scored") {
+      if (!frozen.pinnedSha || !frozen.defaultBranch) throw new Error("Frozen repository authority is incomplete");
+      snapshot = await fetchRepoEvidence(job.repo, frozen.pinnedSha, frozen.defaultBranch, frozen.summary);
+    } else if (frozen) {
+      if (!["missing_or_private", "empty_repository", "no_default_branch"].includes(frozen.assessment)
+        || frozen.pinnedSha !== null || frozen.defaultBranch !== null) throw new Error("Invalid frozen repository assessment");
+      snapshot = {
+        repo: job.repo,
+        pinnedSha: null,
+        defaultBranch: null,
+        summary: frozen.summary,
+        assessment: frozen.assessment as "missing_or_private" | "empty_repository" | "no_default_branch",
+        files: []
+      };
+    } else {
+      snapshot = job.pinnedSha && job.defaultBranch
+        ? await fetchRepoEvidence(job.repo, job.pinnedSha, job.defaultBranch, job.summary)
+        : await resolveRepoEvidence(job.repo, job.summary);
+    }
   } catch (error) {
     if (error instanceof RetryableGithubError) {
       throw new RetryableScoringError(error.message);
     }
     throw error;
   }
-  return evaluateSnapshot(snapshot, { ...options, effort: options.effort ?? (job.mode === "validation" ? "low" : "high") });
+  const result = await scoreSnapshotWithDecisions(snapshot, { ...options, effort: options.effort ?? (job.mode === "validation" ? job.effort ?? "low" : "medium") });
+  return { result, snapshot };
 }
 
-export async function evaluateSnapshot(snapshot: RepoEvidenceSnapshot, options: ScoringOptions = {}): Promise<PublicScoreResult> {
+export async function scoreSnapshotWithDecisions(snapshot: RepoEvidenceSnapshot, options: ScoringOptions = {}): Promise<PublicScoreResult> {
   assertSnapshotAuthority(snapshot);
   if (snapshot.assessment !== "scored") {
     return validatePublicScoreResult(zeroResultForAssessment(snapshot));
   }
 
-  const key = options.apiKey;
-  if (!key) {
-    throw new Error("Hackathon OpenAI API key is required");
-  }
-  const effort = options.effort ?? "high";
-  if (effort !== "low" && effort !== "high") {
-    throw new Error("Invalid scoring effort");
-  }
+  const { key, effort } = scoringSettings(options);
   const fetcher = options.fetch ?? globalThis.fetch;
   const questions = buildDecisionsQuestions(options.trustedFeatureReference);
   const decisionsBody = {
@@ -63,8 +74,63 @@ export async function evaluateSnapshot(snapshot: RepoEvidenceSnapshot, options: 
   };
   const decisionsCall = await callApi("decisions", decisionsBody, 0, key, fetcher, options);
   const signals = parseDecisions(decisionsCall.body);
-  const prompt = buildScoringPrompt(options.trustedFeatureReference);
-  const outputCap = effort === "low" ? 6000 : 12000;
+  return validatePublicScoreResult({
+    summary: "採点が完了しました。採点理由を生成中です。",
+    publicReason: "Decisionsによる点数が確定しました。採点理由を生成中です。",
+    repoAssessment: "scored",
+    pinnedSha: snapshot.pinnedSha,
+    criteria: CRITERIA.map((item) => ({
+      key: item.key,
+      label: item.label,
+      score: signals.scores[item.key],
+      reason: "採点理由を生成中です",
+      evidencePaths: []
+    })),
+    total: CRITERIA.reduce((sum, item) => sum + signals.scores[item.key], 0),
+    attackProbability: signals.attackProbability,
+    attackScore: visibleAttackScore(signals.attackProbability),
+    usage: {
+      model: DECISIONS_MODEL,
+      effort,
+      decisionsModel: DECISIONS_MODEL,
+      referenceVersion: options.trustedFeatureReference === undefined ? DEVDAY_REFERENCE_VERSION : "organizer-override",
+      rubricVersion: RUBRIC_VERSION,
+      inputTokens: decisionsCall.usage.inputTokens,
+      outputTokens: decisionsCall.usage.outputTokens,
+      costUsd: decisionsCall.usage.costUsd,
+      decisionsScores: signals.scores,
+      requestIds: decisionsCall.usage.requestId ? [decisionsCall.usage.requestId] : []
+    }
+  });
+}
+
+export async function explainScoredSnapshot(
+  snapshot: RepoEvidenceSnapshot,
+  fixedResult: PublicScoreResult,
+  options: ScoringOptions = {}
+): Promise<PublicScoreResult> {
+  assertSnapshotAuthority(snapshot);
+  const fixed = validatePublicScoreResult(fixedResult, new Set(snapshot.files.map((file) => file.path)));
+  if (fixed.repoAssessment !== snapshot.assessment || fixed.pinnedSha !== snapshot.pinnedSha) {
+    throw new Error("Fixed assessment or pinned SHA does not match the snapshot");
+  }
+  if (snapshot.assessment !== "scored") return fixed;
+  const prior = fixed.usage;
+  if (!prior || prior.model !== DECISIONS_MODEL || prior.decisionsModel !== DECISIONS_MODEL
+    || prior.explanationModel !== undefined || prior.outputTokens !== 0 || prior.requestIds.length > 1
+    || fixed.attackProbability === undefined
+    || fixed.criteria.some((item) => prior.decisionsScores[item.key] !== item.score)) {
+    throw new Error("Fixed scores must match authoritative Decisions usage");
+  }
+  const { key, effort } = scoringSettings({ ...options, effort: options.effort ?? prior.effort });
+  const fixedScores = {
+    repoAssessment: fixed.repoAssessment,
+    pinnedSha: fixed.pinnedSha,
+    criteria: fixed.criteria.map(({ key, label, score }) => ({ key, label, score })),
+    total: fixed.total
+  };
+  const prompt = buildExplanationPrompt(options.trustedFeatureReference);
+  const outputCap = effort === "low" ? 6000 : effort === "medium" ? 8192 : 12000;
   const responsesBody = {
     model: RESPONSES_MODEL,
     reasoning: { effort },
@@ -72,33 +138,49 @@ export async function evaluateSnapshot(snapshot: RepoEvidenceSnapshot, options: 
     store: false,
     input: [
       { role: "developer", content: prompt },
-      { role: "user", content: JSON.stringify({ snapshot, decisionsSignals: signals.scores }) }
+      { role: "user", content: JSON.stringify({ snapshot, fixedScores }) }
     ],
-    text: { format: { type: "json_schema", name: "hackathon_judgment", strict: true, schema: scoringOutputSchema } }
+    text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }
   };
-  const responsesCall = await callApi("responses", responsesBody, outputCap, key, fetcher, options);
+  const responsesCall = await callApi("responses", responsesBody, outputCap, key, options.fetch ?? globalThis.fetch, options);
   const modelResult = parseResponseResult(responsesCall.body);
-  if (modelResult.repoAssessment !== "scored" || modelResult.pinnedSha !== snapshot.pinnedSha) {
-    throw new Error("Model assessment or pinned SHA does not match the scored snapshot");
+  if (modelResult.repoAssessment !== fixed.repoAssessment || modelResult.pinnedSha !== fixed.pinnedSha
+    || modelResult.total !== fixed.total
+    || modelResult.criteria.some((item) => {
+      const original = fixed.criteria.find((criterion) => criterion.key === item.key);
+      return !original || original.score !== item.score || original.label !== item.label;
+    })) {
+    throw new Error("Explanation changed authoritative scores, assessment, labels, or pinned SHA");
+  }
+  if (modelResult.criteria.some((item) => item.evidencePaths.length === 0) && !modelResult.reviewRequired) {
+    throw new Error("Explanation without evidence requires reviewRequired");
+  }
+  if (modelResult.criteria.some((item) => !/[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}]/u.test(item.reason))) {
+    throw new Error("Explanation reasons must be Japanese");
   }
   const result: PublicScoreResult = {
     ...modelResult,
-    attackProbability: signals.attackProbability,
-    attackScore: visibleAttackScore(signals.attackProbability),
+    attackProbability: fixed.attackProbability,
+    attackScore: fixed.attackScore,
     usage: {
-      model: RESPONSES_MODEL,
+      ...prior,
       effort,
-      decisionsModel: DECISIONS_MODEL,
-      referenceVersion: options.trustedFeatureReference === undefined ? DEVDAY_REFERENCE_VERSION : "organizer-override",
-      rubricVersion: RUBRIC_VERSION,
-      inputTokens: decisionsCall.usage.inputTokens + responsesCall.usage.inputTokens,
-      outputTokens: decisionsCall.usage.outputTokens + responsesCall.usage.outputTokens,
-      costUsd: decisionsCall.usage.costUsd + responsesCall.usage.costUsd,
-      decisionsScores: signals.scores,
-      requestIds: [decisionsCall.usage.requestId, responsesCall.usage.requestId].filter((id): id is string => typeof id === "string" && id.length > 0)
+      explanationModel: RESPONSES_MODEL,
+      inputTokens: prior.inputTokens + responsesCall.usage.inputTokens,
+      outputTokens: prior.outputTokens + responsesCall.usage.outputTokens,
+      costUsd: ceilUsd(prior.costUsd + responsesCall.usage.costUsd),
+      requestIds: [...prior.requestIds, ...(responsesCall.usage.requestId ? [responsesCall.usage.requestId] : [])]
     }
   };
   return validatePublicScoreResult(result, new Set(snapshot.files.map((file) => file.path)));
+}
+
+function scoringSettings(options: ScoringOptions) {
+  const key = options.apiKey;
+  if (!key) throw new Error("Hackathon OpenAI API key is required");
+  const effort = options.effort ?? "medium";
+  if (effort !== "low" && effort !== "medium" && effort !== "high") throw new Error("Invalid scoring effort");
+  return { key, effort };
 }
 
 function assertSnapshotAuthority(snapshot: RepoEvidenceSnapshot): void {
@@ -112,7 +194,7 @@ function assertSnapshotAuthority(snapshot: RepoEvidenceSnapshot): void {
     throw new Error("Invalid canonical repository identity");
   }
   if (snapshot.assessment !== "scored") {
-    if (snapshot.files.length !== 0) {
+    if (!["empty_repository", "missing_or_private", "no_default_branch"].includes(snapshot.assessment) || snapshot.files.length !== 0) {
       throw new Error("Non-scored snapshot must contain no files");
     }
     return;
@@ -192,10 +274,10 @@ async function callApi(
     throw new Error("OpenAI returned an unexpected model");
   }
   const usage = parseUsage(kind, data.usage, response.headers.get("x-request-id"), reservationId);
-  await options.afterCall?.(usage);
   if (usage.inputTokens > maxInputTokens || usage.outputTokens > maxOutputTokens) {
     throw new Error("API usage exceeded reserved token bounds");
   }
+  await options.afterCall?.(usage);
   return { body: data, usage };
 }
 
@@ -232,7 +314,8 @@ function parseUsage(kind: "decisions" | "responses", input: unknown, requestId: 
 }
 
 function parseDecisions(input: Record<string, unknown>): { attackProbability: number; scores: Record<CriterionKey, number> } {
-  if (input.refusal != null || input.status === "incomplete" || input.error != null) {
+  if (input.refusal != null || (input.status !== undefined && input.status !== "completed")
+    || input.incomplete_details != null || input.error != null) {
     throw new Error("Decisions judgment was refused or incomplete");
   }
   const answers = input.answers;
@@ -244,7 +327,8 @@ function parseDecisions(input: Record<string, unknown>): { attackProbability: nu
   let attackProbability: number | undefined;
   for (const raw of answers) {
     const answer = record(raw);
-    if (answer.refusal != null) {
+    if (answer.refusal != null || answer.error != null
+      || (answer.status !== undefined && answer.status !== "completed") || answer.incomplete_details != null) {
       throw new Error("Decisions answer was refused");
     }
     const name = answer.name;
@@ -258,32 +342,33 @@ function parseDecisions(input: Record<string, unknown>): { attackProbability: nu
       attackProbability = validateAttackProbability(finiteNumber(answer.probability));
       continue;
     }
-    if (answer.type !== "score") {
-      throw new Error("Rubric answer must be a score");
+    if (answer.type !== "choice" || "score" in answer) {
+      throw new Error("Rubric answer must be an unambiguous choice");
     }
-    const score = finiteNumber(answer.score);
+    const levels = new Set<string>(DECISION_SCORE_LEVELS.map(String));
+    if (typeof answer.choice !== "string" || !levels.has(answer.choice)) {
+      throw new Error("Decisions choice is not an allowed score level");
+    }
     const confidence = finiteNumber(answer.confidence);
-    if (score < 0 || score > DECISION_SCORE_LEVELS.length - 1 || confidence < 0 || confidence > 1) {
-      throw new Error("Decisions score or confidence is out of range");
+    if (confidence < 0 || confidence > 1) {
+      throw new Error("Decisions confidence is out of range");
     }
     if (!Array.isArray(answer.probabilities) || answer.probabilities.length !== DECISION_SCORE_LEVELS.length) {
-      throw new Error("Decisions score distribution must contain six levels");
+      throw new Error("Decisions choice distribution must contain six levels");
     }
     let sum = 0;
-    let weighted = 0;
-    for (let index = 0; index < DECISION_SCORE_LEVELS.length; index += 1) {
-      const point = record(answer.probabilities[index]);
+    for (const rawPoint of answer.probabilities) {
+      const point = record(rawPoint);
       const probability = finiteNumber(point.probability);
-      if (point.value !== index || point.label !== String(DECISION_SCORE_LEVELS[index]) || probability < 0 || probability > 1) {
-        throw new Error("Decisions score distribution has invalid levels");
+      if (typeof point.value !== "string" || !levels.delete(point.value) || probability < 0 || probability > 1) {
+        throw new Error("Decisions choice distribution has invalid levels");
       }
       sum += probability;
-      weighted += index * probability;
     }
-    if (Math.abs(sum - 1) > 0.001 || Math.abs(weighted - score) > 0.02) {
-      throw new Error("Decisions score distribution is inconsistent");
+    if (levels.size || Math.abs(sum - 1) > 0.001) {
+      throw new Error("Decisions choice distribution is inconsistent");
     }
-    scores[name as CriterionKey] = score * 2;
+    scores[name as CriterionKey] = Number(answer.choice);
   }
   if (expected.size || attackProbability === undefined) {
     throw new Error("Decisions answers are incomplete");
@@ -324,7 +409,7 @@ function parseResponseResult(input: Record<string, unknown>) {
   } catch {
     throw new Error("Responses judgment text is invalid JSON");
   }
-  return scoringModelResultSchema.parse(parsed);
+  return explanationModelResultSchema.parse(parsed);
 }
 
 function record(input: unknown): Record<string, unknown> {

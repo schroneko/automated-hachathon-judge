@@ -1,9 +1,24 @@
-import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, TARGET_TEAMS } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
-import { normalizeGitHubRepoUrl, validatePublicScoreResult } from "../shared/validation";
+import { validatePublicScoreResult } from "../shared/validation";
+import { createBatch, frozenBarrier, getBatch, listBatches, retryBatch } from "./batches";
+import { matchesFrozenResolution, retryExplanation } from "./explanations";
+import { normalizeDemoUrl, SUBMISSION_METADATA_BODY_LIMIT_BYTES } from "./submission-metadata";
 import type { BudgetReservationInput, BudgetUsage, FinalizePayload, LeaseJob, PublicScoreResult, PublicSubmissionRecord, RankingEntry, ScoringQueueMessage, SubmissionMode } from "../shared/types";
 
-interface SubmissionRow {
+export interface SubmissionRow {
+  explanation_status: "pending" | "processing" | "completed" | "failed" | null;
+  evidence_snapshot_json: string | null;
+  decisions_result_json: string | null;
+  scored_at: string | null;
+  explanation_dispatches: number;
+  explanation_requested_at: string | null;
+  explanation_started_at: string | null;
+  batch_id: string | null;
+  submitted_at: string | null;
+  default_branch: string | null;
+  frozen_at: string | null;
+  frozen_resolution_json: string | null;
   id: string;
   event_id: string;
   repo_url: string;
@@ -11,8 +26,10 @@ interface SubmissionRow {
   repo_owner: string;
   repo_name: string;
   team_name: string;
+  demo_url: string | null;
   mode: SubmissionMode;
   effort: "low" | "high";
+  scoring_effort: "low" | "medium" | "high" | null;
   status: "queued" | "processing" | "completed" | "failed";
   attempts: number;
   dispatch_count: number;
@@ -26,6 +43,13 @@ interface SubmissionRow {
   result_json: string | null;
   outcome_json: string | null;
 }
+
+const publicSubmissionFields = [
+  "id", "event_id", "repo_url", "repo_normalized", "repo_owner", "repo_name", "team_name", "demo_url", "mode", "effort", "scoring_effort", "status", "attempts", "dispatch_count", "created_at", "updated_at", "started_at", "completed_at", "pinned_sha", "failure_message", "result_json", "batch_id", "submitted_at", "frozen_at", "explanation_status", "explanation_dispatches", "scored_at"
+] as const;
+
+export const PUBLIC_SUBMISSION_COLUMNS = publicSubmissionFields.join(", ");
+export type PublicSubmissionRow = Pick<SubmissionRow, typeof publicSubmissionFields[number]>;
 
 interface AccountRow {
   mode: SubmissionMode;
@@ -51,31 +75,29 @@ interface ReservationRow {
 
 export async function handleApiRequest(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const path = new URL(request.url).pathname;
+  if (!["GET", "HEAD", "OPTIONS"].includes(request.method) && !sameOrigin(request)) return jsonResponse({ error: "Cross-origin mutation rejected" }, { status: 403 });
+  if (request.method === "POST" && path === "/api/batches") return createBatch(request, env);
+  if (request.method === "POST" && /^\/api\/batches\/[^/]+\/retry$/.test(path)) return retryBatch(request, path.split("/")[3]!, env);
+  if (request.method === "GET" && /^\/api\/batches\/[^/]+$/.test(path)) return getBatch(path.split("/").at(-1) ?? "", env);
   if (request.method === "GET" && path === "/api/dashboard") return dashboard(env);
   if (request.method === "GET" && path === "/api/submission-status") return jsonResponse({ open: submissionsOpen(env) });
   if (request.method === "GET" && path === "/api/runner-status") return jsonResponse(await runnerStatus(env));
   if (request.method === "GET" && path === "/api/ranking") return jsonResponse({ items: await ranking(env) });
   if (request.method === "GET" && path === "/api/recent") return jsonResponse({ items: (await listSubmissions(env)).slice(0, 50) });
   if (request.method === "GET" && /^\/api\/(submissions|results)\/[^/]+$/.test(path)) return getSubmission(path.split("/").at(-1) ?? "", env);
+  if (request.method === "PATCH" && /^\/api\/submissions\/[^/]+$/.test(path)) return updateSubmissionMetadata(request, path.split("/").at(-1) ?? "", env);
   if (request.method === "POST" && path === "/api/submissions") {
-    if (!authorized(request, env)) return unauthorized(env);
-    return createSubmission(request, env);
+    return createBatch(request, env, true);
   }
   if (request.method === "POST" && /^\/api\/submissions\/[^/]+\/retry$/.test(path)) {
-    if (!authorized(request, env)) return unauthorized(env);
     return retrySubmission(request, path.split("/")[3]!, env);
   }
   return jsonResponse({ error: "Not found" }, { status: 404 });
 }
 
-function authorized(request: Request, env: Env): boolean {
-  const configured = env.RUNNER_TOKEN?.trim();
-  const supplied = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "").trim();
-  return Boolean(configured && supplied && configured === supplied);
-}
-
-function unauthorized(env: Env): Response {
-  return jsonResponse({ error: env.RUNNER_TOKEN ? "Unauthorized" : "Runner is not configured" }, { status: env.RUNNER_TOKEN ? 401 : 503 });
+function sameOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+  return origin === null || origin === new URL(request.url).origin;
 }
 
 function submissionsOpen(env: Env): boolean {
@@ -90,81 +112,68 @@ export function judgingEnabled(env: Env): boolean {
   return env.JUDGING_ENABLED?.trim().toLowerCase() === "true";
 }
 
-async function createSubmission(request: Request, env: Env): Promise<Response> {
-  let input: { repoUrl: string; teamName?: string; mode: SubmissionMode; effort: "low" | "high" };
-  try {
-    const value = await readJson(request, API_BODY_LIMIT_BYTES);
-    if (!object(value) || Object.keys(value).some((key) => !["repoUrl", "teamName", "mode", "effort"].includes(key))) throw new Error("Invalid submission body");
-    if (typeof value.repoUrl !== "string" || value.repoUrl.length > 512 || !["production", "validation"].includes(String(value.mode))) throw new Error("Invalid submission body");
-    if (value.teamName !== undefined && (typeof value.teamName !== "string" || value.teamName.trim().length > 100)) throw new Error("Invalid team name");
-    if (value.effort !== undefined && value.effort !== "low" && value.effort !== "high") throw new Error("Invalid scoring effort");
-    if (value.mode === "production" && value.effort === "low") throw new Error("Production judging requires high effort");
-    input = { repoUrl: value.repoUrl, mode: value.mode as SubmissionMode, effort: value.mode === "production" ? "high" : value.effort === "high" ? "high" : "low", ...(typeof value.teamName === "string" ? { teamName: value.teamName } : {}) };
-  } catch (error) {
-    return invalid(error);
-  }
-  let repo;
-  try {
-    repo = normalizeGitHubRepoUrl(input.repoUrl);
-  } catch (error) {
-    return invalid(error);
-  }
-  const existing = await env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE event_id = ? AND repo_normalized = ? AND mode = ?").bind(EVENT_ID, repo.normalized, input.mode).first<SubmissionRow>();
-  if (existing) return jsonResponse({ submission: toPublic(existing) });
-  if (!submissionsOpen(env)) return jsonResponse({ error: "新しい投稿の受付は停止中です。" }, { status: 403 });
-  if (!judgingEnabled(env)) return disabled();
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const teamName = input.teamName?.trim() || repo.normalized;
-  const max = input.mode === "production" ? PRODUCTION_SUBMISSION_LIMIT : VALIDATION_SUBMISSION_LIMIT;
-  try {
-    const result = await env.JUDGE_DB.prepare(
-      "INSERT INTO devday_judge_submissions (id, event_id, repo_url, repo_normalized, repo_owner, repo_name, team_name, mode, effort, status, dispatch_count, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, ?, ? WHERE (SELECT COUNT(*) FROM devday_judge_submissions WHERE event_id = ? AND mode = ?) < ?"
-    ).bind(id, EVENT_ID, repo.canonicalUrl, repo.normalized, repo.owner, repo.repo, teamName, input.mode, input.effort, now, now, EVENT_ID, input.mode, max).run();
-    if (!result.meta.changes) {
-      return jsonResponse({ error: "Submission limit reached", code: "submission_limit" }, { status: 429 });
-    }
-  } catch (error) {
-    const duplicate = await env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE event_id = ? AND repo_normalized = ? AND mode = ?").bind(EVENT_ID, repo.normalized, input.mode).first<SubmissionRow>();
-    if (duplicate) return jsonResponse({ submission: toPublic(duplicate) });
-    throw error;
-  }
-  const row = await getRow(id, env);
-  if (!row) throw new Error("Inserted submission missing");
-  if (!await sendQueueMessage(env, row)) return jsonResponse({ error: "Scoring queue send failed", code: "queue_send_failed" }, { status: 503 });
-  return jsonResponse({ submission: toPublic(row) }, { status: 202 });
+export function workEnabled(env: Env): boolean {
+  return judgingEnabled(env) && submissionsOpen(env);
+}
+
+export function effectiveEffort(row: Pick<SubmissionRow, "scoring_effort" | "effort">): "low" | "medium" | "high" {
+  return row.scoring_effort ?? row.effort;
 }
 
 async function getSubmission(id: string, env: Env): Promise<Response> {
-  const row = await getRow(id, env);
+  const row = await env.JUDGE_DB.prepare(`SELECT ${PUBLIC_SUBMISSION_COLUMNS} FROM devday_judge_submissions WHERE id = ? AND event_id = ?`).bind(id, EVENT_ID).first<PublicSubmissionRow>();
   return row ? jsonResponse(toPublic(row)) : jsonResponse({ error: "Not found" }, { status: 404 });
 }
 
-async function retrySubmission(request: Request, id: string, env: Env): Promise<Response> {
-  let highValidation = false;
+async function updateSubmissionMetadata(request: Request, id: string, env: Env): Promise<Response> {
+  let teamName: string;
+  let demoUrl: string | null | undefined;
   try {
-    const body = await readJson(request, API_BODY_LIMIT_BYTES);
-    if (!object(body) || Object.keys(body).some((key) => !["confirm", "effort"].includes(key)) || body.confirm !== true || (body.effort !== undefined && body.effort !== "high")) throw new Error("Invalid retry body");
-    highValidation = body.effort === "high";
+    const body = await readJson(request, SUBMISSION_METADATA_BODY_LIMIT_BYTES);
+    if (!object(body) || Object.keys(body).some((key) => !["teamName", "demoUrl"].includes(key)) || typeof body.teamName !== "string" || !body.teamName.trim() || body.teamName.trim().length > 100) throw new Error("Invalid submission metadata");
+    teamName = body.teamName.trim();
+    demoUrl = body.demoUrl === undefined ? undefined : body.demoUrl === null ? null : normalizeDemoUrl(body.demoUrl);
   } catch (error) {
     return invalid(error);
   }
-  if (!judgingEnabled(env)) return disabled();
+  const select = () => env.JUDGE_DB.prepare(`SELECT ${PUBLIC_SUBMISSION_COLUMNS} FROM devday_judge_submissions WHERE id = ? AND event_id = ?`).bind(id, EVENT_ID).first<PublicSubmissionRow>();
+  const current = await select();
+  if (!current) return jsonResponse({ error: "Not found" }, { status: 404 });
+  if (current.team_name === teamName && (demoUrl === undefined || current.demo_url === demoUrl)) return jsonResponse({ submission: toPublic(current) });
+  const suppliedDemo = Number(demoUrl !== undefined);
+  const updated = await env.JUDGE_DB.prepare(`UPDATE devday_judge_submissions SET team_name = ?, demo_url = CASE WHEN ? = 1 THEN ? ELSE demo_url END WHERE id = ? AND event_id = ? AND (team_name IS NOT ? OR (? = 1 AND demo_url IS NOT ?)) RETURNING ${PUBLIC_SUBMISSION_COLUMNS}`)
+    .bind(teamName, suppliedDemo, demoUrl ?? null, id, EVENT_ID, teamName, suppliedDemo, demoUrl ?? null).first<PublicSubmissionRow>();
+  const latest = updated ?? await select();
+  return latest ? jsonResponse({ submission: toPublic(latest) }) : jsonResponse({ error: "Not found" }, { status: 404 });
+}
+
+async function retrySubmission(request: Request, id: string, env: Env): Promise<Response> {
+  let requestedEffort: "medium" | "high" | undefined;
+  try {
+    const body = await readJson(request, API_BODY_LIMIT_BYTES);
+    if (!object(body) || Object.keys(body).some((key) => !["confirm", "effort"].includes(key)) || body.confirm !== true || (body.effort !== undefined && body.effort !== "medium" && body.effort !== "high")) throw new Error("Invalid retry body");
+    requestedEffort = body.effort;
+  } catch (error) {
+    return invalid(error);
+  }
+  if (!workEnabled(env)) return disabled();
   const current = await getRow(id, env);
   if (!current) return jsonResponse({ error: "Not found" }, { status: 404 });
-  if (highValidation && current.mode !== "validation") return invalid(new Error("Effort changes require validation mode"));
+  if (requestedEffort && current.mode !== "validation") return invalid(new Error("Effort changes require validation mode"));
+  if (current.result_json) return retryExplanation(current, requestedEffort, env);
+  if (!await frozenBarrier(current, env)) return jsonResponse({ error: "Retry the batch to finish freezing", code: "freeze_incomplete", batchId: current.batch_id, retryUrl: current.batch_id ? `/api/batches/${current.batch_id}/retry` : null, retryBody: { confirm: true } }, { status: 409 });
   if (current.attempts >= 3 || current.dispatch_count >= 3) return jsonResponse({ error: "Retry limit reached", code: "retry_limit" }, { status: 409 });
   const now = new Date().toISOString();
   const staleBefore = new Date(Date.parse(now) - 30 * 60 * 1000).toISOString();
   const staleProcessing = current.status === "processing" && current.started_at && current.started_at < staleBefore;
   const staleQueued = current.status === "queued" && current.updated_at < staleBefore;
-  const completedLowValidation = highValidation && current.mode === "validation" && current.effort === "low" && current.status === "completed";
+  const completedLowValidation = Boolean(requestedEffort) && current.mode === "validation" && effectiveEffort(current) === "low" && current.status === "completed";
   if (current.status !== "failed" && !staleProcessing && !staleQueued && !completedLowValidation) {
     return jsonResponse({ error: "Retry is unavailable for this submission", code: "retry_unavailable" }, { status: 409 });
   }
   const updated = await env.JUDGE_DB.prepare(
-    "UPDATE devday_judge_submissions SET status = 'queued', effort = ?, dispatch_count = dispatch_count + 1, callback_token = NULL, started_at = NULL, completed_at = NULL, pinned_sha = NULL, failure_message = NULL, result_json = NULL, outcome_json = NULL, updated_at = ? WHERE id = ? AND event_id = ? AND attempts < 3 AND attempts = ? AND dispatch_count < 3 AND dispatch_count = ? AND callback_token IS ? AND (status = 'failed' OR (status = 'processing' AND started_at < ?) OR (status = 'queued' AND updated_at < ?) OR (? = 1 AND status = 'completed' AND mode = 'validation' AND effort = 'low')) RETURNING *"
-  ).bind(highValidation ? "high" : current.effort, now, id, EVENT_ID, current.attempts, current.dispatch_count, current.callback_token, staleBefore, staleBefore, Number(completedLowValidation)).first<SubmissionRow>();
+    "UPDATE devday_judge_submissions SET status = 'queued', scoring_effort = ?, dispatch_count = dispatch_count + 1, callback_token = NULL, started_at = NULL, completed_at = NULL, failure_message = NULL, outcome_json = NULL, updated_at = ? WHERE id = ? AND event_id = ? AND result_json IS NULL AND attempts < 3 AND attempts = ? AND dispatch_count < 3 AND dispatch_count = ? AND callback_token IS ? AND (status = 'failed' OR (status = 'processing' AND started_at < ?) OR (status = 'queued' AND updated_at < ?) OR (? = 1 AND status = 'completed' AND mode = 'validation' AND COALESCE(scoring_effort, effort) = 'low')) RETURNING *"
+  ).bind(current.mode === "production" ? "medium" : requestedEffort ?? effectiveEffort(current), now, id, EVENT_ID, current.attempts, current.dispatch_count, current.callback_token, staleBefore, staleBefore, Number(completedLowValidation)).first<SubmissionRow>();
   if (updated) {
     if (!await sendQueueMessage(env, updated)) return jsonResponse({ error: "Scoring queue send failed", code: "queue_send_failed" }, { status: 503 });
     return jsonResponse({ submission: toPublic(updated) }, { status: 202 });
@@ -175,11 +184,11 @@ async function retrySubmission(request: Request, id: string, env: Env): Promise<
     : jsonResponse({ error: "Retry is unavailable for this submission", code: "retry_unavailable" }, { status: 409 });
 }
 
-async function getRow(id: string, env: Env): Promise<SubmissionRow | null> {
+export async function getRow(id: string, env: Env): Promise<SubmissionRow | null> {
   return env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE id = ? AND event_id = ?").bind(id, EVENT_ID).first<SubmissionRow>();
 }
 
-async function sendQueueMessage(env: Env, row: SubmissionRow): Promise<boolean> {
+export async function sendQueueMessage(env: Env, row: SubmissionRow): Promise<boolean> {
   const message: ScoringQueueMessage = { eventId: EVENT_ID, submissionId: row.id, mode: row.mode, attempt: row.attempts, dispatch: row.dispatch_count };
   try {
     await env.SCORING_QUEUE.send(message);
@@ -192,8 +201,15 @@ async function sendQueueMessage(env: Env, row: SubmissionRow): Promise<boolean> 
   }
 }
 
-function toPublic(row: SubmissionRow): PublicSubmissionRecord {
+export function toPublic(row: PublicSubmissionRow): PublicSubmissionRecord {
   return {
+    ...(row.batch_id ? { batchId: row.batch_id } : {}),
+    ...(row.submitted_at ? { submittedAt: row.submitted_at } : {}),
+    pinnedSha: row.pinned_sha,
+    frozenAt: row.frozen_at,
+    scoredAt: row.scored_at,
+    ...(row.explanation_status ? { explanationStatus: row.explanation_status } : {}),
+    explanationDispatches: row.explanation_dispatches,
     id: row.id,
     eventId: row.event_id,
     repoUrl: row.repo_url,
@@ -204,8 +220,9 @@ function toPublic(row: SubmissionRow): PublicSubmissionRecord {
       canonicalUrl: row.repo_url
     },
     teamName: row.team_name,
+    demoUrl: row.demo_url,
     mode: row.mode,
-    effort: row.effort,
+    effort: effectiveEffort(row),
     status: row.status,
     attempts: row.attempts,
     dispatches: row.dispatch_count,
@@ -219,12 +236,12 @@ function toPublic(row: SubmissionRow): PublicSubmissionRecord {
 }
 
 async function listSubmissions(env: Env): Promise<PublicSubmissionRecord[]> {
-  const rows = await env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE event_id = ? ORDER BY created_at DESC, id DESC").bind(EVENT_ID).all<SubmissionRow>();
+  const rows = await env.JUDGE_DB.prepare(`SELECT ${PUBLIC_SUBMISSION_COLUMNS} FROM devday_judge_submissions WHERE event_id = ? ORDER BY created_at DESC, id DESC`).bind(EVENT_ID).all<PublicSubmissionRow>();
   return rows.results.map(toPublic);
 }
 
 async function ranking(env: Env): Promise<RankingEntry[]> {
-  const rows = await env.JUDGE_DB.prepare("SELECT * FROM devday_judge_submissions WHERE event_id = ? AND mode = 'production' AND status = 'completed' AND result_json IS NOT NULL").bind(EVENT_ID).all<SubmissionRow>();
+  const rows = await env.JUDGE_DB.prepare(`SELECT ${PUBLIC_SUBMISSION_COLUMNS} FROM devday_judge_submissions WHERE event_id = ? AND mode = 'production' AND result_json IS NOT NULL`).bind(EVENT_ID).all<PublicSubmissionRow>();
   const scored = rows.results.map((row) => ({ row, result: JSON.parse(row.result_json!) as PublicScoreResult }))
     .sort((a, b) => b.result.total - a.result.total || a.row.created_at.localeCompare(b.row.created_at) || a.row.id.localeCompare(b.row.id));
   const cutoffScore = scored.length >= FINALIST_COUNT ? scored[FINALIST_COUNT - 1]!.result.total : null;
@@ -239,6 +256,7 @@ async function ranking(env: Env): Promise<RankingEntry[]> {
       repo: row.repo_normalized,
       repoUrl: row.repo_url,
       teamName: row.team_name,
+      demoUrl: row.demo_url,
       mode: row.mode,
       pinnedSha: result.pinnedSha,
       total: result.total,
@@ -275,6 +293,7 @@ async function dashboard(env: Env): Promise<Response> {
     event: { id: EVENT_ID, name: EVENT_NAME, date: EVENT_DATE, targetTeams: TARGET_TEAMS, finalistCount: FINALIST_COUNT },
     open: submissionsOpen(env),
     counts,
+    scoredCount: production.filter((item) => item.result !== null).length,
     budget: {
       limitUsd: account.limit_micro_usd / 1_000_000,
       spentUsd: account.spent_micro_usd / 1_000_000,
@@ -282,6 +301,7 @@ async function dashboard(env: Env): Promise<Response> {
       remainingUsd: (account.limit_micro_usd - account.spent_micro_usd - account.reserved_micro_usd) / 1_000_000
     },
     items,
+    batches: await listBatches(env, items),
     ranking: entries,
     cutoff: { score: cutoffScore, tied: entries.some((entry) => entry.tiedAtCutoff), tiedCount },
     runner
@@ -305,8 +325,9 @@ export function validQueueMessage(value: unknown): value is ScoringQueueMessage 
 export async function claimQueueMessage(message: ScoringQueueMessage, env: Env): Promise<LeaseJob | null> {
   if (!validQueueMessage(message)) return null;
   const queued = await getRow(message.submissionId, env);
-  if (!queued || queued.mode !== message.mode || queued.status !== "queued" || queued.attempts !== message.attempt || queued.dispatch_count !== message.dispatch) return null;
-  if (!judgingEnabled(env)) {
+  if (!queued || queued.result_json || queued.mode !== message.mode || queued.status !== "queued" || queued.attempts !== message.attempt || queued.dispatch_count !== message.dispatch) return null;
+  if (!await frozenBarrier(queued, env)) return null;
+  if (!workEnabled(env)) {
     const now = new Date().toISOString();
     const failure = "Judging is paused. Retry after it resumes.";
     await env.JUDGE_DB.prepare("UPDATE devday_judge_submissions SET status = 'failed', updated_at = ?, completed_at = ?, failure_message = ?, outcome_json = ? WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND attempts = ? AND dispatch_count = ?")
@@ -316,7 +337,7 @@ export async function claimQueueMessage(message: ScoringQueueMessage, env: Env):
   const token = crypto.randomUUID();
   const now = new Date().toISOString();
   const row = await env.JUDGE_DB.prepare(
-    "UPDATE devday_judge_submissions SET status = 'processing', callback_token = ?, started_at = ?, updated_at = ?, attempts = attempts + 1 WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND attempts = ? AND attempts < 3 AND dispatch_count = ? RETURNING *"
+    "UPDATE devday_judge_submissions SET status = 'processing', callback_token = ?, started_at = ?, updated_at = ?, attempts = attempts + 1 WHERE id = ? AND event_id = ? AND mode = ? AND status = 'queued' AND result_json IS NULL AND attempts = ? AND attempts < 3 AND dispatch_count = ? RETURNING *"
   ).bind(token, now, now, message.submissionId, EVENT_ID, message.mode, message.attempt, message.dispatch).first<SubmissionRow>();
   if (!row) return null;
   const job: LeaseJob = {
@@ -326,16 +347,18 @@ export async function claimQueueMessage(message: ScoringQueueMessage, env: Env):
     teamName: row.team_name,
     mode: row.mode,
     startedAt: row.started_at!,
-    effort: row.mode === "production" ? "high" : row.effort,
+    effort: row.mode === "production" ? "medium" : effectiveEffort(row),
     callbackToken: token,
-    pinnedSha: null,
-    defaultBranch: null,
-    summary: `${row.repo_normalized} processing-time repository snapshot`
+    pinnedSha: row.pinned_sha,
+    defaultBranch: row.default_branch,
+    summary: `${row.repo_normalized} repository snapshot`,
+    ...(row.frozen_resolution_json ? { frozenResolution: JSON.parse(row.frozen_resolution_json) } : {})
   };
   return job;
 }
 
 export async function callback(request: Request, env: Env): Promise<Response> {
+  if (!sameOrigin(request)) return jsonResponse({ error: "Cross-origin mutation rejected" }, { status: 403 });
   let body: FinalizePayload;
   try {
     const parsed = await readJson(request, CALLBACK_BODY_LIMIT_BYTES);
@@ -360,14 +383,16 @@ export async function callback(request: Request, env: Env): Promise<Response> {
       : jsonResponse({ error: "Callback payload conflict" }, { status: 409 });
   }
   if (row.status !== "processing") return jsonResponse({ error: "Stale callback" }, { status: 409 });
+  if (row.result_json) return jsonResponse({ error: "Scores are already fixed; retry explanations explicitly" }, { status: 409 });
+  if (body.outcome.kind === "completed" && !matchesFrozenResolution(row, body.outcome.result)) return invalid(new Error("Result does not match frozen repository"));
   const now = new Date().toISOString();
   const status = body.outcome.kind === "completed" ? "completed" : "failed";
   const resultJson = body.outcome.kind === "completed" ? JSON.stringify(body.outcome.result) : null;
-  const pinnedSha = body.outcome.kind === "completed" ? body.outcome.result.pinnedSha : null;
+  const pinnedSha = row.frozen_at ? row.pinned_sha : body.outcome.kind === "completed" ? body.outcome.result.pinnedSha : null;
   const failure = body.outcome.kind === "completed" ? null : body.outcome.message;
   const updated = await env.JUDGE_DB.prepare(
-    "UPDATE devday_judge_submissions SET status = ?, updated_at = ?, completed_at = ?, pinned_sha = ?, failure_message = ?, result_json = ?, outcome_json = ? WHERE id = ? AND status = 'processing' AND callback_token = ? RETURNING *"
-  ).bind(status, now, now, pinnedSha, failure, resultJson, outcomeJson, body.submissionId, body.callbackToken).first<SubmissionRow>();
+    "UPDATE devday_judge_submissions SET status = ?, updated_at = ?, completed_at = ?, pinned_sha = ?, failure_message = ?, result_json = ?, outcome_json = ?, scored_at = CASE WHEN ? IS NOT NULL THEN ? ELSE scored_at END, explanation_status = CASE WHEN ? IS NOT NULL THEN 'completed' ELSE explanation_status END WHERE id = ? AND status = 'processing' AND callback_token = ? AND result_json IS NULL RETURNING *"
+  ).bind(status, now, now, pinnedSha, failure, resultJson, outcomeJson, resultJson, now, resultJson, body.submissionId, body.callbackToken).first<SubmissionRow>();
   if (updated) return jsonResponse({ ok: true, submission: toPublic(updated) });
   const current = await getRow(body.submissionId, env);
   return current?.callback_token === body.callbackToken && current.outcome_json === outcomeJson
@@ -376,19 +401,21 @@ export async function callback(request: Request, env: Env): Promise<Response> {
 }
 
 export async function reserve(request: Request, env: Env): Promise<Response> {
-  if (!judgingEnabled(env)) return disabled();
-  let input: { submissionId: string; callbackToken: string; reservationId: string; reservation: BudgetReservationInput };
+  if (!sameOrigin(request)) return jsonResponse({ error: "Cross-origin mutation rejected" }, { status: 403 });
+  if (!workEnabled(env)) return disabled();
+  let input: { submissionId: string; callbackToken: string; reservationId: string; reservation: BudgetReservationInput; explanationDispatch?: number };
   try {
     const value = await readJson(request, API_BODY_LIMIT_BYTES);
     if (!object(value) || !shortString(value.submissionId, 100) || !shortString(value.callbackToken, 100) || !shortString(value.reservationId, 100) || !object(value.reservation)) throw new Error("Invalid reservation");
     const reservation = value.reservation;
+    if (value.explanationDispatch !== undefined && (!Number.isSafeInteger(value.explanationDispatch) || Number(value.explanationDispatch) < 1 || Number(value.explanationDispatch) > 3)) throw new Error("Invalid explanation dispatch");
     if (!validModel(reservation.kind, reservation.model) || !safeCount(reservation.maxInputTokens) || reservation.maxInputTokens >= 272_000 || !safeCount(reservation.maxOutputTokens) || !positiveMoney(reservation.reservedUsd)) throw new Error("Invalid reservation");
     if (reservation.kind === "decisions" && reservation.maxOutputTokens !== 0) throw new Error("Decisions must reserve zero output tokens");
     const required = reservation.kind === "decisions"
       ? reservation.maxInputTokens * 0.1 / 1_000_000
       : (reservation.maxInputTokens * 2.5 + reservation.maxOutputTokens * 10) / 1_000_000;
     if (micro(reservation.reservedUsd) < micro(required)) throw new Error("Reservation is below the maximum call cost");
-    input = { submissionId: value.submissionId, callbackToken: value.callbackToken, reservationId: value.reservationId, reservation: reservation as unknown as BudgetReservationInput };
+    input = { submissionId: value.submissionId, callbackToken: value.callbackToken, reservationId: value.reservationId, reservation: reservation as unknown as BudgetReservationInput, ...(value.explanationDispatch === undefined ? {} : { explanationDispatch: Number(value.explanationDispatch) }) };
   } catch (error) {
     return invalid(error);
   }
@@ -401,10 +428,11 @@ export async function reserve(request: Request, env: Env): Promise<Response> {
     ? jsonResponse({ reservationId: existing.id, status: existing.status, reservedUsd: existing.reserved_micro_usd / 1_000_000 })
     : jsonResponse({ error: "Reservation conflict" }, { status: 409 });
   if (job.status !== "processing") return jsonResponse({ error: "Stale lease" }, { status: 409 });
+  if (input.explanationDispatch !== undefined && (job.explanation_status !== "processing" || job.explanation_dispatches !== input.explanationDispatch)) return jsonResponse({ error: "Stale explanation lease" }, { status: 409 });
   const now = new Date().toISOString();
   try {
     const results = await env.JUDGE_DB.batch([
-      env.JUDGE_DB.prepare("UPDATE devday_judge_budget_accounts SET reserved_micro_usd = reserved_micro_usd + ? WHERE mode = ? AND spent_micro_usd + reserved_micro_usd + ? <= limit_micro_usd AND NOT EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE id = ?) AND EXISTS (SELECT 1 FROM devday_judge_submissions WHERE id = ? AND callback_token = ? AND status = 'processing' AND mode = ?)").bind(amount, job.mode, amount, input.reservationId, job.id, input.callbackToken, job.mode),
+      env.JUDGE_DB.prepare("UPDATE devday_judge_budget_accounts SET reserved_micro_usd = reserved_micro_usd + ? WHERE mode = ? AND spent_micro_usd + reserved_micro_usd + ? <= limit_micro_usd AND NOT EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE id = ?) AND EXISTS (SELECT 1 FROM devday_judge_submissions WHERE id = ? AND callback_token = ? AND status = 'processing' AND mode = ? AND (? IS NULL OR (explanation_status = 'processing' AND explanation_dispatches = ?)))").bind(amount, job.mode, amount, input.reservationId, job.id, input.callbackToken, job.mode, input.explanationDispatch ?? null, input.explanationDispatch ?? null),
       env.JUDGE_DB.prepare("INSERT INTO devday_judge_budget_reservations (id, submission_id, callback_token, mode, kind, model, max_input_tokens, max_output_tokens, reserved_micro_usd, status, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ? WHERE changes() = 1").bind(input.reservationId, job.id, input.callbackToken, job.mode, input.reservation.kind, input.reservation.model, input.reservation.maxInputTokens, input.reservation.maxOutputTokens, amount, now)
     ]);
     if (!results[0]?.meta.changes || !results[1]?.meta.changes) {
@@ -429,6 +457,7 @@ function sameReservation(row: ReservationRow, input: { submissionId: string; cal
 }
 
 export async function settle(request: Request, env: Env): Promise<Response> {
+  if (!sameOrigin(request)) return jsonResponse({ error: "Cross-origin mutation rejected" }, { status: 403 });
   let input: { submissionId: string; callbackToken: string; reservationId: string; usage: BudgetUsage };
   try {
     const value = await readJson(request, API_BODY_LIMIT_BYTES);
@@ -456,8 +485,6 @@ export async function settle(request: Request, env: Env): Promise<Response> {
   if (reservation.status === "settled") return reservation.actual_micro_usd === actual && reservation.usage_json === usageJson
     ? jsonResponse({ ok: true, spentUsd: actual / 1_000_000 })
     : jsonResponse({ error: "Settlement conflict" }, { status: 409 });
-  const job = await getRow(input.submissionId, env);
-  if (job?.status !== "processing" || job.callback_token !== input.callbackToken) return jsonResponse({ error: "Stale lease" }, { status: 409 });
   const now = new Date().toISOString();
   const results = await env.JUDGE_DB.batch([
     env.JUDGE_DB.prepare("UPDATE devday_judge_budget_accounts SET reserved_micro_usd = reserved_micro_usd - ?, spent_micro_usd = spent_micro_usd + ? WHERE mode = ? AND EXISTS (SELECT 1 FROM devday_judge_budget_reservations WHERE id = ? AND status = 'reserved' AND callback_token = ?)").bind(reservation.reserved_micro_usd, actual, reservation.mode, reservation.id, input.callbackToken),
@@ -500,7 +527,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function readJson(request: Request, limit: number): Promise<unknown> {
+export async function readJson(request: Request, limit: number): Promise<unknown> {
   const length = Number(request.headers.get("content-length"));
   if (Number.isFinite(length) && length > limit) throw new BodyTooLarge();
   if (!request.body) return null;

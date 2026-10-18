@@ -22,11 +22,11 @@ GitHub repository の Security tab から private vulnerability report を作成
 
 特に次の領域を重視します。
 
-- Runner endpoint または callback の authentication bypass
-- public response への内部 token の露出
+- 審査開始の期限・件数制限・冪等性の回避
+- public response へのAPIキーや内部callback tokenの露出
 - untrusted repository content からの code execution
 - OpenAI または GitHub credential の漏えい
-- D1 の審査結果や費用台帳の unauthorized mutation
+- D1の審査結果や費用台帳の不正な変更
 - prompt injection による scoring boundary の逸脱
 
 第三者の repository や service に対する無断テスト、denial of service、social engineering は行わないでください。

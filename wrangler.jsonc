@@ -23,10 +23,12 @@
   ],
   "queues": {
     "producers": [
-      { "binding": "SCORING_QUEUE", "queue": "devday-judge-20261018" }
+      { "binding": "SCORING_QUEUE", "queue": "devday-judge-20261018" },
+      { "binding": "EXPLANATION_QUEUE", "queue": "devday-judge-explanations-20261018" }
     ],
     "consumers": [
-      { "queue": "devday-judge-20261018", "max_batch_size": 1, "max_batch_timeout": 1, "max_concurrency": 4, "max_retries": 0 }
+      { "queue": "devday-judge-20261018", "max_batch_size": 1, "max_batch_timeout": 1, "max_concurrency": 8, "max_retries": 0 },
+      { "queue": "devday-judge-explanations-20261018", "max_batch_size": 1, "max_batch_timeout": 1, "max_concurrency": 8, "max_retries": 0 }
     ]
   },
   "migrations": [

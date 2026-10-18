@@ -1,4 +1,8 @@
 export const API_BODY_LIMIT_BYTES = 2048;
+export const BATCH_BODY_LIMIT_BYTES = 131_072;
+export const BATCH_ITEM_LIMIT = 30;
+export const SUBMISSION_DEADLINE_ISO = "2026-10-18T08:15:00.000Z";
+export const JUDGING_START_ISO = "2026-10-18T08:30:00.000Z";
 export const CALLBACK_BODY_LIMIT_BYTES = 131_072;
 export const EVENT_ID = "devday-20261018";
 export const EVENT_NAME = "OpenAI DevDay 2026 Community Hackathon Tokyo";
@@ -6,9 +10,10 @@ export const EVENT_DATE = "2026-10-18";
 export const TARGET_TEAMS = 30;
 export const FINALIST_COUNT = 10;
 export const PRODUCTION_SUBMISSION_LIMIT = 40;
-export const VALIDATION_SUBMISSION_LIMIT = 20;
+export const VALIDATION_SUBMISSION_LIMIT = 40;
 export const MAX_EVIDENCE_FILES = 24;
 export const MAX_EVIDENCE_TOTAL_BYTES = 120_000;
+export const MAX_SNAPSHOT_SERIALIZED_BYTES = 850_000;
 export const MAX_EVIDENCE_FILE_BYTES = 12_000;
 export const RUNNER_ONLINE_WINDOW_MS = 30 * 60 * 1000;
 

@@ -6,31 +6,33 @@
 
 Workersで画面とAPIを提供し、既存の共有D1 `wordplay-arcade-budget` の `devday_judge_` テーブルだけを使います。新しいD1の作成枠は不要です。既存テーブル・データは変更しません。
 
-作成済みのCloudflare Queue `devday-judge-20261018` に審査ID・イベント・区分・試行番号を送り、Workerのconsumerで有限の採点を実行します。ブラウザを閉じても開始済みの採点と残りのキュー処理が続きます。Durable ObjectsとBrowser Renderingは使用しません。旧Durable Objectのmigration履歴と拒否用classだけを保持します。
+採点Queue `devday-judge-20261018` と理由生成Queue `devday-judge-explanations-20261018` に審査ID等の有限メッセージを送り、Workerのconsumerで処理します。Decisionsの点数を先に保存し、Solの理由生成が採点の進行を占有しません。ブラウザを閉じても処理が続きます。Durable ObjectsとBrowser Renderingは使用しません。旧Durable Objectのmigration履歴と拒否用classだけを保持します。
 
 公開Git smart HTTP refs広告でdefault branchとSHAを固定し、recursive treeのREST取得を1試行につき1回に抑えます。refsは最大256KB、tree応答は最大2MB、証拠は最大24ファイル・各12KB・合計120KBです。GitHub token、対象コードの実行、リンク巡回は不要です。
 
-主催者は既存の `RUNNER_TOKEN` をブラウザで使います。トークンの主催者への受け渡しは未完了です。採点キーは既存1Password Environmentの `OPENAI_API_KEY_20261018_HACKATHON` をWorker secretとして扱い、値を表示せずに注入する手順は検証中です。
+画面のログインやトークン入力はありません。採点キーは既存1Password Environmentの `OPENAI_API_KEY_20261018_HACKATHON` をWorker secretへ非表示のpipeで設定済みです。ブラウザへ渡しません。
 
 ## Bounds and cost
 
 | 項目 | 上限 |
 | --- | --- |
-| 登録 | 本番40件、検証20件 |
+| 登録 | 本番40件、検証40件。一括最大30件 |
 | 試行・送信 | 初回と主催者の明示的な再試行を合わせて1件につき最大3回 |
-| Queue送信 | 最大180件、審査IDなど1KB未満のmetadataだけ |
-| Consumer | batch 1、同時4件、自動再試行0 |
+| 採点Queue送信 | 最大240件、審査IDなど1KB未満のmetadataだけ |
+| 理由生成Queue送信 | 1件につき最大3回、合計最大240件 |
+| コミット固定Queue送信 | batchにつき最大3回、合計最大240件 |
+| Consumer | 両Queueともbatch 1、最大同時8件、自動再試行0 |
 | GitHub取得 | 1試行につき全体45秒 |
 | OpenAI採点 | 各API呼び出し最大180秒 |
 | OpenAI費用 | 予約を含め本番$90、検証$20 |
 | Queue保持 | Workers Freeの24時間 |
 | 結果・費用台帳 | イベント後90日を目安。削除は別途確認 |
 
-Queueの通常配信は書き込み・読み取り・削除で1通あたり3操作です。180通なら通常約540操作で、Workers Freeの10,000操作/日というアカウント枠を下回ります。重複配信は追加読み取りになり得ますが、条件付きclaimで再採点を拒否します。上限はこのイベントの送信数に対するもので、他サービスの利用量を含むアカウント全体の予約ではありません。
+Queueの通常配信は書き込み・読み取り・削除で1通あたり3操作です。採点・理由生成・コミット固定の合計最大720通なら、通常配信は約2,160操作です。新規batchには少なくとも1件の新規審査が必要で、合計80件の登録上限がbatch数の上限にもなります。重複配信は追加読み取りになり得ますが、条件付きclaimで再処理を拒否します。この上限は他サービスの利用量を含むアカウント全体の予約ではありません。
 
 変更のないリクエスト、空のキュー、重複登録、処理済みメッセージの重複配信は書き込み0件です。常駐ポーリング、定期heartbeat、Cronはありません。再試行で過去の精算や未確定の費用予約を消さず、同じ区分の上限へ含めます。登録上限・送信上限・試行上限・費用予約・停止フラグをテストしてから公開します。
 
-本番はSolのhigh、検証はlowが既定で、検証区分に限りhighで再検証できます。ルーブリック `2026-10-18-v1` の `0 / 2 / 4 / 6 / 8 / 10` を画面と両APIで共有し、根拠と次の段階に不足する条件を示します。
+本番はSolのmedium、検証はlowが既定で、検証区分ではmediumとhighも選べます。ルーブリック `2026-10-18-v1` の `0 / 2 / 4 / 6 / 8 / 10` を画面と両APIで共有し、根拠と次の段階に不足する条件を示します。
 
 料金・制限の確認元: [Queues pricing](https://developers.cloudflare.com/queues/platform/pricing/)、[Queues limits](https://developers.cloudflare.com/queues/platform/limits/)。
 

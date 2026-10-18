@@ -1,7 +1,9 @@
 import { handleApiRequest } from "./api";
 import { JudgeState } from "./judge-state";
-import { processScoringMessage } from "./queue";
-import type { ScoringQueueMessage } from "../shared/types";
+import { processExplanationMessage, processScoringMessage } from "./queue";
+import { validExplanationMessage } from "./explanations";
+import { processFreezeMessage, validFreezeMessage } from "./batches";
+import type { JudgeQueueMessage } from "../shared/types";
 
 export { JudgeState };
 
@@ -13,10 +15,12 @@ export default {
     }
     return env.ASSETS.fetch(request);
   },
-  async queue(batch: MessageBatch<ScoringQueueMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+  async queue(batch: MessageBatch<JudgeQueueMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
     for (const message of batch.messages) {
       try {
-        await processScoringMessage(message.body, env);
+        if (validFreezeMessage(message.body)) await processFreezeMessage(message.body, env);
+        else if (validExplanationMessage(message.body)) await processExplanationMessage(message.body, env);
+        else await processScoringMessage(message.body, env);
       } finally {
         message.ack();
       }

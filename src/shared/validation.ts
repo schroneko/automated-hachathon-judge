@@ -12,8 +12,9 @@ const submissionBodySchema = z.object({
 
 const usageSchema = z.object({
   model: z.string().min(1),
-  effort: z.enum(["low", "high"]),
+  effort: z.enum(["low", "medium", "high"]),
   decisionsModel: z.string().min(1),
+  explanationModel: z.string().min(1).optional(),
   referenceVersion: z.string().min(1).max(100).optional(),
   rubricVersion: z.string().min(1).max(100).optional(),
   inputTokens: z.number().int().nonnegative(),
@@ -47,14 +48,15 @@ export const publicScoreResultSchema = z.object({
   total: z.number().int().min(0).max(MAX_TOTAL_SCORE),
   attackScore: z.number().int().min(80).max(100).nullable(),
   attackProbability: z.number().finite().min(0).max(1).optional(),
+  reviewRequired: z.boolean().optional(),
   usage: usageSchema.optional()
 }).strict();
 
-export const scoringModelResultSchema = publicScoreResultSchema.omit({
+export const explanationModelResultSchema = publicScoreResultSchema.omit({
   attackScore: true,
   attackProbability: true,
   usage: true
-}).strict();
+}).extend({ reviewRequired: z.boolean() }).strict();
 
 const scoringCallbackBodySchema = z.object({
   submissionId: z.string().min(1).max(100),
@@ -75,10 +77,10 @@ const scoringCallbackBodySchema = z.object({
   ])
 }).strict();
 
-export const scoringOutputSchema = {
+export const explanationOutputSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["summary", "publicReason", "repoAssessment", "pinnedSha", "criteria", "total"],
+  required: ["summary", "publicReason", "repoAssessment", "pinnedSha", "criteria", "total", "reviewRequired"],
   properties: {
     summary: { type: "string" },
     publicReason: { type: "string" },
@@ -110,7 +112,8 @@ export const scoringOutputSchema = {
         }
       }
     },
-    total: { type: "integer" }
+    total: { type: "integer" },
+    reviewRequired: { type: "boolean" }
   }
 } as const;
 
@@ -215,10 +218,15 @@ export function validatePublicScoreResult(input: unknown, allowedEvidencePaths?:
   if (parsed.repoAssessment === "scored" && parsed.pinnedSha === null) {
     throw new Error("Scored repositories must include a pinned SHA");
   }
-  const { usage, ...result } = parsed;
+  const { usage, reviewRequired, ...fields } = parsed;
+  const result = { ...fields, ...(reviewRequired === undefined ? {} : { reviewRequired }) };
   if (!usage) return result;
-  const { referenceVersion, ...audit } = usage;
-  return { ...result, usage: { ...audit, ...(referenceVersion === undefined ? {} : { referenceVersion }) } };
+  const { referenceVersion, explanationModel, ...audit } = usage;
+  return { ...result, usage: {
+    ...audit,
+    ...(referenceVersion === undefined ? {} : { referenceVersion }),
+    ...(explanationModel === undefined ? {} : { explanationModel })
+  } };
 }
 
 export function scoreAnchorsText(): string {

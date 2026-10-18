@@ -1,14 +1,24 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CRITERIA, EVENT_ID } from "../src/shared/constants";
-import type { ScoringQueueMessage } from "../src/shared/types";
+import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, ScoringQueueMessage } from "../src/shared/types";
+import type { ScoringOptions } from "../src/container/scorer";
+import { processFreezeMessage } from "../src/worker/batches";
 
-const scorer = vi.hoisted(() => ({ scoreSubmission: vi.fn() }));
-vi.mock("../src/container/scorer", () => scorer);
+const scorer = vi.hoisted(() => ({ scoreSubmissionDecisions: vi.fn(), explainScoredSnapshot: vi.fn() }));
+vi.mock("../src/container/scorer", () => ({
+  scoreSubmissionDecisions: async (job: LeaseJob, options: unknown) => {
+    const result = await scorer.scoreSubmissionDecisions(job, options);
+    return result && "snapshot" in result ? result : { result, snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored", files: [{ path: "README.md", size: 8, content: "evidence", truncated: false }] } };
+  },
+  explainScoredSnapshot: scorer.explainScoredSnapshot
+}));
+vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async () => ({ assessment: "scored", pinnedSha: "a".repeat(40), defaultBranch: "main", summary: "snapshot" })) }));
 
-import { handleApiRequest } from "../src/worker/api";
-import { processScoringMessage } from "../src/worker/queue";
+import { callback, handleApiRequest } from "../src/worker/api";
+import type { SubmissionRow } from "../src/worker/api";
+import { processExplanationMessage, processScoringMessage } from "../src/worker/queue";
 import worker from "../src/worker/index";
 
 class SqliteD1 {
@@ -57,8 +67,8 @@ class SqliteD1 {
     return Number((this.db.prepare("SELECT total_changes() AS n").get() as { n: number }).n);
   }
 
-  row(id: string): { status: string; attempts: number; failure_message: string | null; callback_token: string | null } {
-    return this.db.prepare("SELECT * FROM devday_judge_submissions WHERE id = ?").get(id) as { status: string; attempts: number; failure_message: string | null; callback_token: string | null };
+  row(id: string): SubmissionRow {
+    return this.db.prepare("SELECT * FROM devday_judge_submissions WHERE id = ?").get(id) as unknown as SubmissionRow;
   }
 
   account(mode: string): { spent_micro_usd: number; reserved_micro_usd: number } {
@@ -66,21 +76,31 @@ class SqliteD1 {
   }
 }
 
-function score() {
+function score(): PublicScoreResult {
   return {
     summary: "summary", publicReason: "reason", repoAssessment: "scored", pinnedSha: "a".repeat(40),
     criteria: CRITERIA.map((item) => ({ key: item.key, label: item.label, score: 8, reason: "reason", evidencePaths: [] })),
-    total: 32, attackScore: null
+    total: 32, attackScore: null,
+    usage: { model: "gpt-6-luna", decisionsModel: "gpt-6-luna", effort: "medium", inputTokens: 100, outputTokens: 0, costUsd: 0.00001, decisionsScores: { technical: 8, ux: 8, impact: 8, idea: 8 }, requestIds: [] }
   };
+}
+
+function explained(fixed: PublicScoreResult): PublicScoreResult {
+  return { ...fixed, summary: "理由生成済み", publicReason: "評価理由", reviewRequired: false,
+    criteria: fixed.criteria.map((item) => ({ ...item, reason: "保存した根拠に基づく評価です", evidencePaths: ["README.md"] })),
+    usage: { ...fixed.usage!, explanationModel: "gpt-6.1-sol" } };
 }
 
 function setup() {
   const database = new SqliteD1();
   const sent: ScoringQueueMessage[] = [];
+  const controls: FreezeQueueMessage[] = [];
+  const explanations: ExplanationQueueMessage[] = [];
   let sendError = false;
   const env = {
     JUDGE_DB: database,
-    SCORING_QUEUE: { send: async (message: ScoringQueueMessage) => { sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
+    SCORING_QUEUE: { send: async (message: ScoringQueueMessage | FreezeQueueMessage) => { if ("type" in message) { controls.push(message); return; } sent.push(message); if (sendError) throw new Error("ambiguous send"); } },
+    EXPLANATION_QUEUE: { send: async (message: ExplanationQueueMessage) => { explanations.push(message); } },
     RUNNER_TOKEN: "organizer-secret",
     JUDGING_ENABLED: "true",
     SUBMISSIONS_OPEN: "true",
@@ -93,34 +113,36 @@ function setup() {
       ...(body === undefined ? {} : { body: JSON.stringify(body) })
     }), env, {} as ExecutionContext);
   }
-  async function create(name: string, mode: "production" | "validation" = "production", effort?: "low" | "high") {
-    const response = await api("/api/submissions", "POST", { repoUrl: `https://github.com/example/${name}`, mode, ...(effort ? { effort } : {}) }, true);
+  async function create(name: string, mode: "production" | "validation" = "production", effort?: "low" | "medium" | "high") {
+    const response = await api("/api/submissions", "POST", { repoUrl: `https://github.com/example/${name}`, mode, submittedAt: "2026-10-18T08:15:00.000Z", ...(effort ? { effort } : {}) }, true);
+    if (response.status === 202) await processFreezeMessage(controls.at(-1)!, env);
     const body = await response.json() as { submission?: { id: string } };
     return { response, id: body.submission?.id ?? "" };
   }
-  return { database, env, sent, api, create, setSendError: (value: boolean) => { sendError = value; } };
+  return { database, env, sent, explanations, api, create, setSendError: (value: boolean) => { sendError = value; } };
 }
 
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); scorer.scoreSubmission.mockReset(); });
+beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
+afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); scorer.scoreSubmissionDecisions.mockReset(); scorer.explainScoredSnapshot.mockReset(); });
 
 describe("cloud queue runtime", () => {
   it("acknowledges a completed or skipped Queue delivery without requesting retry", async () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
-    scorer.scoreSubmission.mockResolvedValue(score());
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
     const created = await create("ack");
     const ack = vi.fn();
     const retry = vi.fn();
     const batch = { messages: [{ body: sent[0], ack, retry }] } as unknown as MessageBatch<ScoringQueueMessage>;
     await worker.queue(batch, env, {} as ExecutionContext);
     await worker.queue(batch, env, {} as ExecutionContext);
-    expect(database.row(created.id)).toMatchObject({ status: "completed", attempts: 1 });
+    expect(database.row(created.id)).toMatchObject({ status: "processing", explanation_status: "pending", attempts: 1 });
     expect(ack).toHaveBeenCalledTimes(2);
     expect(retry).not.toHaveBeenCalled();
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(1);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
   });
 
-  it.each([["validation", "low"], ["validation", "high"], ["production", "high"]] as const)("scores %s with %s effort, reserves and settles", async (mode, effort) => {
+  it.each([["validation", "low"], ["validation", "medium"], ["validation", "high"], ["production", "medium"]] as const)("scores %s with %s effort, reserves and settles", async (mode, effort) => {
     const { database, env, sent, api, create } = setup();
     const fetcher = vi.fn(async (url: string, init?: RequestInit) => {
       expect(url).toBe("https://api.openai.com/v1/models");
@@ -128,17 +150,17 @@ describe("cloud queue runtime", () => {
       return Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] });
     });
     vi.stubGlobal("fetch", fetcher);
-    scorer.scoreSubmission.mockImplementation(async (_job: unknown, options: {
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: unknown, options: {
       effort: string; apiKey: string;
       beforeCall: (input: unknown) => Promise<string>;
       afterCall: (input: unknown) => Promise<void>;
     }) => {
       expect(options.effort).toBe(effort);
       expect(options.apiKey).toBe("scoring-secret");
-      const reservationId = await options.beforeCall({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+      const reservationId = await options.beforeCall({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
       expect(database.account(mode).reserved_micro_usd).toBe(1_000_000);
-      await options.afterCall({ kind: "responses", model: "gpt-6.1-sol", reservationId, inputTokens: 100, outputTokens: 10, cachedInputTokens: 0, costUsd: 0.0003 });
-      expect(database.account(mode)).toMatchObject({ spent_micro_usd: 300, reserved_micro_usd: 0 });
+      await options.afterCall({ kind: "decisions", model: "gpt-6-luna", reservationId, inputTokens: 100, outputTokens: 0, cachedInputTokens: 0, costUsd: 0.00001 });
+      expect(database.account(mode)).toMatchObject({ spent_micro_usd: 10, reserved_micro_usd: 0 });
       return score();
     });
     const created = await create(`success-${mode}`, mode, effort);
@@ -146,7 +168,7 @@ describe("cloud queue runtime", () => {
     expect(sent).toEqual([{ eventId: EVENT_ID, submissionId: created.id, mode, attempt: 0, dispatch: 1 }]);
     await processScoringMessage(sent[0], env);
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(database.row(created.id)).toMatchObject({ status: "completed", attempts: 1, effort });
+    expect(database.row(created.id)).toMatchObject({ status: "processing", explanation_status: "pending", attempts: 1, scoring_effort: effort });
     const publicResponse = await api(`/api/submissions/${created.id}`);
     const publicText = await publicResponse.text();
     expect(publicText).not.toContain("scoring-secret");
@@ -155,13 +177,13 @@ describe("cloud queue runtime", () => {
     await processScoringMessage(sent[0], env);
     expect(database.changes()).toBe(before);
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(1);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
   });
 
   it("claims one exact message under duplicate concurrency and skips invalid identities without writes", async () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
-    scorer.scoreSubmission.mockResolvedValue(score());
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
     const first = await create("first");
     const second = await create("second");
     const original = sent[0]!;
@@ -172,37 +194,36 @@ describe("cloud queue runtime", () => {
       { ...original, dispatch: 0 }, { ...original, dispatch: 4 }, { ...original, dispatch: 2 }
     ]) await processScoringMessage(message, env);
     expect(database.changes()).toBe(before);
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
     await Promise.all([processScoringMessage(original, env), processScoringMessage(original, env)]);
-    expect(database.row(first.id)).toMatchObject({ status: "completed", attempts: 1 });
+    expect(database.row(first.id)).toMatchObject({ status: "processing", explanation_status: "pending", attempts: 1 });
     expect(database.row(second.id)).toMatchObject({ status: "queued", attempts: 0 });
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(1);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
   });
 
   it("marks a failed producer send and ignores an ambiguously accepted message", async () => {
     const { database, env, sent, create, setSendError } = setup();
     setSendError(true);
     const created = await create("send-failure");
-    expect(created.response.status).toBe(503);
+    expect(created.response.status).toBe(202);
     expect(database.row(sent[0]!.submissionId)).toMatchObject({ status: "failed", attempts: 0 });
     const before = database.changes();
     await processScoringMessage(sent[0], env);
     expect(database.changes()).toBe(before);
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
   });
 
   it("requires manual retry and rejects an earlier attempt after requeue", async () => {
     const { database, env, sent, api, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
-    scorer.scoreSubmission.mockRejectedValue(new Error("secret diagnostic"));
+    scorer.scoreSubmissionDecisions.mockRejectedValue(new Error("secret diagnostic"));
     const created = await create("retry");
     await processScoringMessage(sent[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 1 });
     expect(database.row(created.id).failure_message).not.toContain("secret");
     const path = `/api/submissions/${created.id}/retry`;
-    expect((await api(path, "POST", { confirm: true })).status).toBe(401);
     expect((await api(path, "POST", { confirm: false }, true)).status).toBe(400);
-    expect((await api(path, "POST", { confirm: true }, true)).status).toBe(202);
+    expect((await api(path, "POST", { confirm: true })).status).toBe(202);
     expect(sent[1]).toMatchObject({ submissionId: created.id, attempt: 1 });
     const before = database.changes();
     await processScoringMessage(sent[0], env);
@@ -213,7 +234,7 @@ describe("cloud queue runtime", () => {
     await processScoringMessage(sent[2], env);
     expect(database.row(created.id).attempts).toBe(3);
     expect((await api(path, "POST", { confirm: true }, true)).status).toBe(409);
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(3);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(3);
   });
 
   it("stops new claims and reservations while paused, retaining charged usage settlement", async () => {
@@ -222,7 +243,7 @@ describe("cloud queue runtime", () => {
     env.JUDGING_ENABLED = "false";
     await processScoringMessage(sent[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 0 });
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
     expect((await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true }, true)).status).toBe(410);
     expect((await create("new-paused")).response.status).toBe(410);
   });
@@ -231,8 +252,8 @@ describe("cloud queue runtime", () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
     database.db.prepare("UPDATE devday_judge_budget_accounts SET spent_micro_usd = limit_micro_usd WHERE mode = 'production'").run();
-    scorer.scoreSubmission.mockImplementation(async (_job: unknown, options: { beforeCall: (input: unknown) => Promise<string> }) => {
-      await options.beforeCall({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: unknown, options: { beforeCall: (input: unknown) => Promise<string> }) => {
+      await options.beforeCall({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
       throw new Error("paid call reached");
     });
     const created = await create("budget");
@@ -246,8 +267,8 @@ describe("cloud queue runtime", () => {
     const { database, env, sent, create } = setup();
     const modelFetch = vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] }));
     vi.stubGlobal("fetch", modelFetch);
-    scorer.scoreSubmission.mockImplementation(async (_job: unknown, options: { beforeCall: (input: unknown) => Promise<string> }) => {
-      await options.beforeCall({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+    scorer.scoreSubmissionDecisions.mockImplementation(async (_job: unknown, options: { beforeCall: (input: unknown) => Promise<string> }) => {
+      await options.beforeCall({ kind: "decisions", model: "gpt-6-luna", maxInputTokens: 100, maxOutputTokens: 0, reservedUsd: 1 });
       throw new Error("sensitive provider response");
     });
     const created = await create("unresolved");
@@ -261,24 +282,25 @@ describe("cloud queue runtime", () => {
     await processScoringMessage(sent[0], env);
     expect(database.changes()).toBe(before);
     expect(modelFetch).toHaveBeenCalledTimes(1);
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(1);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
   });
 
-  it("fails a claimed job before scoring when either required model is absent", async () => {
+  it("fails a claimed job before scoring when Decisions is absent", async () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
     const created = await create("models");
     await processScoringMessage(sent[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 1 });
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
     expect(database.account("production")).toMatchObject({ spent_micro_usd: 0, reserved_micro_usd: 0 });
   });
 
-  it("requires explicit high validation and preserves earlier charges when upgrading a completed low run", async () => {
-    const { database, env, sent, api, create } = setup();
+  it.each(["medium", "high"] as const)("requires explicit %s validation and preserves earlier charges when upgrading a completed low run", async (effort) => {
+    const { database, env, sent, explanations, api, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
     const efforts: string[] = [];
-    scorer.scoreSubmission.mockImplementation(async (_job: unknown, options: {
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult, options: {
       effort: string;
       beforeCall: (input: unknown) => Promise<string>;
       afterCall: (input: unknown) => Promise<void>;
@@ -286,56 +308,58 @@ describe("cloud queue runtime", () => {
       efforts.push(options.effort);
       const reservationId = await options.beforeCall({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
       await options.afterCall({ kind: "responses", model: "gpt-6.1-sol", reservationId, inputTokens: 100, outputTokens: 10, cachedInputTokens: 0, costUsd: 0.0003 });
-      return score();
+      return { ...fixed, usage: { ...fixed.usage, explanationModel: "gpt-6.1-sol", effort: options.effort } };
     });
     const created = await create("validation-upgrade", "validation");
     await processScoringMessage(sent[0], env);
+    await processExplanationMessage(explanations[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "completed", effort: "low", attempts: 1 });
     const before = database.changes();
-    expect((await create("validation-upgrade", "validation", "high")).response.status).toBe(200);
+    expect((await create("validation-upgrade", "validation", effort)).response.status).toBe(200);
     expect(database.changes()).toBe(before);
     expect(sent).toHaveLength(1);
     const path = `/api/submissions/${created.id}/retry`;
-    expect((await api(path, "POST", { confirm: true, effort: "high" })).status).toBe(401);
-    expect((await api(path, "POST", { confirm: false, effort: "high" }, true)).status).toBe(400);
+    expect((await api(path, "POST", { confirm: false, effort }, true)).status).toBe(400);
     expect((await api(path, "POST", { confirm: true }, true)).status).toBe(409);
     const requests = await Promise.all([
-      api(path, "POST", { confirm: true, effort: "high" }, true),
-      api(path, "POST", { confirm: true, effort: "high" }, true)
+      api(path, "POST", { confirm: true, effort }),
+      api(path, "POST", { confirm: true, effort })
     ]);
     expect(requests.map((response) => response.status).sort()).toEqual([202, 409]);
-    expect(sent).toHaveLength(2);
+    expect(sent).toHaveLength(1);
+    expect(explanations).toHaveLength(2);
     expect(database.account("validation")).toMatchObject({ spent_micro_usd: 300, reserved_micro_usd: 0 });
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM devday_judge_budget_reservations").get()).toMatchObject({ count: 1 });
     const requeued = database.changes();
     await processScoringMessage(sent[0], env);
     expect(database.changes()).toBe(requeued);
-    await Promise.all([processScoringMessage(sent[1], env), processScoringMessage(sent[1], env)]);
-    expect(efforts).toEqual(["low", "high"]);
-    expect(database.row(created.id)).toMatchObject({ status: "completed", effort: "high", attempts: 2 });
+    await Promise.all([processExplanationMessage(explanations[1], env), processExplanationMessage(explanations[1], env)]);
+    expect(efforts).toEqual(["low", effort]);
+    expect(database.row(created.id)).toMatchObject({ status: "completed", scoring_effort: effort, attempts: 1, explanation_dispatches: 2 });
     expect(database.account("validation")).toMatchObject({ spent_micro_usd: 600, reserved_micro_usd: 0 });
     expect(database.db.prepare("SELECT COUNT(*) AS count FROM devday_judge_budget_reservations").get()).toMatchObject({ count: 2 });
-    expect((await api(path, "POST", { confirm: true, effort: "high" }, true)).status).toBe(409);
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(2);
+    expect((await api(path, "POST", { confirm: true, effort }, true)).status).toBe(409);
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
+    expect(scorer.explainScoredSnapshot).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps production high and rejects unsupported efforts before any write or send", async () => {
+  it("keeps production medium and rejects unsupported efforts before any write or send", async () => {
     const { database, sent, api, create } = setup();
     const before = database.changes();
-    for (const effort of ["low", "light", null, 1]) {
+    for (const effort of ["low", "high", "light", null, 1]) {
       expect((await api("/api/submissions", "POST", { repoUrl: "https://github.com/example/production-effort", mode: "production", effort }, true)).status).toBe(400);
     }
     expect(database.changes()).toBe(before);
     expect(sent).toHaveLength(0);
     const created = await create("production-effort");
-    expect(database.row(created.id)).toMatchObject({ effort: "high" });
+    expect(database.row(created.id)).toMatchObject({ effort: "high", scoring_effort: "medium" });
     expect((await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true, effort: "high" }, true)).status).toBe(400);
   });
 
   it("recovers a stale queued delivery once while rejecting fresh queued retries", async () => {
     const { database, env, sent, api, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
-    scorer.scoreSubmission.mockResolvedValue(score());
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
     const created = await create("queued-recovery");
     const path = `/api/submissions/${created.id}/retry`;
     expect((await api(path, "POST", { confirm: true }, true)).status).toBe(409);
@@ -344,14 +368,14 @@ describe("cloud queue runtime", () => {
     expect(requests.map((response) => response.status).sort()).toEqual([202, 409]);
     expect(sent).toHaveLength(2);
     await Promise.all([processScoringMessage(sent[0], env), processScoringMessage(sent[1], env)]);
-    expect(scorer.scoreSubmission).toHaveBeenCalledTimes(1);
-    expect(database.row(created.id)).toMatchObject({ status: "completed", attempts: 1 });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(1);
+    expect(database.row(created.id)).toMatchObject({ status: "processing", explanation_status: "pending", attempts: 1 });
   });
 
   it("fails invalid scorer output without leaving a processing lease", async () => {
     const { database, env, sent, create } = setup();
     vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }, { id: "gpt-6-luna" }] })));
-    scorer.scoreSubmission.mockResolvedValue({ ...score(), total: 33 });
+    scorer.scoreSubmissionDecisions.mockResolvedValue({ ...score(), total: 33 });
     const created = await create("invalid-score");
     await processScoringMessage(sent[0], env);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 1 });
@@ -371,14 +395,14 @@ describe("cloud queue runtime", () => {
     expect(ack).toHaveBeenCalledTimes(1);
     expect(retry).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
     expect(database.row(created.id)).toMatchObject({ status: "queued", attempts: 0 });
   });
 
   it("consumes ambiguous send failures and stops concurrent retries after three dispatches", async () => {
     const { database, env, sent, api, create, setSendError } = setup();
     setSendError(true);
-    expect((await create("dispatch-failures")).response.status).toBe(503);
+    expect((await create("dispatch-failures")).response.status).toBe(202);
     const id = sent[0]!.submissionId;
     const path = `/api/submissions/${id}/retry`;
     const concurrent = await Promise.all([api(path, "POST", { confirm: true }, true), api(path, "POST", { confirm: true }, true)]);
@@ -394,7 +418,7 @@ describe("cloud queue runtime", () => {
     for (const message of sent) await processScoringMessage(message, env);
     expect(database.changes()).toBe(before);
     expect(sent).toHaveLength(3);
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
   });
 
   it("rejects an earlier dispatch after a paused attempt and bounds pause recovery sends", async () => {
@@ -419,16 +443,16 @@ describe("cloud queue runtime", () => {
     expect((await api(path, "POST", { confirm: true }, true)).status).toBe(409);
     expect(database.row(created.id)).toMatchObject({ status: "failed", attempts: 0, dispatch_count: 3 });
     expect(sent).toHaveLength(3);
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
   });
 
-  it("limits all sixty submission slots to one hundred eighty sends even when every send fails", async () => {
+  it("limits all eighty submission slots to two hundred forty sends even when every send fails", async () => {
     const { database, sent, api, create, setSendError } = setup();
     setSendError(true);
     for (const mode of ["production", "validation"] as const) {
-      const limit = mode === "production" ? 40 : 20;
+      const limit = 40;
       for (let index = 0; index < limit; index += 1) {
-        expect((await create(`all-failures-${mode}-${index}`, mode)).response.status).toBe(503);
+        expect((await create(`all-failures-${mode}-${index}`, mode)).response.status).toBe(202);
         const id = sent.at(-1)!.submissionId;
         const path = `/api/submissions/${id}/retry`;
         expect((await api(path, "POST", { confirm: true }, true)).status).toBe(503);
@@ -437,9 +461,288 @@ describe("cloud queue runtime", () => {
       }
       expect((await create(`overflow-${mode}`, mode)).response.status).toBe(429);
     }
-    expect(sent).toHaveLength(180);
+    expect(sent).toHaveLength(240);
     expect(database.db.prepare("SELECT COUNT(*) AS count, SUM(dispatch_count) AS dispatches, SUM(attempts) AS attempts FROM devday_judge_submissions").get())
-      .toMatchObject({ count: 60, dispatches: 180, attempts: 0 });
-    expect(scorer.scoreSubmission).not.toHaveBeenCalled();
+      .toMatchObject({ count: 80, dispatches: 240, attempts: 0 });
+    expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
+  });
+});
+
+describe("two-stage judging pipeline", () => {
+  beforeEach(() => {
+    scorer.scoreSubmissionDecisions.mockResolvedValue(score());
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult) => explained(fixed));
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      expect(url).toBe("https://api.openai.com/v1/models");
+      return Response.json({ data: [{ id: "gpt-6-luna" }] });
+    }));
+  });
+
+  it("publishes fixed ranking before reasons and preflights only the model for each independent queue", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create("early-ranking");
+    await processScoringMessage(sent[0], env);
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    const row = database.row(created.id);
+    expect(row).toMatchObject({ status: "processing", explanation_status: "pending", explanation_dispatches: 1, attempts: 1 });
+    expect(explanations).toEqual([{ type: "explain_submission", eventId: EVENT_ID, submissionId: created.id, attempt: 1, dispatch: 1 }]);
+    const dashboard = await (await api("/api/dashboard")).json() as { scoredCount: number; counts: unknown; ranking: unknown[]; batches: unknown[] };
+    expect(dashboard).toMatchObject({ scoredCount: 1, counts: { processing: 1, completed: 0, total: 1 }, ranking: [{ total: 32 }], batches: [{ scoredCount: 1, freezeRequestedAt: expect.any(String) }] });
+    const publicResult = await (await api(`/api/results/${created.id}`)).text();
+    expect(JSON.parse(publicResult)).toMatchObject({ frozenAt: row.frozen_at, scoredAt: row.scored_at, explanationStatus: "pending", result: { total: 32 } });
+    for (const privateValue of ["evidence_snapshot_json", "decisions_result_json", "callback_token", "scoring-secret", '"content"']) expect(publicResult).not.toContain(privateValue);
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      expect(url).toBe("https://api.openai.com/v1/models");
+      return Response.json({ data: [{ id: "gpt-6.1-sol" }] });
+    }));
+    const ack = vi.fn();
+    await worker.queue({ messages: [{ body: explanations[0], ack }] } as unknown as MessageBatch<ExplanationQueueMessage>, env, {} as ExecutionContext);
+    expect(ack).toHaveBeenCalledOnce();
+    expect(scorer.explainScoredSnapshot).toHaveBeenCalledWith(JSON.parse(row.evidence_snapshot_json!), JSON.parse(row.decisions_result_json!), expect.objectContaining({ effort: "medium" }));
+    expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "completed", scored_at: row.scored_at, frozen_at: row.frozen_at, callback_token: row.callback_token });
+    expect((JSON.parse(database.row(created.id).result_json!) as PublicScoreResult).usage).toMatchObject({ model: "gpt-6-luna", decisionsModel: "gpt-6-luna", explanationModel: "gpt-6.1-sol" });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+  });
+
+  it("does no writes, calls or sends for duplicate score or explanation deliveries and invalid explanation identities", async () => {
+    const { env, database, create, sent, explanations } = setup();
+    const created = await create("explanation-once");
+    await processScoringMessage(sent[0], env);
+    const before = database.changes();
+    await processScoringMessage(sent[0], env);
+    const original = explanations[0]!;
+    for (const message of [{ ...original, eventId: "wrong" }, { ...original, attempt: 0 }, { ...original, attempt: 2 }, { ...original, dispatch: 0 }, { ...original, dispatch: 2 }, { ...original, dispatch: 4 }, { ...original, extra: "invalid" }, { ...original, submissionId: "missing" }]) await processExplanationMessage(message, env);
+    expect(database.changes()).toBe(before);
+    expect(explanations).toHaveLength(1);
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    await Promise.all([processExplanationMessage(original, env), processExplanationMessage(original, env)]);
+    expect(database.row(created.id).explanation_status).toBe("completed");
+    const completed = database.changes();
+    await processExplanationMessage(original, env);
+    expect(database.changes()).toBe(completed);
+    expect(scorer.explainScoredSnapshot).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["sha", "scores", "assessment", "probability", "attack", "keys", "evidence", "model"])("rejects explanation mutation of %s while retaining scores and rank", async (field) => {
+    const { env, database, create, sent, explanations, api } = setup();
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult) => {
+      const result = explained(fixed);
+      if (field === "sha") result.pinnedSha = "b".repeat(40);
+      if (field === "scores") { result.criteria[0]!.score = 10; result.total += 2; }
+      if (field === "assessment") result.repoAssessment = "empty_repository";
+      if (field === "probability") result.attackProbability = 0.2;
+      if (field === "attack") result.attackScore = 90;
+      if (field === "keys") result.criteria[0]!.key = "ux";
+      if (field === "evidence") result.criteria[0]!.evidencePaths = ["not-collected.ts"];
+      if (field === "model") result.usage!.model = "gpt-6.1-sol";
+      return result;
+    });
+    const created = await create(`fixed-${field}`);
+    await processScoringMessage(sent[0], env);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    await processExplanationMessage(explanations[0], env);
+    const row = database.row(created.id);
+    expect(row).toMatchObject({ status: "completed", explanation_status: "failed", pinned_sha: "a".repeat(40) });
+    expect(JSON.parse(row.result_json!)).toEqual({ ...score(), reviewRequired: true });
+    expect(row.failure_message).toContain("Scores are retained");
+    expect(await (await api("/api/ranking")).json()).toMatchObject({ items: [{ total: 32, pinnedSha: "a".repeat(40) }] });
+    const before = database.changes();
+    const response = await callback(new Request("https://internal.invalid", { method: "POST", body: JSON.stringify({ submissionId: created.id, callbackToken: row.callback_token, outcome: { kind: "failed", message: "old scoring callback" } }) }), env);
+    expect(response.status).toBe(409);
+    expect(database.changes()).toBe(before);
+  });
+
+  it("retains ranking on Sol outage without invoking either scorer again", async () => {
+    const { env, database, create, sent, explanations } = setup();
+    const created = await create("sol-outage");
+    await processScoringMessage(sent[0], env);
+    await processExplanationMessage(explanations[0], env);
+    expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "failed" });
+    expect(JSON.parse(database.row(created.id).result_json!)).toMatchObject({ total: 32, reviewRequired: true });
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+  });
+
+  it("consumes ambiguous explanation sends before delivery and bounds concurrent explicit retries to three lifetime sends", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    env.EXPLANATION_QUEUE.send = async (message) => { explanations.push(message); throw new Error("ambiguous acceptance"); };
+    const created = await create("explanation-send-failures");
+    await processScoringMessage(sent[0], env);
+    const saved = database.row(created.id);
+    expect(saved).toMatchObject({ status: "completed", explanation_status: "failed", explanation_dispatches: 1 });
+    const path = `/api/submissions/${created.id}/retry`;
+    const responses = await Promise.all([api(path, "POST", { confirm: true }), api(path, "POST", { confirm: true })]);
+    expect(responses.map((response) => response.status).sort()).toEqual([409, 503]);
+    expect((await api(path, "POST", { confirm: true })).status).toBe(503);
+    const before = database.changes();
+    expect((await api(path, "POST", { confirm: true })).status).toBe(409);
+    for (const message of explanations) await processExplanationMessage(message, env);
+    expect(database.changes()).toBe(before);
+    expect(explanations.map((message) => message.dispatch)).toEqual([1, 2, 3]);
+    expect(database.row(created.id)).toMatchObject({ attempts: 1, dispatch_count: 1, explanation_dispatches: 3, callback_token: saved.callback_token, evidence_snapshot_json: saved.evidence_snapshot_json, decisions_result_json: saved.decisions_result_json, pinned_sha: saved.pinned_sha });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(1);
+  });
+
+  it.each(["pending", "processing"])("recovers stale %s reasons after 30 minutes with the same score, snapshot, attempt and token", async (status) => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create(`stale-${status}`);
+    await processScoringMessage(sent[0], env);
+    if (status === "processing") database.db.prepare("UPDATE devday_judge_submissions SET explanation_status = 'processing', explanation_started_at = ? WHERE id = ?").run(new Date().toISOString(), created.id);
+    const saved = database.row(created.id);
+    const path = `/api/submissions/${created.id}/retry`;
+    expect((await api(path, "POST", { confirm: true })).status).toBe(409);
+    vi.setSystemTime("2026-10-18T09:30:00.001Z");
+    const responses = await Promise.all([api(path, "POST", { confirm: true }), api(path, "POST", { confirm: true })]);
+    expect(responses.map((response) => response.status).sort()).toEqual([202, 409]);
+    const before = database.changes();
+    await processExplanationMessage(explanations[0], env);
+    expect(database.changes()).toBe(before);
+    expect(database.row(created.id)).toMatchObject({ result_json: saved.result_json, pinned_sha: saved.pinned_sha, callback_token: saved.callback_token, scored_at: saved.scored_at, evidence_snapshot_json: saved.evidence_snapshot_json, attempts: 1, explanation_dispatches: 2, explanation_status: "pending" });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+  });
+
+  it.each(["JUDGING_ENABLED", "SUBMISSIONS_OPEN"] as const)("blocks reason work and retries with %s disabled while retaining ranking", async (flag) => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create(`explain-paused-${flag.toLowerCase()}`);
+    await processScoringMessage(sent[0], env);
+    env[flag] = "false";
+    const beforeFetch = vi.mocked(fetch).mock.calls.length;
+    await processExplanationMessage(explanations[0], env);
+    expect(vi.mocked(fetch).mock.calls).toHaveLength(beforeFetch);
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "failed" });
+    expect((await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true })).status).toBe(410);
+    expect(await (await api("/api/ranking")).json()).toMatchObject({ items: [{ total: 32 }] });
+  });
+
+  it("stops reason billing at the exact budget cap without discarding Decisions scores", async () => {
+    const { env, database, create, sent, explanations } = setup();
+    const created = await create("explain-budget");
+    await processScoringMessage(sent[0], env);
+    database.db.prepare("UPDATE devday_judge_budget_accounts SET spent_micro_usd = limit_micro_usd WHERE mode = 'production'").run();
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    let paidCalls = 0;
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+      paidCalls++;
+      return explained(fixed);
+    });
+    await processExplanationMessage(explanations[0], env);
+    expect(paidCalls).toBe(0);
+    expect(database.row(created.id)).toMatchObject({ status: "completed", explanation_status: "failed", failure_message: "Budget exhausted" });
+    expect(JSON.parse(database.row(created.id).result_json!)).toMatchObject({ total: 32, reviewRequired: true });
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 90_000_000, reserved_micro_usd: 0 });
+  });
+
+  it("persists a maximum escaped snapshot internally without the callback body limit or public source leakage", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob) => ({
+      result: score(), snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
+        files: Array.from({ length: 10 }, (_, index) => ({ path: `source-${index}.ts`, size: 12_000, content: "\u0000".repeat(12_000), truncated: false })) }
+    }));
+    const created = await create("snapshot-size");
+    await processScoringMessage(sent[0], env);
+    const row = database.row(created.id);
+    expect(row).toMatchObject({ status: "processing", explanation_status: "pending" });
+    expect(new TextEncoder().encode(row.evidence_snapshot_json!).byteLength).toBeGreaterThan(700_000);
+    expect(new TextEncoder().encode(row.evidence_snapshot_json!).byteLength).toBeLessThan(850_000);
+    expect(explanations).toHaveLength(1);
+    const publicText = await (await api(`/api/results/${created.id}`)).text();
+    expect(publicText).not.toContain("source-0.ts");
+    expect(publicText.length).toBeLessThan(10_000);
+  });
+
+  it("rejects more than 120000 UTF8 evidence bytes without persisting or enqueueing the score", async () => {
+    const { env, database, create, sent, explanations } = setup();
+    scorer.scoreSubmissionDecisions.mockImplementation(async (job: LeaseJob) => ({
+      result: score(), snapshot: { repo: job.repo, pinnedSha: job.pinnedSha, defaultBranch: job.defaultBranch, summary: job.summary, assessment: "scored",
+        files: Array.from({ length: 11 }, (_, index) => ({ path: `source-${index}.ts`, size: 12_000, content: "あ".repeat(4000), truncated: false })) }
+    }));
+    const created = await create("snapshot-overflow");
+    await processScoringMessage(sent[0], env);
+    expect(database.row(created.id)).toMatchObject({ status: "failed", result_json: null, evidence_snapshot_json: null, explanation_dispatches: 0 });
+    expect(explanations).toHaveLength(0);
+  });
+
+  it("settles delayed explanation usage after a stale manual retry while rejecting old new reservations and result writes", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create("late-explanation-charge");
+    await processScoringMessage(sent[0], env);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    let release!: () => void;
+    let started!: () => void;
+    const waiting = new Promise<void>((resolve) => { release = resolve; });
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    let staleOptions!: ScoringOptions;
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, fixed: PublicScoreResult, options: ScoringOptions) => {
+      staleOptions = options;
+      const reservationId = await options.beforeCall!({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+      started();
+      await waiting;
+      await options.afterCall!({ kind: "responses", model: "gpt-6.1-sol", reservationId: reservationId!, inputTokens: 100, outputTokens: 10, cachedInputTokens: 0, costUsd: 0.0003 });
+      return explained(fixed);
+    });
+    const oldConsumer = processExplanationMessage(explanations[0], env);
+    await ready;
+    expect(database.account("production").reserved_micro_usd).toBe(1_000_000);
+    vi.setSystemTime("2026-10-18T09:31:00.000Z");
+    expect((await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true })).status).toBe(202);
+    const before = database.changes();
+    await expect(staleOptions.beforeCall!({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 })).rejects.toThrow("Budget reservation failed");
+    expect(database.changes()).toBe(before);
+    env.JUDGING_ENABLED = "false";
+    env.SUBMISSIONS_OPEN = "false";
+    release();
+    await oldConsumer;
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 300, reserved_micro_usd: 0 });
+    expect(database.row(created.id)).toMatchObject({ explanation_status: "pending", explanation_dispatches: 2, completed_at: null });
+    expect(JSON.parse(database.row(created.id).result_json!)).toEqual(score());
+    expect(database.db.prepare("SELECT status, actual_micro_usd FROM devday_judge_budget_reservations").get()).toEqual({ status: "settled", actual_micro_usd: 300 });
+  });
+
+  it("keeps an unresolved explanation reservation and scores after generation failure and retries reasons only", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    const created = await create("failed-explanation-charge");
+    await processScoringMessage(sent[0], env);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({ data: [{ id: "gpt-6.1-sol" }] })));
+    scorer.explainScoredSnapshot.mockImplementation(async (_snapshot: unknown, _fixed: PublicScoreResult, options: ScoringOptions) => {
+      await options.beforeCall!({ kind: "responses", model: "gpt-6.1-sol", maxInputTokens: 100, maxOutputTokens: 100, reservedUsd: 1 });
+      throw new Error("private provider error");
+    });
+    await processExplanationMessage(explanations[0], env);
+    expect(database.account("production")).toMatchObject({ spent_micro_usd: 0, reserved_micro_usd: 1_000_000 });
+    expect(database.row(created.id).failure_message).not.toContain("private");
+    expect((await api(`/api/submissions/${created.id}/retry`, "POST", { confirm: true })).status).toBe(202);
+    expect(database.account("production").reserved_micro_usd).toBe(1_000_000);
+    expect(database.row(created.id)).toMatchObject({ explanation_status: "pending", explanation_dispatches: 2, attempts: 1, pinned_sha: "a".repeat(40) });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledOnce();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("allows bounded reason retries after all three scoring attempts have been consumed", async () => {
+    const { env, database, create, sent, explanations, api } = setup();
+    scorer.scoreSubmissionDecisions.mockRejectedValueOnce(new Error("failure one")).mockRejectedValueOnce(new Error("failure two"));
+    const created = await create("last-score-attempt");
+    const path = `/api/submissions/${created.id}/retry`;
+    for (let index = 0; index < 2; index++) {
+      await processScoringMessage(sent[index], env);
+      expect((await api(path, "POST", { confirm: true })).status).toBe(202);
+    }
+    await processScoringMessage(sent[2], env);
+    expect(database.row(created.id)).toMatchObject({ attempts: 3, dispatch_count: 3, explanation_dispatches: 1, explanation_status: "pending" });
+    for (let index = 0; index < 3; index++) {
+      expect(explanations[index]).toMatchObject({ attempt: 3, dispatch: index + 1 });
+      await processExplanationMessage(explanations[index], env);
+      expect((await api(path, "POST", { confirm: true })).status).toBe(index < 2 ? 202 : 409);
+    }
+    expect(database.row(created.id)).toMatchObject({ attempts: 3, dispatch_count: 3, explanation_dispatches: 3, explanation_status: "failed" });
+    expect(scorer.scoreSubmissionDecisions).toHaveBeenCalledTimes(3);
+    expect(scorer.explainScoredSnapshot).not.toHaveBeenCalled();
+    expect(sent).toHaveLength(3);
+    expect(explanations).toHaveLength(3);
   });
 });
