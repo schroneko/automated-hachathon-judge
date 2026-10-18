@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CRITERIA, EVENT_ID } from "../src/shared/constants";
+import { CRITERIA, EVENT_ID, PRODUCTION_SUBMISSION_LIMIT, VALIDATION_SUBMISSION_LIMIT } from "../src/shared/constants";
 import { implementationEligibility, prepareFullSourceSnapshot } from "../src/shared/validation";
 import type { ExplanationQueueMessage, FreezeQueueMessage, LeaseJob, PublicScoreResult, RecoveryQueueMessage, RepoEvidenceSnapshot, ScoringQueueMessage } from "../src/shared/types";
 import type { ScoringOptions } from "../src/container/scorer";
@@ -608,11 +608,11 @@ describe("cloud queue runtime", () => {
     expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
   });
 
-  it("limits all eighty submission slots to two hundred forty sends even when every send fails", async () => {
+  it("bounds sends for every submission slot even when every send fails", async () => {
     const { database, sent, api, create, setSendError } = setup();
     setSendError(true);
     for (const mode of ["production", "validation"] as const) {
-      const limit = 40;
+      const limit = mode === "production" ? PRODUCTION_SUBMISSION_LIMIT : VALIDATION_SUBMISSION_LIMIT;
       for (let index = 0; index < limit; index += 1) {
         expect((await create(`all-failures-${mode}-${index}`, mode)).response.status).toBe(202);
         const id = sent.at(-1)!.submissionId;
@@ -623,9 +623,10 @@ describe("cloud queue runtime", () => {
       }
       expect((await create(`overflow-${mode}`, mode)).response.status).toBe(429);
     }
-    expect(sent).toHaveLength(240);
+    const slots = PRODUCTION_SUBMISSION_LIMIT + VALIDATION_SUBMISSION_LIMIT;
+    expect(sent).toHaveLength(slots * 3);
     expect(database.db.prepare("SELECT COUNT(*) AS count, SUM(dispatch_count) AS dispatches, SUM(attempts) AS attempts FROM devday_judge_submissions").get())
-      .toMatchObject({ count: 80, dispatches: 240, attempts: 0 });
+      .toMatchObject({ count: slots, dispatches: slots * 3, attempts: 0 });
     expect(scorer.scoreSubmissionDecisions).not.toHaveBeenCalled();
   });
 });

@@ -1,4 +1,4 @@
-import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, TARGET_TEAMS } from "../shared/constants";
+import { API_BODY_LIMIT_BYTES, CALLBACK_BODY_LIMIT_BYTES, EVENT_DATE, EVENT_ID, EVENT_NAME, FINALIST_COUNT, PRODUCTION_SUBMISSION_LIMIT, TARGET_TEAMS, VALIDATION_SUBMISSION_LIMIT } from "../shared/constants";
 import { jsonResponse } from "../shared/json";
 import { calculateUsageCost, quoteReservation } from "../shared/pricing";
 import { validatePublicScoreResult } from "../shared/validation";
@@ -341,7 +341,7 @@ async function dashboard(env: Env): Promise<Response> {
   const cutoffScore = entries.length >= FINALIST_COUNT ? entries[FINALIST_COUNT - 1]!.total : null;
   const tiedCount = cutoffScore === null ? 0 : entries.filter((entry) => entry.total === cutoffScore).length;
   return jsonResponse({
-    event: { id: EVENT_ID, name: EVENT_NAME, date: EVENT_DATE, targetTeams: TARGET_TEAMS, finalistCount: FINALIST_COUNT },
+    event: { id: EVENT_ID, name: EVENT_NAME, date: EVENT_DATE, targetTeams: TARGET_TEAMS, finalistCount: FINALIST_COUNT, submissionLimits: { production: PRODUCTION_SUBMISSION_LIMIT, validation: VALIDATION_SUBMISSION_LIMIT } },
     open: submissionsOpen(env),
     counts,
     scoredCount: production.filter((item) => item.result !== null).length,

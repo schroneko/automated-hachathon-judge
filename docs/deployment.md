@@ -11,7 +11,7 @@ wrangler whoami
 
 `wrangler.jsonc` の `JUDGE_DB` は既存の共有D1 `wordplay-arcade-budget`、`SCORING_QUEUE` と `EXPLANATION_QUEUE` は作成済みの採点Queue `devday-judge-20261018` と理由生成Queue `devday-judge-explanations-20261018` を参照します。再作成は不要です。D1は `devday_judge_` 専用テーブルと `devday_judge_migrations` だけを使い、既存サービスのテーブルとデータを削除・変更しません。
 
-Queue consumerの設定はbatch 1、同時8件、自動再試行0です。各審査の試行と送信は最大3回、本番40件・検証40件の合計で採点メッセージは最大240回に制限します。
+Queue consumerの設定はbatch 1、同時8件、自動再試行0です。各審査の試行と送信は最大3回、本番40件・検証100件の合計で採点メッセージは最大420回に制限します。
 
 ```bash
 wrangler d1 migrations apply JUDGE_DB --remote
@@ -78,4 +78,4 @@ curl -fsS https://hackathon.nukoevi.app/api/dashboard
 
 ## Event data
 
-受付は本番40件・検証40件で制限します。イベント後は受付と採点を停止し、CSV・JSONを書き出します。D1の保存期間はイベント後90日を目安とし、削除する専用テーブルと影響は別途確認します。無期限保存や自動削除を前提にしません。共有D1そのものや旧Durable Objectは削除しません。
+受付は本番40件・検証100件で制限します。イベント後は受付と採点を停止し、CSV・JSONを書き出します。D1の保存期間はイベント後90日を目安とし、削除する専用テーブルと影響は別途確認します。無期限保存や自動削除を前提にしません。共有D1そのものや旧Durable Objectは削除しません。

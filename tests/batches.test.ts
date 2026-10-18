@@ -3,7 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { CRITERIA, JUDGING_START_ISO, SUBMISSION_DEADLINE_ISO } from "../src/shared/constants";
+import { CRITERIA, JUDGING_START_ISO, PRODUCTION_SUBMISSION_LIMIT, SUBMISSION_DEADLINE_ISO, VALIDATION_SUBMISSION_LIMIT } from "../src/shared/constants";
 import { validatePublicScoreResult } from "../src/shared/validation";
 import type { FreezeQueueMessage, JudgeQueueMessage, PublicBatchRecord, PublicSubmissionRecord, RepoResolution, ScoringQueueMessage } from "../src/shared/types";
 import { callback, claimQueueMessage, handleApiRequest, reserve, settle } from "../src/worker/api";
@@ -216,21 +216,47 @@ describe("batch admission", () => {
     expect((await create(input(1, "validation"))).response.status).toBe(202);
   });
 
-  it("atomically enforces forty per mode under concurrent admission and duplicate repositories", async () => {
+  it("atomically enforces mode-specific caps under concurrent admission and duplicate repositories", async () => {
     const { create, database, messages } = setup();
+    let admittedBatches = 0;
     for (const mode of ["production", "validation"] as const) {
-      expect((await create(input(30, mode, "first"))).response.status).toBe(202);
+      const limit = mode === "production" ? PRODUCTION_SUBMISSION_LIMIT : VALIDATION_SUBMISSION_LIMIT;
+      for (let offset = 0; offset < limit - 10; offset += 30) {
+        expect((await create(input(Math.min(30, limit - 10 - offset), mode, `first-${offset}`))).response.status).toBe(202);
+        admittedBatches++;
+      }
       const competing = await Promise.all([create(input(10, mode, "second")), create(input(10, mode, "third"))]);
       expect(competing.map((result) => result.response.status).sort()).toEqual([202, 429]);
+      admittedBatches++;
       expect((await create(input(1, mode, "overflow"))).response.status).toBe(429);
-      expect((await create(input(2, mode, "first"))).response.status).toBe(409);
+      expect((await create(input(2, mode, "first-0"))).response.status).toBe(409);
     }
-    expect(database.rows()).toHaveLength(80);
-    expect(messages).toHaveLength(4);
+    expect(database.rows()).toHaveLength(PRODUCTION_SUBMISSION_LIMIT + VALIDATION_SUBMISSION_LIMIT);
+    expect(messages).toHaveLength(admittedBatches);
     const fresh = setup();
     const duplicates = await Promise.all([fresh.create(input(2)), fresh.create(input(2))]);
     expect(duplicates.map((result) => result.response.status).sort()).toEqual([202, 409]);
     expect(fresh.database.rows()).toHaveLength(2);
+  });
+
+  it("accepts thirty new validation submissions after thirty-three existing results without using production capacity", async () => {
+    const { create, database, call } = setup();
+    expect((await create(input(30, "validation", "previous"))).response.status).toBe(202);
+    expect((await create(input(3, "validation", "additional"))).response.status).toBe(202);
+    const next = await create(input(30, "validation", "manual-test"));
+    expect(next.response.status).toBe(202);
+    expect(next.payload.submissions).toHaveLength(30);
+    expect(database.rows().filter((row) => row.mode === "validation")).toHaveLength(63);
+    expect(database.rows().filter((row) => row.mode === "production")).toHaveLength(0);
+    const account = database.db.prepare("SELECT mode, limit_micro_usd, spent_micro_usd, reserved_micro_usd FROM devday_judge_budget_accounts ORDER BY mode").all();
+    expect(account).toEqual([
+      { mode: "production", limit_micro_usd: 90_000_000, spent_micro_usd: 0, reserved_micro_usd: 0 },
+      { mode: "validation", limit_micro_usd: 20_000_000, spent_micro_usd: 0, reserved_micro_usd: 0 }
+    ]);
+    const before = database.changes();
+    const dashboard = await (await call("/api/dashboard")).json();
+    expect(dashboard).toMatchObject({ event: { submissionLimits: { production: 40, validation: 100 } }, counts: { total: 0 }, ranking: [] });
+    expect(database.changes()).toBe(before);
   });
 
   it("rolls back the entire admission when a member insert fails", async () => {
@@ -251,16 +277,20 @@ describe("batch admission", () => {
     expect(messages).toHaveLength(1);
   });
 
-  it("keeps an eighty-batch dashboard read bounded and write-free", async () => {
+  it("keeps a full-capacity dashboard read bounded and write-free", async () => {
     const { create, call, database, env } = setup();
-    for (const mode of ["production", "validation"] as const) for (let i = 0; i < 40; i++) await create(input(1, mode, `batch-${i}`));
+    for (const mode of ["production", "validation"] as const) {
+      const limit = mode === "production" ? PRODUCTION_SUBMISSION_LIMIT : VALIDATION_SUBMISSION_LIMIT;
+      for (let i = 0; i < limit; i++) await create(input(1, mode, `batch-${i}`));
+    }
+    const total = PRODUCTION_SUBMISSION_LIMIT + VALIDATION_SUBMISSION_LIMIT;
     const before = database.changes();
     database.queries = 0;
     const response = await call("/api/dashboard");
-    expect((await response.json() as { batches: unknown[] }).batches).toHaveLength(80);
+    expect((await response.json() as { batches: unknown[] }).batches).toHaveLength(total);
     expect(database.queries).toBeLessThanOrEqual(5);
     database.queries = 0;
-    expect(await listBatches(env)).toHaveLength(80);
+    expect(await listBatches(env)).toHaveLength(total);
     expect(database.queries).toBeLessThanOrEqual(2);
     expect(database.changes()).toBe(before);
   });

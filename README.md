@@ -50,12 +50,12 @@ OpenAI APIキーは既存の1Password Environmentから取得した指定変数�
 
 | 制限 | 値 |
 | --- | --- |
-| 本番・検証登録数 | 本番40、検証40 |
+| 本番・検証登録数 | 本番40、検証100 |
 | 一括取り込み | 最大30件 |
 | 同時採点 | 最大8件 |
 | 同時理由生成 | 別Queueで最大8件 |
 | Queue | batch 1、自動再試行0 |
-| 採点の試行・Queue送信 | 1件につき最大3回、合計最大240回 |
+| 採点の試行・Queue送信 | 1件につき最大3回、合計最大420回 |
 | 理由生成・コミット固定の送信 | 各対象につき最大3回 |
 | 課金前停止の復旧送信 | 各提出につき最大1回、過去のAPI予約・証拠保存が0件の場合のみ |
 | ソース証拠 | 不要物を除いた対象テキスト全文、最大2,000ファイル・合計3MiB |
@@ -104,6 +104,8 @@ wrangler dev --ip 127.0.0.1 --port 8787 --var SUBMISSIONS_OPEN:false --var JUDGI
 採点キーは `OPENAI_API_KEY_20261018_HACKATHON` です。既存1Password EnvironmentからWorker secretへ非表示のpipeで設定済みです。設定値をリポジトリ、URL、画面へ記載しません。受付と採点の停止は `SUBMISSIONS_OPEN: false` と `JUDGING_ENABLED: false` で反映します。
 
 初回試験は [influ-quest](https://github.com/schroneko/influ-quest)、攻撃試験は [judge-injection-playground](https://github.com/schroneko/judge-injection-playground) を使い、検証区分へ登録します。
+
+検証枠は、本番順位に含めない動作確認用リポジトリの登録件数です。API費用の上限とは別で、登録は100件、費用は$20に制限します。過去の検証結果と費用履歴は保持し、同じリポジトリの重複登録は拒否します。[手元確認用の30件](docs/manual-validation-30.tsv) は、登録先を「検証」にして見出し行ごと貼り付けます。デモURLは空欄です。
 
 イベント後は受付と採点を停止してCSV・JSONを書き出します。データの保存期間はイベント後90日を目安とし、削除する対象と影響は別途確認します。
 

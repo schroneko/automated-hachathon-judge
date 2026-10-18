@@ -8,7 +8,7 @@ vi.mock("../src/container/github", () => ({ resolveRepoAuthority: vi.fn(async ()
 
 beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); vi.setSystemTime("2026-10-18T09:00:00.000Z"); });
 afterEach(() => { vi.useRealTimers(); });
-import { CRITERIA } from "../src/shared/constants";
+import { CRITERIA, PRODUCTION_SUBMISSION_LIMIT, VALIDATION_SUBMISSION_LIMIT } from "../src/shared/constants";
 import { callback, claimQueueMessage, claimRecoveryMessage, handleApiRequest, reserve, settle, validRecoveryMessage } from "../src/worker/api";
 import type { RecoveryQueueMessage } from "../src/shared/types";
 import { EVENT_ID } from "../src/shared/constants";
@@ -310,11 +310,11 @@ describe("D1 runtime API", () => {
 
   it("enforces separate production and validation submission caps", async () => {
     const { call } = setup();
-    for (let index = 0; index < 40; index += 1) {
+    for (let index = 0; index < PRODUCTION_SUBMISSION_LIMIT; index += 1) {
       expect((await submit(call, `production-${index}`)).status).toBe(202);
     }
     expect((await submit(call, "overflow")).status).toBe(429);
-    for (let index = 0; index < 40; index += 1) {
+    for (let index = 0; index < VALIDATION_SUBMISSION_LIMIT; index += 1) {
       expect((await submit(call, `validation-${index}`, "validation")).status).toBe(202);
     }
     expect((await submit(call, "validation-overflow", "validation")).status).toBe(429);
@@ -326,7 +326,7 @@ describe("D1 runtime API", () => {
     const before = database.changes();
     const dashboard = await call("/api/dashboard");
     expect(dashboard.status).toBe(200);
-    expect((await dashboard.json() as { budget: { limitUsd: number }; runner: { online: boolean } }).budget.limitUsd).toBe(90);
+    expect(await dashboard.json()).toMatchObject({ event: { submissionLimits: { production: 40, validation: 100 } }, budget: { limitUsd: 90 } });
     expect((await call("/internal/runner/claim", "POST", {}, true)).status).toBe(204);
     await call("/api/ranking");
     await call("/api/recent");
