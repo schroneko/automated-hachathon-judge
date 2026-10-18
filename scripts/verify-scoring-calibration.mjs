@@ -106,6 +106,7 @@ export { calculateUsageCost, quoteReservation } from './src/shared/pricing.ts';
 export { buildDecisionsQuestions, buildExplanationPrompt } from './src/shared/prompt.ts';
 export { RUBRIC_VERSION } from './src/shared/rubric.ts';
 export { DEVDAY_REFERENCE_VERSION } from './src/shared/devday-reference.ts';
+export { SHARED_CONTENT_INSTRUCTIONS } from './src/shared/model-evidence.ts';
 export { CALIBRATION_CASES } from './tests/calibration-cases.ts';`,
       resolveDir: fileURLToPath(new URL("../", import.meta.url)), sourcefile: "calibration-entry.ts", loader: "ts" } });
   return import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`);
@@ -305,6 +306,8 @@ async function main() {
   report.policy = {
     rubricVersion: modules.RUBRIC_VERSION,
     referenceVersion: modules.DEVDAY_REFERENCE_VERSION,
+    evidenceEncoding: "exact-content-references-v1",
+    encodingInstructionsHash: createHash("sha256").update(modules.SHARED_CONTENT_INSTRUCTIONS).digest("hex"),
     promptHash: createHash("sha256").update(JSON.stringify({
       questions: modules.buildDecisionsQuestions(), explanation: modules.buildExplanationPrompt()
     })).digest("hex")

@@ -4,6 +4,7 @@ import { CRITERIA, MAX_EVIDENCE_FILE_BYTES, MAX_EVIDENCE_TOTAL_BYTES } from "../
 import { SCORE_LEVELS } from "../src/shared/rubric";
 import { prepareFullSourceSnapshot } from "../src/shared/validation";
 import { quoteReservation } from "../src/shared/pricing";
+import { SHARED_CONTENT_INSTRUCTIONS } from "../src/shared/model-evidence";
 import { fetchRepoEvidence, resolveRepoEvidence } from "../src/container/github";
 import type { ApiReservation, ApiUsage, LeaseJob, PublicScoreResult, RepoEvidenceSnapshot, RepoResolution } from "../src/shared/types";
 
@@ -329,6 +330,70 @@ describe("scoreSnapshotWithDecisions", () => {
     expect(result.usage).toMatchObject((await prepareFullSourceSnapshot(source)).metadata);
     expect(result.usage?.sourceBytes).toBeGreaterThan(120000);
     expect(result.usage?.requestIds).toEqual(["req-1", "req-2"]);
+  });
+
+  it("packs repeated content identically for both model stages and counters while preserving canonical authority", async () => {
+    const content = "export function greet(name: string) { return `Hello ${name}`; }\n";
+    const source = snapshot();
+    source.files = ["src/main.ts", "src/replica.ts"].map((path) => ({ path, content, size: new TextEncoder().encode(content).length, truncated: false }));
+    const original = structuredClone(source);
+    const value = judgment();
+    value.criteria = value.criteria.map((item) => ({ ...item, reason: "src/replica.tsの実装を確認。次段階の条件を裏づける利用例は不足しています。", evidencePaths: ["src/replica.ts"] }));
+    const calls = mockCalls(decisions(), responses(value));
+    const persisted: RepoEvidenceSnapshot[] = [];
+    const settings = options(calls.fetch, { beforeSnapshot: async (canonical) => { persisted.push(canonical); } });
+    const prepared = await prepareFullSourceSnapshot(source);
+    const canonical = JSON.parse(prepared.serialized) as RepoEvidenceSnapshot;
+    const packed = {
+      ...canonical,
+      files: [canonical.files[0], { path: "src/replica.ts", size: source.files[1]!.size, truncated: false, sameContentAs: "src/main.ts" }]
+    };
+    const fixed = await scoreSnapshotWithDecisions(source, settings);
+    const result = await explainScoredSnapshot(source, fixed, settings);
+    expect(persisted).toEqual([canonical]);
+    expect(persisted[0]!.files.map((file) => file.content)).toEqual([content, content]);
+    expect(JSON.parse(calls.bodies[0]!.input as string)).toEqual(packed);
+    const questions = calls.bodies[0]!.questions as Array<{ instructions: string }>;
+    expect(questions.every((question) => question.instructions.includes(SHARED_CONTENT_INSTRUCTIONS))).toBe(true);
+    const decisionCounter = calls.counters[0]!.input as Array<{ role: string; content: string }>;
+    expect(JSON.parse(decisionCounter[0]!.content)).toEqual(questions);
+    expect(JSON.parse(decisionCounter[1]!.content)).toEqual(packed);
+    for (const body of [calls.counters[1]!, calls.counters[2]!, calls.bodies[1]!]) {
+      const input = body.input as Array<{ role: string; content: string }>;
+      expect(input[0]!.content).toContain(SHARED_CONTENT_INSTRUCTIONS);
+      expect(JSON.parse(input[1]!.content).snapshot).toEqual(packed);
+    }
+    expect(calls.counters[2]!.input).toEqual(calls.bodies[1]!.input);
+    expect(calls.order).toEqual(["input_tokens", "input_tokens", "decisions", "input_tokens", "responses"]);
+    expect(result.criteria.map((item) => item.evidencePaths)).toEqual(CRITERIA.map(() => ["src/replica.ts"]));
+    expect(result.criteria.map((item) => item.score)).toEqual(fixed.criteria.map((item) => item.score));
+    expect(result).toMatchObject({ total: fixed.total, pinnedSha: sha, eligibility: fixed.eligibility, attackScore: fixed.attackScore, attackProbability: fixed.attackProbability });
+    expect(fixed.usage).toMatchObject(prepared.metadata);
+    expect(result.usage).toMatchObject(prepared.metadata);
+    expect(source).toEqual(original);
+  });
+
+  it.each([0, 1])("blocks packed evidence before persistence or paid reservation when counter %s exceeds capacity", async (failingCounter) => {
+    const content = "export const answer = () => 42;\n";
+    const source = snapshot();
+    source.files = ["src/main.ts", "src/replica.ts"].map((path) => ({ path, content, size: content.length, truncated: false }));
+    const calls = mockCalls(decisions(), responses(), (body, index) => ({ model: body.model, input_tokens: index === failingCounter ? 900000 : 1000 }));
+    const beforeCall = vi.fn();
+    const afterCall = vi.fn();
+    const beforeSnapshot = vi.fn();
+    await expect(scoreSnapshotWithDecisions(source, options(calls.fetch, { beforeCall, afterCall, beforeSnapshot }))).rejects.toThrow(/conservative/);
+    expect(calls.counters).toHaveLength(failingCounter + 1);
+    for (const [index, body] of calls.counters.entries()) {
+      const input = body.input as Array<{ role: string; content: string }>;
+      const user = JSON.parse(input[1]!.content);
+      const evidence = index === 0 ? user : user.snapshot;
+      expect(evidence.files[1]).toMatchObject({ path: "src/replica.ts", sameContentAs: "src/main.ts" });
+      expect(evidence.files[1]).not.toHaveProperty("content");
+    }
+    expect(calls.bodies).toHaveLength(0);
+    expect(beforeSnapshot).not.toHaveBeenCalled();
+    expect(beforeCall).not.toHaveBeenCalled();
+    expect(afterCall).not.toHaveBeenCalled();
   });
 
   it("persists the canonical snapshot once after both preflights and before paid reservation", async () => {

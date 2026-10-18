@@ -1,6 +1,7 @@
 import { CRITERIA } from "../shared/constants";
 import { visibleAttackScore, validateAttackProbability } from "../shared/attack-score";
 import { buildDecisionsQuestions, buildExplanationPrompt, DECISION_SCORE_LEVELS } from "../shared/prompt";
+import { packModelEvidence, SHARED_CONTENT_INSTRUCTIONS } from "../shared/model-evidence";
 import { DEVDAY_REFERENCE_VERSION } from "../shared/devday-reference";
 import { RUBRIC_VERSION } from "../shared/rubric";
 import { explanationModelResultSchema, explanationOutputSchema, implementationEligibility, prepareFullSourceSnapshot, validatePublicScoreResult } from "../shared/validation";
@@ -75,17 +76,20 @@ async function scoreCanonicalSnapshot(source: RepoEvidenceSnapshot, options: Sco
 
   const { key, effort } = scoringSettings(options);
   const fetcher = options.fetch ?? globalThis.fetch;
-  const questions = buildDecisionsQuestions(options.trustedFeatureReference);
+  const modelEvidence = packModelEvidence(snapshot);
+  const modelSource = modelEvidence.shared ? JSON.stringify(modelEvidence.data) : prepared.serialized;
+  const baseQuestions = buildDecisionsQuestions(options.trustedFeatureReference);
+  const questions = modelEvidence.shared ? baseQuestions.map((question) => ({ ...question, instructions: `${question.instructions}\n${SHARED_CONTENT_INSTRUCTIONS}` })) : baseQuestions;
   const decisionsBody = {
     model: DECISIONS_MODEL,
-    input: prepared.serialized,
+    input: modelSource,
     questions
   };
   const maxInputTokens = await countInput({
     model: DECISIONS_MODEL,
     input: [
       { role: "developer", content: JSON.stringify(questions) },
-      { role: "user", content: prepared.serialized }
+      { role: "user", content: modelSource }
     ]
   }, 0, key, fetcher);
   const future = explanationBody(snapshot, {
@@ -213,14 +217,16 @@ function scoringSettings(options: ScoringOptions) {
 }
 
 function explanationBody(snapshot: RepoEvidenceSnapshot, fixedScores: object, reference: string | undefined, effort: "low" | "medium" | "high", version = RUBRIC_VERSION) {
+  const modelEvidence = packModelEvidence(snapshot);
+  const prompt = buildExplanationPrompt(reference, version);
   return {
     model: RESPONSES_MODEL,
     reasoning: { effort },
     max_output_tokens: effort === "low" ? 6000 : effort === "medium" ? 8192 : 12000,
     store: false,
     input: [
-      { role: "developer", content: buildExplanationPrompt(reference, version) },
-      { role: "user", content: JSON.stringify({ snapshot, fixedScores }) }
+      { role: "developer", content: modelEvidence.shared ? `${prompt}\n\n${SHARED_CONTENT_INSTRUCTIONS}` : prompt },
+      { role: "user", content: JSON.stringify({ snapshot: modelEvidence.data, fixedScores }) }
     ],
     text: { format: { type: "json_schema", name: "hackathon_explanation", strict: true, schema: explanationOutputSchema } }
   };
