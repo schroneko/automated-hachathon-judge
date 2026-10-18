@@ -23,7 +23,8 @@ export async function processScoringMessage(value: unknown, env: Env): Promise<v
     return;
   } catch (error) {
     const message = failureMessage(error, stage === "validation" ? "The scoring result failed validation. Review and retry manually." : "Scoring failed. Review the submission and retry manually.");
-    const diagnostic = error instanceof Error && /^(GitHub API failed with status [0-9]{3}|Pinned GitHub tree was not found|Pinned GitHub tree is truncated or malformed|Pinned repository has no readable source evidence|OpenAI request returned status [0-9]{3}|API request exceeds short-context input bound)$/.test(error.message) ? error.message : error instanceof Error ? error.name : "UnknownError";
+    const upstreamStatus = error instanceof Error ? /^(GitHub (?:API|raw|public refs) (?:fetch )?failed with status [0-9]{3})(?:;|$)/.exec(error.message)?.[1] : undefined;
+    const diagnostic = upstreamStatus ?? (error instanceof Error && /^(GitHub (?:API|raw|public refs) redirected from canonical repository|Pinned GitHub tree was not found|Pinned GitHub tree is truncated or malformed|Pinned repository has no readable source evidence|OpenAI request returned status [0-9]{3}|API request exceeds short-context input bound)$/.test(error.message) ? error.message : error instanceof Error ? error.name : "UnknownError");
     console.error(JSON.stringify({ event: "judging_failed", submissionId: job.submissionId, stage, message, diagnostic }));
     const response = await callback(internalRequest({ submissionId: job.submissionId, callbackToken: job.callbackToken, outcome: { kind: "failed", message } }), env);
     if (!response.ok && response.status !== 403 && response.status !== 409) throw new Error("Scoring finalization failed");
