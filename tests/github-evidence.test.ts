@@ -28,11 +28,13 @@ function refsResponse(body: BodyInit = advertisement(), init: ResponseInit = {})
   return new Response(body, { ...init, headers: { "content-type": "application/x-git-upload-pack-advertisement", ...init.headers } });
 }
 
-function stubGithub(entries: Array<{ path: string; content: string; size?: number }>, options: { refs?: Response; tree?: Response } = {}) {
-  const fetch = vi.fn(async (input: string | URL, _init?: RequestInit) => {
+function stubGithub(entries: Array<{ path: string; content: string; size?: number }>, options: { refs?: Response; tree?: Response; raw?: Response } = {}) {
+  const fetch = vi.fn(async (input: string | URL, init?: RequestInit) => {
+    if (init?.redirect === "error") throw new TypeError("Invalid redirect value, must be follow or manual");
     const url = String(input);
     if (url === refsUrl) return options.refs ?? refsResponse();
     if (url.includes("/git/trees/")) return options.tree ?? new Response(JSON.stringify({ truncated: false, tree: entries.map((entry) => ({ path: entry.path, type: "blob", size: entry.size ?? encoder.encode(entry.content).length })) }));
+    if (options.raw) return options.raw;
     const entry = entries.find((item) => url.endsWith(item.path));
     return new Response(entry?.content ?? "", { headers: { "content-type": "text/plain; charset=utf-8" } });
   });
@@ -47,7 +49,7 @@ describe("GitHub evidence authority", () => {
     expect(result).toMatchObject({ assessment: "scored", pinnedSha: sha, defaultBranch: "main" });
     expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([refsUrl, `https://api.github.com/repos/demo/project/git/trees/${sha}?recursive=1`, `https://raw.githubusercontent.com/demo/project/${sha}/src/main.ts`]);
     expect(fetch.mock.calls.filter(([url]) => String(url).startsWith("https://api.github.com"))).toHaveLength(1);
-    expect(fetch.mock.calls[0][1]).toMatchObject({ redirect: "error" });
+    expect(fetch.mock.calls.every(([, init]) => init?.redirect === "manual")).toBe(true);
     expect(JSON.stringify(fetch.mock.calls.map(([, init]) => init)).toLowerCase()).not.toMatch(/authorization|git-protocol/);
   });
 
@@ -123,8 +125,31 @@ describe("GitHub evidence authority", () => {
     for (const refs of [redirected, changed, new Response("<html>login</html>", { headers: { "content-type": "text/html" } })]) {
       const fetch = stubGithub([], { refs });
       await expect(resolveRepoEvidence(repo, "summary")).rejects.toThrow();
-      expect(fetch.mock.calls[0][1]).toMatchObject({ redirect: "error" });
+      expect(fetch.mock.calls[0][1]).toMatchObject({ redirect: "manual" });
       expect(fetch).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it.each([
+    ["refs", 301, 1], ["refs", 302, 1], ["refs", 307, 1], ["refs", 308, 1],
+    ["tree", 301, 2], ["tree", 302, 2], ["tree", 307, 2], ["tree", 308, 2],
+    ["raw", 301, 3], ["raw", 302, 3], ["raw", 307, 3], ["raw", 308, 3]
+  ] as const)("rejects %s status %i without following its Location", async (stage, status, calls) => {
+    const location = "https://attacker.example/replaced-evidence";
+    const response = new Response("redirected evidence", { status, headers: { location } });
+    const fetch = stubGithub([{ path: "README.md", content: "pinned source" }], { [stage]: response });
+    await expect(resolveRepoEvidence(repo, "summary")).rejects.toThrow(/redirected from canonical repository/);
+    expect(fetch).toHaveBeenCalledTimes(calls);
+    expect(fetch.mock.calls.every(([url, init]) => String(url) !== location && init?.redirect === "manual")).toBe(true);
+  });
+
+  it.each(["tree", "raw"] as const)("rejects changed canonical %s authority even with a successful status", async (stage) => {
+    for (const changed of ["url", "redirected"] as const) {
+      const response = new Response("changed source", { headers: { "content-type": "text/plain" } });
+      Object.defineProperty(response, changed, { value: changed === "url" ? "https://attacker.example/replaced-evidence" : true });
+      const fetch = stubGithub([{ path: "README.md", content: "pinned source" }], { [stage]: response });
+      await expect(resolveRepoEvidence(repo, "summary")).rejects.toThrow(/redirected from canonical repository/);
+      expect(fetch).toHaveBeenCalledTimes(stage === "tree" ? 2 : 3);
     }
   });
 

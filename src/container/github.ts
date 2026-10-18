@@ -122,10 +122,13 @@ async function fetchEvidenceFiles(
     if (totalBytes >= MAX_EVIDENCE_TOTAL_BYTES) {
       break;
     }
-    const response = await fetch(`${RAW_BASE}/${repo.owner}/${repo.repo}/${sha}/${file.path.split("/").map(encodeURIComponent).join("/")}`, {
+    const url = `${RAW_BASE}/${repo.owner}/${repo.repo}/${sha}/${file.path.split("/").map(encodeURIComponent).join("/")}`;
+    const response = await fetch(url, {
       headers: { "user-agent": "automated-hachathon-judge" },
+      redirect: "manual",
       signal
     });
+    assertCanonicalResponse(response, url, "GitHub raw");
     if (!response.ok) {
       if (isRetryableStatus(response.status)) {
         throw new RetryableGithubError(`GitHub raw fetch failed with status ${response.status}`);
@@ -242,10 +245,8 @@ type PublicRefs = { kind: "found"; branch: string; sha: string } | { kind: "empt
 
 async function fetchPublicRefs(repo: NormalizedRepo, signal: AbortSignal): Promise<PublicRefs | null> {
   const url = `${GITHUB_PUBLIC_BASE}/${repo.owner}/${repo.repo}.git/info/refs?service=git-upload-pack`;
-  const response = await fetch(url, { redirect: "error", signal });
-  if (response.redirected || (response.url && response.url !== url) || (response.status >= 300 && response.status < 400)) {
-    throw new Error("GitHub public refs redirected from canonical repository");
-  }
+  const response = await fetch(url, { redirect: "manual", signal });
+  assertCanonicalResponse(response, url, "GitHub public refs");
   if (response.status === 401 || response.status === 403 || response.status === 404) return null;
   if (response.status === 429 || response.status >= 500) {
     throw new RetryableGithubError(rateLimitMessage("GitHub public refs", response));
@@ -336,7 +337,8 @@ function validateRepoIdentity(repo: NormalizedRepo): void {
 }
 
 async function githubJson<T>(url: string, signal: AbortSignal): Promise<{ kind: "ok"; data: T } | { kind: "missing" }> {
-  const response = await fetch(url, { headers: { accept: "application/vnd.github+json", "user-agent": "automated-hachathon-judge" }, redirect: "error", signal });
+  const response = await fetch(url, { headers: { accept: "application/vnd.github+json", "user-agent": "automated-hachathon-judge" }, redirect: "manual", signal });
+  assertCanonicalResponse(response, url, "GitHub API");
   if (response.status === 403 || response.status === 429 || response.status >= 500 || (!response.ok && response.headers.get("x-ratelimit-remaining") === "0")) {
     throw new RetryableGithubError(rateLimitMessage("GitHub API", response));
   }
@@ -350,6 +352,12 @@ async function githubJson<T>(url: string, signal: AbortSignal): Promise<{ kind: 
     kind: "ok",
     data: JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readBoundedBytes(response, MAX_TREE_BYTES, signal, "GitHub tree"))) as T
   };
+}
+
+function assertCanonicalResponse(response: Response, url: string, source: string): void {
+  if (response.redirected || (response.url && response.url !== url) || (response.status >= 300 && response.status < 400)) {
+    throw new Error(`${source} redirected from canonical repository`);
+  }
 }
 
 function rateLimitMessage(source: string, response: Response): string {
