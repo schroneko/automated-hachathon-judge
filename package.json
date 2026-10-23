@@ -23,7 +23,7 @@
     "typecheck": "tsc -p tsconfig.worker.json --noEmit && tsc -p tsconfig.client.json --noEmit"
   },
   "engines": {
-    "node": ">=22.13.0"
+    "node": "^22.13.0 || >=24.0.0"
   },
   "dependencies": {
     "zod": "^4.4.3"

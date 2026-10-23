@@ -97,7 +97,7 @@ Queueのメモリ不足はclaim前の遅延配送で扱います。取得・復�
 
 ## Development
 
-開発時だけNode.js 22.13以上、npm、mise管理のWranglerを使います。会場での操作にCLIは不要です。
+開発時だけNode.js 22系（22.13以上）または24以上、npm、mise管理のWranglerを使います。会場での操作にCLIは不要です。
 
 ```bash
 npm ci
