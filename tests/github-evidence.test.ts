@@ -343,10 +343,11 @@ describe("GitHub partial-clone tracked evidence", () => {
     expect(fetch.mock.calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1 + Math.ceil(31 / 64));
   });
 
-  it("includes unknown, extensionless, docs, tests, config and original tracked policy files without executing or applying them", async () => {
+  it("includes unknown, extensionless, docs, config and original tracked policy files without executing or applying them", async () => {
+    const excludedTest = { path: "tests/main.spec.ts", content: "throw new Error('do not execute')" };
     const entries = [
       { path: "README.md", content: "readme" }, { path: "docs/guide.rst", content: "guide" },
-      { path: "tests/main.spec.ts", content: "throw new Error('do not execute')" }, { path: "config/example.ini", content: "setting=true" },
+      { path: "config/example.ini", content: "setting=true" },
       { path: "src/code.unrecognized", content: "$Format:%H$\nexport-ignore source" }, { path: "LICENSE", content: "license" },
       { path: ".gitignore", content: "src/\ndocs/\ntests/\nconfig/\n" },
       { path: ".gitattributes", content: "src/* export-ignore\nsrc/* export-subst\n" },
@@ -357,11 +358,13 @@ describe("GitHub partial-clone tracked evidence", () => {
       { path: "src/secrets.py", content: "def read_secret(): return None" },
       { path: "src/bom", content: "\ufefforiginal BOM" }
     ];
-    const data = fixture(entries);
+    const data = fixture([...entries, excludedTest]);
     const fetch = stubGithub(data);
     const result = await fetchRepoEvidence(repo, data.sha, "main", "summary");
     expect(result.files).toHaveLength(entries.length);
     for (const entry of entries) expect(result.files.find((file) => file.path === entry.path)).toEqual({ ...entry, size: Buffer.byteLength(entry.content), truncated: false });
+    expect(result.files.some((file) => file.path === excludedTest.path)).toBe(false);
+    expect(blobWants(fetch)).not.toContain(data.paths.get(excludedTest.path));
     expect(fetch.mock.calls.every(([url]) => url === refsUrl || url === uploadUrl)).toBe(true);
   });
 
