@@ -29,7 +29,7 @@ wrangler deploy
 
 採点は既存1Password Environmentの `OPENAI_API_KEY_20261018_HACKATHON` をWorker secretとして使います。APIキーをブラウザへ入力・送信しません。指定キーだけを非表示のプロセス間pipeで `wrangler secret put` の標準入力へ渡し、保存ファイルを作らずに設定します。Wranglerのプロセス環境からOP関連変数とAPIキーを除き、既存OAuthセッションで設定する手順を確認済みです。
 
-1Passwordを使うのはアプリ用キーの取得だけです。Environment対応beta版 `op`、既存サービスアカウント、`OP_ENVIRONMENT_ID` を使い、`op whoami` のtypeが `SERVICE_ACCOUNT` であることを先に確認します。Cloudflareの認証・公開・管理に `op`、1PasswordのCloudflare credential、`CLOUDFLARE_API_TOKEN` は使いません。Wranglerは既存OAuthセッションで実行します。
+1Passwordを使うのはアプリ用キーの取得だけです。通常版の `op` と `OP_ENVIRONMENT_ID` を使います。Cloudflareの認証・公開・管理に `op`、1PasswordのCloudflare credential、`CLOUDFLARE_API_TOKEN` は使いません。Wranglerは既存OAuthセッションで実行します。
 
 ```bash
 op --version
